@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+
+# IDE
+*.swp
+
+# Data (local dev)
+data/
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ignore all .folders unless explictly allowed
+.*/
+!.github
+docs/samples/*.json
+docs/samples/*.xml
+_tmp_*
+test_results.txt

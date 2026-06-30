@@ -1,0 +1,83 @@
+services:
+  cvproxy:
+    build: .
+    container_name: cvproxy
+    ports:
+      - "8585:8585"
+    volumes:
+      # All persistent data (database, image cache, stats) lives under ./data.
+      # Create this directory before first run: mkdir -p ./data
+      - ./data:/data
+    environment:
+
+      # -----------------------------------------------------------------------
+      # Required
+      # -----------------------------------------------------------------------
+      - CV_API_KEY=your_key_here
+
+      # -----------------------------------------------------------------------
+      # Storage paths  (inside container — change only if remapping volumes)
+      # -----------------------------------------------------------------------
+      - DB_PATH=/data/localcv.db
+      - IMAGE_CACHE_DIR=/data/images
+      - STATS_DB_PATH=/data/stats.db
+
+      # -----------------------------------------------------------------------
+      # ComicVine API
+      # -----------------------------------------------------------------------
+      - CV_API_BASE_URL=https://comicvine.gamespot.com/api
+      # CV enforces 200 req/hr per endpoint path. Defaults leave a safety buffer.
+      - RATE_LIMIT_PER_MINUTE=100
+      - RATE_LIMIT_PER_HOUR_PER_ENDPOINT=180
+
+      # -----------------------------------------------------------------------
+      # Background scheduler
+      # -----------------------------------------------------------------------
+      - SYNC_ENABLED=true
+      - SYNC_CRON_HOUR=3        # UTC hour for daily jobs (0–23); spread from neighbours
+      # Max upstream pages fetched per search query (100 results per page).
+      - SEARCH_MAX_PAGES=5
+
+      # -----------------------------------------------------------------------
+      # Cache TTLs  (0 = keep forever)
+      # -----------------------------------------------------------------------
+      - IMAGE_CACHE_TTL_DAYS=14
+      - RESPONSE_CACHE_TTL_DAYS=30   # generic resource cache (characters, teams, etc.)
+      - SEARCH_CACHE_TTL_DAYS=60     # search result cache
+
+      # -----------------------------------------------------------------------
+      # Ingest cutoff  (0 = disabled — cache all content regardless of age)
+      #
+      # Skip writing issues/volumes older than this publication year.
+      #   Issues  → checked against store_date, then cover_date.
+      #   Volumes → checked against last_issue.cover_date (skipped if absent).
+      #
+      # Example: only cache content from 1990 onward
+      #   CACHE_CUTOFF_YEAR=1990
+      # -----------------------------------------------------------------------
+      - CACHE_CUTOFF_YEAR=0
+
+      # -----------------------------------------------------------------------
+      # Cache eviction  (0 = disabled — rows are never automatically removed)
+      #
+      # Removes stale issues/volumes from the database during the nightly job,
+      # and expires response-cache entries on their configured TTL.
+      #
+      # An issue is eviction-eligible when its cover_date predates the cutoff
+      # AND it has not been accessed within the grace period.  Volumes with no
+      # remaining issues are cascade-removed.
+      #
+      # Example: evict issues older than 10 years, unaccessed for 6 months
+      #   EVICT_OLDER_THAN_YEARS=10
+      #   EVICT_UNACCESSED_DAYS=180
+      # -----------------------------------------------------------------------
+      - EVICT_OLDER_THAN_YEARS=0
+      - EVICT_UNACCESSED_DAYS=180
+
+      # -----------------------------------------------------------------------
+      # Server
+      # -----------------------------------------------------------------------
+      - HOST=0.0.0.0
+      - PORT=8585
+
+    restart: unless-stopped
