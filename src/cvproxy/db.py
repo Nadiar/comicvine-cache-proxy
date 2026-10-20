@@ -894,6 +894,44 @@ class Database:
             offset=offset,
         )
 
+    def find_series_issues(
+        self, series: str, issue_number: str, *, max_volumes: int = 25
+    ) -> list[CVIssue]:
+        """Return issue *issue_number* of every volume named exactly *series*.
+
+        The name match is case-insensitive.  Results are ordered by volume
+        count_of_issues (largest first) and each carries a CV-shaped
+        ``volume`` dict with the volume's name and URLs.
+        """
+        volumes = self.conn.execute(
+            "SELECT id, name, api_detail_url, site_detail_url FROM cv_volume "
+            "WHERE name = ? COLLATE NOCASE "
+            "ORDER BY COALESCE(count_of_issues, 0) DESC, id LIMIT ?",
+            [series, max_volumes],
+        ).fetchall()
+        if not volumes:
+            return []
+        order = {row["id"]: i for i, row in enumerate(volumes)}
+        placeholders = ",".join("?" * len(volumes))
+        rows = self.conn.execute(
+            f"SELECT {_ISSUE_COLS} FROM cv_issue "  # noqa: S608
+            f"WHERE volume_id IN ({placeholders}) AND issue_number = ?",
+            [*order, issue_number],
+        ).fetchall()
+        rows = sorted(rows, key=lambda r: order[r["volume_id"]])
+        issues = []
+        for row in rows:
+            vol = volumes[order[row["volume_id"]]]
+            issue = _row_to_issue(row)
+            issue["volume"] = {
+                "id": vol["id"],
+                "name": vol["name"],
+                "api_detail_url": vol["api_detail_url"],
+                "site_detail_url": vol["site_detail_url"],
+            }
+            issues.append(issue)
+        return issues
+
     def get_issue(self, issue_id: int) -> CVIssue | None:
         """Get a single issue by ID."""
         cur = self.conn.execute(f"SELECT {_ISSUE_COLS} FROM cv_issue WHERE id = ?", [issue_id])

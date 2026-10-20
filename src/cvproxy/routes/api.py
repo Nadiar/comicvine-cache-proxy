@@ -398,6 +398,17 @@ def _apply_list_defaults(
 # ---------------------------------------------------------------------------
 
 
+def _negate_date(date: str | None) -> str:
+    """Invert an ISO date so newer dates sort lower (ascending sort = descending date).
+
+    Each digit d → (9-d), non-digit chars kept as-is.  Missing date → "~"
+    which sorts after all digit strings, putting undated results last.
+    """
+    if not date:
+        return "~"
+    return "".join(str(9 - int(c)) if c.isdigit() else c for c in date)
+
+
 def _search_relevance_key(
     name: str | None, query: str, date: str | None = None
 ) -> tuple[int, int, int, str]:
@@ -410,14 +421,7 @@ def _search_relevance_key(
 
     Within a tier, more recent date_last_updated sorts first (negated ISO string).
     """
-    # Invert ISO date so newer dates sort lower (ascending sort = descending date).
-    # Each digit d → (9-d), non-digit chars kept as-is.  Missing date → "~"
-    # which sorts after all digit strings, putting undated results last.
-    neg_date = (
-        "".join(str(9 - int(c)) if c.isdigit() else c for c in date)
-        if date
-        else "~"
-    )
+    neg_date = _negate_date(date)
 
     if not name:
         return (3, 0, 0, neg_date)
@@ -434,6 +438,89 @@ def _search_relevance_key(
 
     missing = len(query_terms) - matched
     return (2, missing, len(name), neg_date)
+
+
+_TRAILING_ISSUE_NUMBER_RE = re.compile(
+    r"^(?P<series>.*?\S)(?:\s+#?|\s*#)(?P<number>\d+(?:\.\d+)?)$"
+)
+
+
+def _normalize_issue_number(number: Any) -> str:
+    """Canonical issue number for comparison: '#001' → '1', '12.50' kept as-is."""
+    text = str(number or "").strip().lstrip("#").strip().lower()
+    return re.sub(r"^0+(?=\d)", "", text)
+
+
+def _split_issue_query(query: str) -> tuple[str, str | None]:
+    """Split '<series> <number>' (also '#1', '001') into (series, issue_number).
+
+    A query that is only a number (e.g. '1602') is treated as a series name.
+    """
+    match = _TRAILING_ISSUE_NUMBER_RE.match(query.strip())
+    if not match:
+        return query.strip(), None
+    return match["series"].strip(), _normalize_issue_number(match["number"])
+
+
+def _issue_sort_key(
+    result: dict[str, Any],
+    query: str,
+    series: str,
+    number: str | None,
+    volume_sizes: dict[int, int],
+) -> tuple[Any, ...]:
+    """Relevance key for an issue search result (lower = more relevant).
+
+    Groups: 0 = volume name matches the series (or the whole query),
+    1 = only the issue title matches, 2 = neither.  Within a group an exact
+    issue number ranks first, then name closeness, then larger volumes.
+    The trailing number is only ever compared to issue_number, so it never
+    matches a record on its own.
+    """
+    volume = result.get("volume") or {}
+    volume_name = volume.get("name")
+    date_key = _negate_date(result.get("date_last_updated"))
+    number_miss = int(
+        number is not None and _normalize_issue_number(result.get("issue_number")) != number
+    )
+    volume_rel = _search_relevance_key(volume_name, series)[:3]
+    if number is not None and _search_relevance_key(volume_name, query)[0] == 0:
+        # Series names that end in a number, e.g. "Spider-Man 2099"
+        group, number_miss, rel = 0, 0, (0, 0, 0)
+    elif volume_rel[0] <= 1:
+        group, rel = 0, volume_rel
+    else:
+        title_rel = _search_relevance_key(result.get("name"), series)[:3]
+        group = 1 if title_rel[0] <= 1 else 2
+        rel = title_rel if group == 1 else min(volume_rel, title_rel)
+    return (group, number_miss, rel, -volume_sizes.get(volume.get("id") or 0, 0), date_key)
+
+
+def _search_sort_key(result: dict[str, Any], query: str) -> tuple[int, int, int, str]:
+    """Relevance key for a volume/publisher search result."""
+    return _search_relevance_key(result.get("name"), query, result.get("date_last_updated"))
+
+
+def _rank_issue_results(
+    db: Database, results: list[dict[str, Any]], query: str
+) -> list[dict[str, Any]]:
+    """Merge local '<series> #<number>' matches into issue results and rank them."""
+    series, number = _split_issue_query(query)
+    if number is not None:
+        direct = db.find_series_issues(series, number)
+        for issue in direct:
+            issue["resource_type"] = "issue"
+        direct_ids = {issue["id"] for issue in direct}
+        results = direct + [r for r in results if r.get("id") not in direct_ids]
+    volume_ids = list({
+        vid for r in results if (vid := (r.get("volume") or {}).get("id"))
+    })
+    volume_sizes = {
+        v["id"]: v.get("count_of_issues") or 0 for v in db.get_volumes_by_ids(volume_ids)[0]
+    } if volume_ids else {}
+    return sorted(
+        results, key=lambda r: _issue_sort_key(r, query, series, number, volume_sizes)
+    )
 
 
 _SEARCH_PAGE_SIZE = 100
@@ -622,12 +709,13 @@ async def search(
             raw, total = search_fn(query, limit=limit, offset=effective_offset)
             if not raw:
                 continue
-            raw.sort(key=lambda r: _search_relevance_key(
-                r.get("name"), query, r.get("date_last_updated")
-            ))
-            search_fields = list_fields | {"resource_type"}
             for r in raw:
                 r["resource_type"] = resource_type
+            if resource_type == "issue":
+                raw = _rank_issue_results(db, raw, query)
+            else:
+                raw.sort(key=lambda r: _search_sort_key(r, query))
+            search_fields = list_fields | {"resource_type"}
             shaped = [_apply_list_defaults(r, search_fields, field_list) for r in raw]
             _record(request, endpoint="search", source="cache", start=t0)
             return _cv_envelope(shaped, total=total, limit=limit, offset=effective_offset)
@@ -698,9 +786,10 @@ async def search(
         r["resource_type"] = resource_type
 
     # Relevance sort across full result set
-    enriched.sort(key=lambda r: _search_relevance_key(
-        r.get("name"), query, r.get("date_last_updated")
-    ))
+    if resource_type == "issue":
+        enriched = _rank_issue_results(db, enriched, query)
+    else:
+        enriched.sort(key=lambda r: _search_sort_key(r, query))
 
     # Slice by requested offset/limit
     page_slice = enriched[effective_offset: effective_offset + limit]

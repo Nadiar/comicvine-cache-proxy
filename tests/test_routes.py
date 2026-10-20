@@ -377,6 +377,96 @@ def test_search_issue_default_fields(app_client: TestClient) -> None:
     assert result["resource_type"] == "issue"
 
 
+def test_search_issue_relevance_uses_volume_name(app_client: TestClient) -> None:
+    """Issue results rank by series name: issue titles rarely contain the series name."""
+    issues = [
+        {"id": 1, "name": "Saga", "issue_number": "1",
+         "volume": {"id": 10, "name": "All-New Wolverine Saga"}},
+        {"id": 2, "name": "Chapter One", "issue_number": "1",
+         "volume": {"id": 46568, "name": "Saga"}},
+    ]
+    app_client.app.state.cv_client = _mock_search_client({1: _search_page(issues, 2)})
+
+    data = app_client.get(
+        "/api/search/", params={"query": "Saga", "resources": "issue", "limit": 12}
+    ).json()
+
+    assert [r["id"] for r in data["results"]] == [2, 1]
+
+
+def _seed_saga(db: Database) -> None:
+    """Two volumes named 'Saga' with a #1 each; the long-running one has more issues."""
+    db.upsert_volume({"id": 46568, "name": "Saga", "start_year": "2012", "count_of_issues": 72})
+    db.upsert_volume({"id": 52845, "name": "Saga", "start_year": "2012", "count_of_issues": 12})
+    db.upsert_issue({"id": 321297, "volume": {"id": 46568}, "name": "Chapter One",
+                     "issue_number": "1", "image": {}})
+    db.upsert_issue({"id": 900001, "volume": {"id": 52845}, "name": "Volume One",
+                     "issue_number": "1", "image": {}})
+
+
+# Upstream results for "Saga 1": titles containing "saga" and "1", no real Saga #1
+_SAGA_1_UPSTREAM = [
+    {"id": 964917, "name": "Guin saga 1", "issue_number": "102",
+     "volume": {"id": 144314, "name": "Collana Japan"}},
+    {"id": 155167, "name": "Saga, part 1", "issue_number": "1",
+     "volume": {"id": 7570, "name": "Warlord"}},
+    {"id": 1110082, "name": "Volume Twelve", "issue_number": "12",
+     "volume": {"id": 52845, "name": "Saga"}},
+    {"id": 231789, "name": "Saga", "issue_number": "1",
+     "volume": {"id": 10, "name": "All-New Wolverine Saga"}},
+]
+
+
+@pytest.mark.parametrize("query", ["Saga 1", "Saga #1", "Saga 001", "saga 1"])
+def test_search_issue_series_number_finds_series_issue_first(
+    app_client: TestClient, query: str
+) -> None:
+    """'<series> <number>' puts that issue of the matching series first, then other #1s."""
+    _seed_saga(app_client.app.state.db)
+    app_client.app.state.cv_client = _mock_search_client(
+        {1: _search_page(_SAGA_1_UPSTREAM, 170616)}
+    )
+
+    data = app_client.get(
+        "/api/search/", params={"query": query, "resources": "issue", "limit": 12}
+    ).json()
+
+    ids = [r["id"] for r in data["results"]]
+    assert ids[:2] == [321297, 900001]
+    first = data["results"][0]
+    assert first["issue_number"] == "1"
+    assert first["volume"]["id"] == 46568
+    assert first["volume"]["name"] == "Saga"
+
+
+def test_search_issue_number_alone_does_not_match(app_client: TestClient) -> None:
+    """A volume-name match outranks a title that only matches via the number term."""
+    app_client.app.state.cv_client = _mock_search_client(
+        {1: _search_page(_SAGA_1_UPSTREAM, 170616)}
+    )
+
+    data = app_client.get(
+        "/api/search/", params={"query": "Saga 1", "resources": "issue", "limit": 12}
+    ).json()
+
+    ids = [r["id"] for r in data["results"]]
+    # Volume "Saga" #12 and "All-New Wolverine Saga" #1 rank above title-only matches
+    assert ids.index(1110082) < ids.index(964917)
+    assert ids.index(231789) < ids.index(155167)
+
+
+def test_split_issue_query() -> None:
+    from cvproxy.routes.api import _split_issue_query
+
+    assert _split_issue_query("Saga 1") == ("Saga", "1")
+    assert _split_issue_query("Saga #1") == ("Saga", "1")
+    assert _split_issue_query("Saga 001") == ("Saga", "1")
+    assert _split_issue_query("Saga#12.5") == ("Saga", "12.5")
+    assert _split_issue_query("Saga") == ("Saga", None)
+    assert _split_issue_query("1602") == ("1602", None)
+    assert _split_issue_query("Issue 0") == ("Issue", "0")
+
+
 def test_search_relevance_key_ordering() -> None:
     """Relevance sort key produces the correct tier ordering."""
     from cvproxy.routes.api import _search_relevance_key
