@@ -10,8 +10,8 @@ import asyncio
 import logging
 import time
 from collections import deque
-from datetime import datetime, timedelta, timezone
-from typing import Any, Final
+from datetime import UTC, datetime, timedelta
+from typing import Any, Final, Literal
 
 import httpx
 
@@ -27,7 +27,7 @@ class _RateLimited:
 
     __slots__ = ()
 
-    def __bool__(self) -> bool:
+    def __bool__(self) -> Literal[False]:
         return False
 
     def __repr__(self) -> str:
@@ -49,7 +49,7 @@ class _NotFound:
 
     __slots__ = ()
 
-    def __bool__(self) -> bool:
+    def __bool__(self) -> Literal[False]:
         return False
 
     def __repr__(self) -> str:
@@ -58,6 +58,9 @@ class _NotFound:
 
 #: Returned when the CV API responds with status_code 101 (Object Not Found).
 NOT_FOUND: Final[_NotFound] = _NotFound()
+
+#: What :meth:`CVClient.get` returns: the JSON body, a sentinel, or ``None`` on error.
+CVResponse = dict[str, Any] | _RateLimited | _NotFound | None
 
 
 class CVClient:
@@ -208,12 +211,13 @@ class CVClient:
         self,
         endpoint: str,
         params: dict[str, Any] | None = None,
-    ) -> "dict[str, Any] | _RateLimited | None":
+    ) -> CVResponse:
         """Make a GET request to the CV API.
 
         Returns the parsed JSON response body, ``RATE_LIMITED`` when the
-        upstream explicitly refuses the request due to rate limiting, or
-        ``None`` on any other error.
+        upstream explicitly refuses the request due to rate limiting,
+        ``NOT_FOUND`` when CV reports the object doesn't exist, or ``None``
+        on any other error.
         """
         if self._cooldown_until > time.time():
             return RATE_LIMITED
@@ -234,7 +238,7 @@ class CVClient:
         try:
             resp = await self._client.get(url, params=req_params)
             resp.raise_for_status()
-            data = resp.json()
+            data: dict[str, Any] = resp.json()
 
             status = data.get("status_code", 0)
             if status == 107:
@@ -271,7 +275,7 @@ class CVClient:
         rather than on a rolling 60-minute window.  This timestamp lets callers
         display the worst-case reset time under that assumption.
         """
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(UTC)
         next_hour = now_utc.replace(minute=0, second=0, microsecond=0)
         # Advance by one full hour to get the *next* boundary.
         next_hour = next_hour.replace(hour=(now_utc.hour + 1) % 24)
@@ -312,7 +316,7 @@ class CVClient:
             active = [ts for ts in window if ts > cutoff]
             oldest_ts = min(active) if active else None
             sliding_reset_at = (
-                datetime.fromtimestamp(oldest_ts + 3600.0, tz=timezone.utc).isoformat()
+                datetime.fromtimestamp(oldest_ts + 3600.0, tz=UTC).isoformat()
                 if oldest_ts is not None
                 else None
             )
@@ -362,7 +366,7 @@ class CVClient:
         *,
         limit: int = 100,
         page: int = 1,
-    ) -> dict[str, Any] | None:
+    ) -> CVResponse:
         # CV's /search ignores offset; it pages by 1-based `page`.
         return await self.get(
             "search/",
@@ -374,7 +378,7 @@ class CVClient:
             },
         )
 
-    async def get_volume(self, volume_id: int) -> dict[str, Any] | None:
+    async def get_volume(self, volume_id: int) -> CVResponse:
         return await self.get(
             f"volume/4050-{volume_id}/",
             {
@@ -385,8 +389,8 @@ class CVClient:
             },
         )
 
-    async def get_issue(self, issue_id: int) -> dict[str, Any] | None:
+    async def get_issue(self, issue_id: int) -> CVResponse:
         return await self.get(f"issue/4000-{issue_id}/")
 
-    async def get_publisher(self, publisher_id: int) -> dict[str, Any] | None:
+    async def get_publisher(self, publisher_id: int) -> CVResponse:
         return await self.get(f"publisher/4010-{publisher_id}/")

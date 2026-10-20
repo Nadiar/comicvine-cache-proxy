@@ -26,14 +26,14 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from functools import partial
-from typing import Any, Literal
-from urllib.parse import urlencode, parse_qs, urlparse
+from typing import Any, Literal, TypeVar
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from fastapi import APIRouter, BackgroundTasks, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from cvproxy.config import get_settings
-from cvproxy.cv_client import CVClient, NOT_FOUND, RATE_LIMITED
+from cvproxy.cv_client import NOT_FOUND, RATE_LIMITED, CVClient, _RateLimited
 from cvproxy.db import Database, is_past_cutoff
 from cvproxy.image_cache import ImageCache
 from cvproxy.stats import StatsTracker
@@ -329,9 +329,13 @@ def _touch_if_evicting(db: Database, table: str, entity_id: int) -> None:
         db.touch_last_accessed(table, entity_id)
 
 
-async def _guarded_get(
-    client: CVClient, endpoint: str, call: Callable[[], Awaitable[Any]]
-) -> Any:
+_T = TypeVar("_T")
+
+
+# TypeVar rather than PEP 695 syntax: requires-python is still >=3.11
+async def _guarded_get(  # noqa: UP047
+    client: CVClient, endpoint: str, call: Callable[[], Awaitable[_T]]
+) -> _T | _RateLimited:
     """Pre-flight budget check before calling upstream.
 
     Returns RATE_LIMITED without calling *call* while CV is cooling down, the
@@ -608,8 +612,8 @@ def _store_search_results(
             if item.get("id"):
                 try:
                     db.upsert_volume(item)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to upsert volume %s: %s", item.get("id"), exc)
     db.cache_put_search(params_hash, results, cv_total, query=query, resources=resources)
 
 
@@ -702,12 +706,15 @@ async def search(
     # --- 1. Check cache ---
     if cache_mode != "no-cache":
         cached_data = db.cache_get_search(params_hash)
-        if cached_data is not None:
-            # Stale check: if local FTS has more matching volumes than cache, re-fetch
-            if "volume" in resources and params_hash not in _search_fills_in_progress:
-                local_count = db.count_volumes_fts(query)
-                if local_count > len(cached_data.get("results", [])):
-                    cached_data = None  # invalidate
+        # Stale check: if local FTS has more matching volumes than cache, re-fetch
+        if (
+            cached_data is not None
+            and "volume" in resources
+            and params_hash not in _search_fills_in_progress
+        ):
+            local_count = db.count_volumes_fts(query)
+            if local_count > len(cached_data.get("results", [])):
+                cached_data = None  # invalidate
         if cached_data is not None and _has_duplicate_ids(cached_data.get("results", [])):
             cached_data = None  # stored by the old offset-paging bug: page 1 repeated
 
@@ -919,7 +926,9 @@ async def list_volumes(
             if results:
                 if sort:
                     results = _apply_sort(results, sort)
-                results = [_apply_list_defaults(r, _VOLUME_LIST_FIELDS, field_list) for r in results]
+                results = [
+                    _apply_list_defaults(r, _VOLUME_LIST_FIELDS, field_list) for r in results
+                ]
                 _record(request, endpoint="volumes", source="cache", start=t0)
                 return _cv_envelope(results, total=total, limit=limit, offset=effective_offset)
 
@@ -958,7 +967,9 @@ async def list_volumes(
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to upsert volume %s: %s", vol.get("id"), exc)
             if field_list:
-                data = {**data, "results": [_apply_field_list(r, field_list) for r in data["results"]]}
+                data = {
+                    **data, "results": [_apply_field_list(r, field_list) for r in data["results"]]
+                }
         _record(request, endpoint="volumes", source="upstream", start=t0)
         return data
 
@@ -1185,7 +1196,9 @@ async def list_issues(
         _record(request, endpoint="issues", source="miss", start=t0)
         return _cv_envelope([], total=0, limit=limit, offset=effective_offset)
 
-    upstream_params2: dict[str, Any] = {"filter": filter, "limit": limit, "offset": effective_offset}
+    upstream_params2: dict[str, Any] = {
+        "filter": filter, "limit": limit, "offset": effective_offset
+    }
     if sort:
         upstream_params2["sort"] = sort
     data = await _guarded_get(client, "issues/", partial(client.get, "issues/", upstream_params2))
@@ -1206,7 +1219,9 @@ async def list_issues(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to store issues for filter %r: %s", filter, exc)
             if field_list:
-                data = {**data, "results": [_apply_field_list(r, field_list) for r in data["results"]]}
+                data = {
+                    **data, "results": [_apply_field_list(r, field_list) for r in data["results"]]
+                }
         _record(request, endpoint="issues", source="upstream", start=t0)
         return data
 
@@ -1315,7 +1330,9 @@ async def list_publishers(
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to upsert publisher %s: %s", pub.get("id"), exc)
             if field_list:
-                data = {**data, "results": [_apply_field_list(r, field_list) for r in data["results"]]}
+                data = {
+                    **data, "results": [_apply_field_list(r, field_list) for r in data["results"]]
+                }
         _record(request, endpoint="publishers", source="upstream", start=t0)
         return data
 

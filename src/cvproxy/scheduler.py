@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -37,7 +37,7 @@ def _make_tracked(name: str, fn: Any) -> Any:
     async def _wrapper(*args: Any) -> None:
         entry: dict[str, Any] = {
             "name": name,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": datetime.now(UTC).isoformat(),
             "finished_at": None,
             "status": "running",
             "result": None,
@@ -55,7 +55,7 @@ def _make_tracked(name: str, fn: Any) -> Any:
             entry["status"] = "error"
             entry["result"] = {"error": str(exc)}
         finally:
-            entry["finished_at"] = datetime.now(timezone.utc).isoformat()
+            entry["finished_at"] = datetime.now(UTC).isoformat()
     return _wrapper
 
 
@@ -74,7 +74,7 @@ _BACKFILL_MAX_SLEEP = 120.0
 _BACKFILL_MIN_SLEEP = 2.0
 
 
-def _backfill_call_interval(client: "CVClient") -> float:
+def _backfill_call_interval(client: CVClient) -> float:
     """Compute seconds to sleep after each backfill upstream call.
 
     Divides the remaining seconds in the current clock-hour by the remaining
@@ -83,7 +83,7 @@ def _backfill_call_interval(client: "CVClient") -> float:
 
     Example: 45 min left, 100 budget remaining → sleep 27 s per call.
     """
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     secs_left_in_hour = max(
         1.0,
         3600.0 - (now_utc.minute * 60 + now_utc.second + now_utc.microsecond / 1_000_000),
@@ -101,8 +101,8 @@ def _backfill_call_interval(client: "CVClient") -> float:
 def create_scheduler(
     settings: Settings,
     image_cache: ImageCache,
-    db: "Database",
-    client: "CVClient",
+    db: Database,
+    client: CVClient,
 ) -> AsyncIOScheduler:
     """Create and configure the background scheduler.
 
@@ -254,14 +254,14 @@ def _cleanup_images(image_cache: ImageCache) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def _prefetch_releases(client: "CVClient", db: "Database") -> None:
+async def _prefetch_releases(client: CVClient, db: Database) -> dict[str, Any]:
     """Fetch upcoming/recent releases from CV and upsert into local DB.
 
     Window: 2 weeks in the past through 1 week in the future.
     Comics data on CV typically lags, so looking backward catches
     recently-added entries.
     """
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     start = (today - timedelta(weeks=2)).isoformat()
     end = (today + timedelta(weeks=1)).isoformat()
 
@@ -314,7 +314,7 @@ _ISSUE_BATCH = 150
 _PUBLISHER_BATCH = 50  # publishers table is much smaller
 
 
-async def _backfill_volumes(client: "CVClient", db: "Database") -> None:
+async def _backfill_volumes(client: CVClient, db: Database) -> dict[str, Any]:
     """Re-fetch volumes that are missing the new detail fields.
 
     Two-tier batching:
@@ -391,7 +391,7 @@ async def _backfill_volumes(client: "CVClient", db: "Database") -> None:
     return {"updated": updated, "queued": len(volume_ids)}
 
 
-async def _backfill_issues(client: "CVClient", db: "Database") -> None:
+async def _backfill_issues(client: CVClient, db: Database) -> dict[str, Any]:
     """Re-fetch issues that are missing the new detail fields.
 
     Prioritises issues with a recent store_date, then falls back to
@@ -459,7 +459,7 @@ async def _backfill_issues(client: "CVClient", db: "Database") -> None:
     return {"updated": updated, "queued": len(issue_ids)}
 
 
-async def _backfill_publishers(client: "CVClient", db: "Database") -> None:
+async def _backfill_publishers(client: CVClient, db: Database) -> dict[str, Any]:
     """Re-fetch publishers that are missing the new detail fields."""
     cur = db.conn.execute(
         """
@@ -506,7 +506,7 @@ async def _backfill_publishers(client: "CVClient", db: "Database") -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _sync_recent_issues(client: "CVClient", db: "Database", hours: int = 48) -> None:
+async def _sync_recent_issues(client: CVClient, db: Database, hours: int = 48) -> dict[str, Any]:
     """Pull issues updated in the last *hours* hours and upsert them.
 
     Keeps the local cache fresh for recently-edited CV entries
@@ -519,7 +519,7 @@ async def _sync_recent_issues(client: "CVClient", db: "Database", hours: int = 4
     INSERT OR REPLACE succeeds (because backfill_missing is not in the column
     list, so the replacement row gets NULL).
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     since = (now - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     until = now.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -574,7 +574,7 @@ sync_recent_issues = _sync_recent_issues
 # ---------------------------------------------------------------------------
 
 
-async def _evict_stale_data(db: "Database", settings: "Settings") -> None:
+async def _evict_stale_data(db: Database, settings: Settings) -> dict[str, Any]:
     """Remove stale entities and expired response cache entries.
 
     Issues:         deleted if cover_date < cutoff AND last_accessed older than access window
@@ -589,7 +589,7 @@ async def _evict_stale_data(db: "Database", settings: "Settings") -> None:
     if settings.evict_older_than_years > 0:
         cutoff = (_date.today() - timedelta(days=settings.evict_older_than_years * 365)).isoformat()
         access_expiry = (
-            datetime.now(timezone.utc) - timedelta(days=settings.evict_unaccessed_days)
+            datetime.now(UTC) - timedelta(days=settings.evict_unaccessed_days)
         ).strftime("%Y-%m-%d %H:%M:%S")
         issues_deleted = db.evict_stale_issues(cutoff, access_expiry)
         vol_deleted = db.evict_orphaned_volumes(access_expiry)
@@ -597,12 +597,14 @@ async def _evict_stale_data(db: "Database", settings: "Settings") -> None:
 
     if settings.response_cache_ttl_days > 0 or settings.search_cache_ttl_days > 0:
         cache_cutoff = (
-            (datetime.now(timezone.utc) - timedelta(days=settings.response_cache_ttl_days)).strftime("%Y-%m-%dT%H:%M:%S")
+            (datetime.now(UTC) - timedelta(days=settings.response_cache_ttl_days))
+            .strftime("%Y-%m-%dT%H:%M:%S")
             if settings.response_cache_ttl_days > 0
             else "1900-01-01T00:00:00"
         )
         search_cutoff = (
-            (datetime.now(timezone.utc) - timedelta(days=settings.search_cache_ttl_days)).strftime("%Y-%m-%dT%H:%M:%S")
+            (datetime.now(UTC) - timedelta(days=settings.search_cache_ttl_days))
+            .strftime("%Y-%m-%dT%H:%M:%S")
             if settings.search_cache_ttl_days > 0
             else None
         )
@@ -611,7 +613,11 @@ async def _evict_stale_data(db: "Database", settings: "Settings") -> None:
 
     if not issues_deleted and not vol_deleted and not cache_deleted:
         logger.debug("Eviction: nothing to remove (all settings disabled or no eligible rows)")
-    return {"issues_deleted": issues_deleted, "volumes_deleted": vol_deleted, "cache_deleted": cache_deleted}
+    return {
+        "issues_deleted": issues_deleted,
+        "volumes_deleted": vol_deleted,
+        "cache_deleted": cache_deleted,
+    }
 
 
 # Public alias for app.py admin endpoint
@@ -626,7 +632,7 @@ evict_stale_data = _evict_stale_data
 _SEARCH_BACKFILL_BATCH = 50
 
 
-async def _backfill_search_cache_volumes(client: "CVClient", db: "Database") -> None:
+async def _backfill_search_cache_volumes(client: CVClient, db: Database) -> dict[str, Any]:
     """Fetch volumes referenced in search caches but absent from cv_volume.
 
     When a search result references a volume ID that isn't in our local

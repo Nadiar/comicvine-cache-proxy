@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import UTC
+from unittest.mock import AsyncMock, patch
 
 import httpx
-import pytest
 
-from cvproxy.cv_client import CVClient, RATE_LIMITED
+from cvproxy.cv_client import RATE_LIMITED, CVClient
 
 
 async def test_rate_limiter_releases_lock_before_sleeping() -> None:
@@ -75,7 +75,9 @@ def _make_response(status_code: int, body: bytes | None = None) -> httpx.Respons
 
 
 def _json_response(payload: dict) -> httpx.Response:
-    resp = httpx.Response(200, content=json.dumps(payload).encode(), headers={"content-type": "application/json"})
+    resp = httpx.Response(
+        200, content=json.dumps(payload).encode(), headers={"content-type": "application/json"}
+    )
     resp.request = httpx.Request("GET", "https://comicvine.gamespot.com/api/test/")
     return resp
 
@@ -86,7 +88,8 @@ async def test_get_returns_rate_limited_on_http_429() -> None:
     mock_resp = _make_response(429)
     mock_resp.request = httpx.Request("GET", "https://example.com")
 
-    with patch.object(client._client, "get", new=AsyncMock(side_effect=httpx.HTTPStatusError("429", request=mock_resp.request, response=mock_resp))):
+    error = httpx.HTTPStatusError("429", request=mock_resp.request, response=mock_resp)
+    with patch.object(client._client, "get", new=AsyncMock(side_effect=error)):
         result = await client.get("volumes/")
 
     assert result is RATE_LIMITED
@@ -163,13 +166,13 @@ async def test_get_hourly_usage_includes_reset_fields() -> None:
     assert vol["limit"] == client._hourly_limit
     # sliding_reset_at = oldest call + 3600 s ≈ now + 3580 s
     assert vol["sliding_reset_at"] is not None
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     reset_dt = datetime.fromisoformat(vol["sliding_reset_at"])
-    assert reset_dt > datetime.now(timezone.utc), "reset_at should be in the future"
+    assert reset_dt > datetime.now(UTC), "reset_at should be in the future"
     # clock_hour_reset_at must also be a valid future UTC ISO timestamp
     clock_dt = datetime.fromisoformat(vol["clock_hour_reset_at"])
-    assert clock_dt > datetime.now(timezone.utc)
+    assert clock_dt > datetime.now(UTC)
     await client.close()
 
 
@@ -186,11 +189,11 @@ async def test_get_hourly_usage_empty_window_sliding_reset_is_null() -> None:
 
 def test_next_clock_hour_utc_is_always_in_future() -> None:
     """_next_clock_hour_utc() should always return a future top-of-the-hour."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     result = CVClient._next_clock_hour_utc()
     dt = datetime.fromisoformat(result)
-    assert dt > datetime.now(timezone.utc)
+    assert dt > datetime.now(UTC)
     assert dt.minute == 0
     assert dt.second == 0
 

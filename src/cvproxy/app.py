@@ -8,12 +8,13 @@ import logging
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from cvproxy.config import get_settings
 from cvproxy.cv_client import CVClient
@@ -21,7 +22,12 @@ from cvproxy.dashboard import DASHBOARD_HTML
 from cvproxy.db import Database
 from cvproxy.image_cache import ImageCache
 from cvproxy.routes.api import router as api_router
-from cvproxy.scheduler import create_scheduler, sync_recent_issues, evict_stale_data, get_scheduler_log
+from cvproxy.scheduler import (
+    create_scheduler,
+    evict_stale_data,
+    get_scheduler_log,
+    sync_recent_issues,
+)
 from cvproxy.stats import StatsTracker
 
 logger = logging.getLogger(__name__)
@@ -35,14 +41,15 @@ class TrailingSlashMiddleware:
     (the redirect URL gets generated with http:// instead of https://).
     """
 
-    def __init__(self, app):
+    def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
             path = scope["path"]
             # Only normalise /api/ paths (where routes expect trailing slashes)
-            if path.startswith("/api/") and not path.endswith("/") and "." not in path.rsplit("/", 1)[-1]:
+            last_segment = path.rsplit("/", 1)[-1]
+            if path.startswith("/api/") and not path.endswith("/") and "." not in last_segment:
                 scope["path"] = path + "/"
         await self.app(scope, receive, send)
 
@@ -55,10 +62,10 @@ class XmlFormatMiddleware:
     as XML matching the Comic Vine XML API format.
     """
 
-    def __init__(self, app):
+    def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or not scope["path"].startswith("/api/"):
             await self.app(scope, receive, send)
             return
@@ -69,12 +76,12 @@ class XmlFormatMiddleware:
             return
 
         # Collect the response body, then convert JSON -> XML.
-        response_body = []
+        response_body: list[bytes] = []
         response_started = False
-        original_headers = []
+        original_headers: list[tuple[bytes, bytes]] = []
         original_status = 200
 
-        async def capture_send(message):
+        async def capture_send(message: Message) -> None:
             nonlocal response_started, original_status
             if message["type"] == "http.response.start":
                 response_started = True
@@ -92,7 +99,9 @@ class XmlFormatMiddleware:
             # <results> get the correct tag (e.g. <volume>, <issue>).
             resource_type = _resource_type_from_path(scope["path"])
             xml_body = '<?xml version="1.0" encoding="utf-8"?>'
-            xml_body += "<response>" + _dict_to_cv_xml(data, resource_type=resource_type) + "</response>"
+            xml_body += (
+                "<response>" + _dict_to_cv_xml(data, resource_type=resource_type) + "</response>"
+            )
             body = xml_body.encode("utf-8")
             content_type = b"application/xml; charset=utf-8"
         except (json.JSONDecodeError, TypeError):
@@ -315,7 +324,8 @@ def create_app() -> FastAPI:
 
     # Background job registry — keyed by job_id (uuid hex).
     # Each entry: {"status": "running"|"done"|"error", "result": {...}, "started_at": str}
-    app.state.jobs: dict[str, dict[str, Any]] = {}
+    jobs: dict[str, dict[str, Any]] = {}
+    app.state.jobs = jobs
 
     _MAX_JOBS = 200
 
@@ -340,7 +350,7 @@ def create_app() -> FastAPI:
             "name": name,
             "params": params,
             "status": "running",
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": datetime.now(UTC).isoformat(),
             "finished_at": None,
             "result": None,
             "_task": task_holder,  # holds the asyncio.Task for cancellation
@@ -359,7 +369,7 @@ def create_app() -> FastAPI:
                 app.state.jobs[job_id]["status"] = "error"
                 app.state.jobs[job_id]["result"] = {"error": str(exc)}
             finally:
-                app.state.jobs[job_id]["finished_at"] = datetime.now(timezone.utc).isoformat()
+                app.state.jobs[job_id]["finished_at"] = datetime.now(UTC).isoformat()
 
         task = asyncio.create_task(_wrap())
         task_holder["task"] = task
@@ -441,7 +451,10 @@ def create_app() -> FastAPI:
         ),
         calendar_only: bool = Query(
             default=True,
-            description="Only repair volumes referenced by calendar issues (store_date IS NOT NULL). Much faster than repairing all 150k+ volumes.",
+            description=(
+                "Only repair volumes referenced by calendar issues (store_date IS NOT NULL). "
+                "Much faster than repairing all 150k+ volumes."
+            ),
         ),
     ) -> dict[str, Any]:
         """Re-sync publisher IDs for locally cached volumes.
@@ -537,7 +550,9 @@ def create_app() -> FastAPI:
     async def admin_evict(
         dry_run: bool = Query(
             default=True,
-            description="Preview candidate counts without deleting (safe default). Set false to evict.",
+            description=(
+                "Preview candidate counts without deleting (safe default). Set false to evict."
+            ),
         ),
     ) -> dict[str, Any]:
         """Trigger cache eviction based on current eviction settings.
@@ -556,11 +571,13 @@ def create_app() -> FastAPI:
                     "issues": 0,
                     "volumes": 0,
                     "response_cache": 0,
-                    "note": "Eviction disabled — set EVICT_OLDER_THAN_YEARS or RESPONSE_CACHE_TTL_DAYS",
+                    "note": (
+                        "Eviction disabled — set EVICT_OLDER_THAN_YEARS or RESPONSE_CACHE_TTL_DAYS"
+                    ),
                 }
 
             access_expiry = (
-                datetime.now(timezone.utc) - timedelta(days=settings.evict_unaccessed_days)
+                datetime.now(UTC) - timedelta(days=settings.evict_unaccessed_days)
             ).strftime("%Y-%m-%d %H:%M:%S")
 
             if dry_run:
@@ -574,7 +591,7 @@ def create_app() -> FastAPI:
                     counts.update({"issues": 0, "volumes": 0})
                 if settings.response_cache_ttl_days > 0:
                     cache_cutoff = (
-                        datetime.now(timezone.utc) - timedelta(days=settings.response_cache_ttl_days)
+                        datetime.now(UTC) - timedelta(days=settings.response_cache_ttl_days)
                     ).strftime("%Y-%m-%d %H:%M:%S")
                     counts["response_cache"] = db.count_response_cache_before(cache_cutoff)
                 else:

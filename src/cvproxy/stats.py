@@ -88,7 +88,8 @@ class StatsTracker:
         """Record a single request event."""
         with self._lock:
             self.conn.execute(
-                "INSERT INTO request_log (ts, client_ip, forwarded, endpoint, source, latency_ms, query_url) "
+                "INSERT INTO request_log"
+            " (ts, client_ip, forwarded, endpoint, source, latency_ms, query_url) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (time.time(), client_ip, forwarded, endpoint, source, latency_ms, query_url),
             )

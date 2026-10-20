@@ -37,7 +37,8 @@ def test_interval_is_clamped_below_maximum() -> None:
 def test_interval_increases_as_budget_is_consumed() -> None:
     """With fewer remaining calls the interval between calls should grow."""
     interval_with_full_budget = _backfill_call_interval(_mock_client(used=0))
-    interval_with_half_budget = _backfill_call_interval(_mock_client(used=_BACKFILL_HOURLY_BUDGET // 2))
+    half_budget_client = _mock_client(used=_BACKFILL_HOURLY_BUDGET // 2)
+    interval_with_half_budget = _backfill_call_interval(half_budget_client)
     # Can't assert strict ordering because both might be clamped at min/max,
     # but at least the half-budget interval must be >= full-budget interval.
     assert interval_with_half_budget >= interval_with_full_budget

@@ -640,7 +640,7 @@ def test_evict_stale_issues_keeps_recently_accessed_old(tmp_db: Database) -> Non
     )
     tmp_db.conn.commit()
 
-    # access_expiry = 1 year ago – the issue was just accessed so it should survive
+    # access_expiry = 1 year ago - the issue was just accessed so it should survive
     past_expiry = "2000-01-01 00:00:00"
     tmp_db.evict_stale_issues("2000-01-01", past_expiry)
 
@@ -865,7 +865,8 @@ def test_cache_find_superset_search_skips_incomplete_cache(tmp_db: Database) -> 
 def test_cache_find_superset_search_skips_different_resources(tmp_db: Database) -> None:
     """Superset cache for a different resource type must not be used."""
     tmp_db.cache_put_search(
-        "hash_bat_issue", [{"id": 1, "name": "Batman #1"}], total=1, query="batman", resources="issue"
+        "hash_bat_issue", [{"id": 1, "name": "Batman #1"}],
+        total=1, query="batman", resources="issue",
     )
     result = tmp_db.cache_find_superset_search("absolute batman", "volume")
     assert result is None

@@ -31,7 +31,8 @@ class TestRecord:
         assert summary["totals"]["total_requests"] == 1
         assert summary["totals"]["cache_hits"] == 1
         assert summary["totals"]["upstream_calls"] == 0
-        assert summary["recent_requests"][0]["query_url"] == "/api/search/?query=Batman&resources=volume"
+        expected = "/api/search/?query=Batman&resources=volume"
+        assert summary["recent_requests"][0]["query_url"] == expected
 
     def test_record_upstream_call(self, tracker: StatsTracker) -> None:
         tracker.record(

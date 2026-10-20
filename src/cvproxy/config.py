@@ -32,11 +32,14 @@ class Settings(BaseSettings):
     sync_cron_hour: int = 3  # UTC hour for daily sync
 
     # Cache eviction (all disabled by default — set > 0 to enable)
-    evict_older_than_years: int = 0    # age cutoff; entities older than this become eviction-eligible
+    # Age cutoff: entities older than this become eviction-eligible
+    evict_older_than_years: int = 0
     evict_unaccessed_days: int = 180   # days since last access before an eligible entity is evicted
-    response_cache_ttl_days: int = 30  # TTL for cv_response_cache (generic resources); 0 = keep forever
+    # TTL for cv_response_cache (generic resources); 0 = keep forever
+    response_cache_ttl_days: int = 30
     search_cache_ttl_days: int = 60    # TTL for search result caches; 0 = keep forever
-    search_max_pages: int = 5          # max upstream pages to fetch per search query (100 results/page)
+    # Max upstream pages to fetch per search query (100 results/page)
+    search_max_pages: int = 5
 
     # Ingest cutoff — skip caching content older than this publication year (0 = disabled).
     # Issues: checked against store_date, then cover_date.

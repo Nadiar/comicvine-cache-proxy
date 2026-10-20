@@ -46,10 +46,16 @@ def _seed_db(db: Database) -> None:
     }
     db.upsert_issue(_issue(1073108, 160294, "Issue 1", "1", "2024-12-01", "2024-11-06",
                             "First issue", "https://example.com/issue.jpg", "https://example.com/issue"))
-    db.upsert_issue(_issue(1073109, 160294, "Issue 2", "2", "2025-01-01", "2024-12-04", "Second issue"))
+    db.upsert_issue(
+        _issue(1073109, 160294, "Issue 2", "2", "2025-01-01", "2024-12-04", "Second issue")
+    )
     db.upsert_issue(_issue(1073110, 100001, "Batman 1", "1", "2016-06-01", "2016-04-06", "Issue 1"))
-    db.upsert_issue(_issue(1073111, 100001, "Batman 50", "50", "2018-12-01", "2018-10-03", "Issue 50"))
-    db.upsert_issue(_issue(1073112, 160294, "Issue 3", "3", None, "2025-02-04", "Third issue no cover date"))
+    db.upsert_issue(
+        _issue(1073111, 100001, "Batman 50", "50", "2018-12-01", "2018-10-03", "Issue 50")
+    )
+    db.upsert_issue(
+        _issue(1073112, 160294, "Issue 3", "3", None, "2025-02-04", "Third issue no cover date")
+    )
 
 
 def _mock_cv_client() -> AsyncMock:
@@ -550,7 +556,8 @@ def test_dashboard_data_records_after_search(app_client: TestClient) -> None:
     recent = data["recent_requests"]
     assert len(recent) == 1
     assert "query_url" in recent[0]
-    assert "Absolute+Batman" in recent[0]["query_url"] or "Absolute%20Batman" in recent[0]["query_url"]
+    query_url = recent[0]["query_url"]
+    assert "Absolute+Batman" in query_url or "Absolute%20Batman" in query_url
     assert "api_key" not in recent[0]["query_url"]
 
 
@@ -1282,7 +1289,7 @@ def test_non_api_404_returns_standard_format(app_client: TestClient) -> None:
 
 
 def test_api_404_returns_cv_error_envelope(app_client: TestClient) -> None:
-    """Requests to non-existent /api/ endpoints are handled by generic_list, returning empty results."""
+    """Requests to unknown /api/ endpoints go to generic_list and return empty results."""
     # This path now matches /{resources}/ and is handled by generic_list catch-all.
     # When upstream has no data, returns empty list with status_code=1 (not 101 error).
     resp = app_client.get("/api/nonexistent-endpoint-xyz/")

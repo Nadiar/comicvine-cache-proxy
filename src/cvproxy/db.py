@@ -12,13 +12,16 @@ from __future__ import annotations
 import json
 import logging
 from datetime import date, timedelta
-
-try:
-    import pysqlite3 as sqlite3  # bundled SQLite with FTS5 support
-except ImportError:
-    import sqlite3  # type: ignore[no-redef]
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import sqlite3  # pysqlite3 mirrors the stdlib API, so type-check against that
+else:
+    try:
+        import pysqlite3 as sqlite3  # bundled SQLite with FTS5 support
+    except ImportError:
+        import sqlite3
 
 logger = logging.getLogger(__name__)
 
@@ -462,7 +465,7 @@ def _row_to_publisher(row: sqlite3.Row) -> CVPublisher:
     }
 
 
-def _image_dict(url: str | None) -> dict[str, str] | None:
+def _image_dict(url: str | None) -> dict[str, str | None] | None:
     if not url:
         return None
     def _sized(size: str) -> str:
@@ -486,9 +489,10 @@ def _parse_json_col(row: sqlite3.Row, col: str) -> list[dict[str, Any]]:
     if not raw:
         return []
     try:
-        return json.loads(raw)
+        parsed: list[dict[str, Any]] = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return []
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +595,7 @@ class Database:
             "'issue_fts_ai', 'issue_fts_au', 'issue_fts_ad',"
             "'publisher_fts_ai', 'publisher_fts_au', 'publisher_fts_ad')"
         )
-        return cur.fetchone()[0]
+        return int(cur.fetchone()[0])
 
     def close(self) -> None:
         if self._conn:
@@ -764,7 +768,7 @@ class Database:
                 "SELECT COUNT(*) FROM volume_fts WHERE volume_fts MATCH ?",
                 [fts_query],
             )
-            return cur.fetchone()[0]
+            return int(cur.fetchone()[0])
         except sqlite3.OperationalError:
             return 0
 
@@ -773,7 +777,8 @@ class Database:
         safe = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{safe}%"
         cur = self.conn.execute(
-            _VOLUME_SELECT + " WHERE v.name LIKE ? ESCAPE '\\' ORDER BY v.start_year DESC LIMIT ? OFFSET ?",
+            _VOLUME_SELECT
+            + " WHERE v.name LIKE ? ESCAPE '\\' ORDER BY v.start_year DESC LIMIT ? OFFSET ?",
             [pattern, limit, offset],
         )
         return cur.fetchall()
@@ -890,7 +895,7 @@ class Database:
         offset: int = 0,
     ) -> tuple[list[CVIssue], int]:
         """Search issues by name using FTS5 with LIKE fallback."""
-        return self._search_entity_by_name(  # type: ignore[return-value]
+        return self._search_entity_by_name(
             query,
             table="cv_issue",
             cols=_ISSUE_COLS,
@@ -1065,7 +1070,7 @@ class Database:
         offset: int = 0,
     ) -> tuple[list[CVPublisher], int]:
         """Search publishers by name using FTS5 with LIKE fallback."""
-        return self._search_entity_by_name(  # type: ignore[return-value]
+        return self._search_entity_by_name(
             query,
             table="cv_publisher",
             cols=_PUBLISHER_COLS,
@@ -1209,9 +1214,10 @@ class Database:
         return missing[:limit]
 
     def cache_get_search(self, params_hash: str) -> dict[str, Any] | None:
-        """Return cached search data as {results: [...], total: int, query: str}, or None on miss."""
+        """Return cached search data as {results, total, query}, or None on miss."""
         cur = self.conn.execute(
-            "SELECT data_json FROM cv_response_cache WHERE resource_type='search' AND params_hash=?",
+            "SELECT data_json FROM cv_response_cache"
+            " WHERE resource_type='search' AND params_hash=?",
             [params_hash],
         )
         row = cur.fetchone()
@@ -1379,7 +1385,9 @@ class Database:
                     last_issue = json.loads(last_issue)
                 except (json.JSONDecodeError, TypeError):
                     last_issue = {}
-            if isinstance(last_issue, dict) and self._is_before_cutoff(last_issue.get("cover_date")):
+            if isinstance(last_issue, dict) and self._is_before_cutoff(
+                last_issue.get("cover_date")
+            ):
                 return
         pub = data.get("publisher") or {}
         if pub.get("id"):
@@ -1541,7 +1549,7 @@ class Database:
             "SELECT COUNT(*) FROM cv_response_cache WHERE cached_at < ?",
             [cutoff],
         )
-        return cur.fetchone()[0]
+        return int(cur.fetchone()[0])
 
     def get_counts(self) -> dict[str, int]:
         """Return row counts for health/stats endpoint."""
