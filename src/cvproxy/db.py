@@ -1380,7 +1380,8 @@ class Database:
                 _to_json(data.get("first_appearance_objects")),
                 _to_json(data.get("first_appearance_storyarcs")),
                 _to_json(data.get("first_appearance_teams")),
-                int(data.get("has_staff_review") or 0),
+                # CV sends false, or a review object when one exists
+                int(bool(data.get("has_staff_review"))),
                 data.get("api_detail_url"),
                 data.get("date_added"),
                 data.get("date_last_updated"),

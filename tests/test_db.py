@@ -357,6 +357,26 @@ def test_upsert_issue_stores_new_fields(tmp_db: Database) -> None:
     assert issue["first_appearance_teams"] == []
 
 
+def test_upsert_issue_staff_review_object_stored_as_true(tmp_db: Database) -> None:
+    """CV returns has_staff_review as an object when a review exists."""
+    data = {
+        "id": 88003,
+        "volume": {"id": 160294},
+        "issue_number": "1",
+        "has_staff_review": {
+            "api_detail_url": "https://comicvine.gamespot.com/api/review/1900-1/",
+            "id": 1,
+            "name": "Staff Review",
+            "site_detail_url": "https://comicvine.gamespot.com/reviews/1900-1/",
+        },
+        "image": {},
+    }
+    tmp_db.upsert_issue(data)
+    issue = tmp_db.get_issue(88003)
+    assert issue is not None
+    assert issue["has_staff_review"] is True
+
+
 def test_upsert_volume_stores_new_fields(tmp_db: Database) -> None:
     """New cv_volume fields round-trip through upsert → get."""
     data = {
