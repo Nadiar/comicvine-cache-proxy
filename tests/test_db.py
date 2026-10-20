@@ -1,6 +1,7 @@
 """Tests for the database layer."""
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -951,3 +952,114 @@ def test_volume_with_zero_issue_count_is_not_complete(tmp_db: Database) -> None:
     """count_of_issues=0 may just be stale; don't answer authoritatively from it."""
     tmp_db.upsert_volume({"id": 424243, "name": "Brand New", "count_of_issues": 0})
     assert tmp_db.volume_issues_complete(424243, sync_ttl_hours=24) is False
+
+
+# ---------------------------------------------------------------------------
+# Issue detail tracking (detail_fetched_at)
+# ---------------------------------------------------------------------------
+
+
+def _detail_issue(iid: int, updated: str = "2026-01-01 00:00:00") -> dict[str, Any]:
+    """Issue as returned by CV's /issue/ detail endpoint (credit keys present)."""
+    return {
+        "id": iid, "volume": {"id": 160294}, "issue_number": "9", "name": "Detail",
+        "date_last_updated": updated,
+        "person_credits": [{"id": 1, "name": "Writer"}], "character_credits": [],
+        "team_credits": [], "location_credits": [], "story_arc_credits": [],
+    }
+
+
+def _list_issue(iid: int, updated: str = "2026-01-01 00:00:00") -> dict[str, Any]:
+    """Issue as returned by CV's /issues/ list endpoint (no credit keys)."""
+    return {
+        "id": iid, "volume": {"id": 160294}, "issue_number": "9", "name": "Listed",
+        "date_last_updated": updated,
+    }
+
+
+def test_detail_upsert_marks_issue_detailed(tmp_db: Database) -> None:
+    tmp_db.upsert_issue(_detail_issue(5001))
+    assert tmp_db.issue_needs_detail(5001) is False
+
+
+def test_detail_upsert_with_no_credits_is_still_detailed(tmp_db: Database) -> None:
+    """Empty credit lists are stored as NULL, so the marker must not rely on them."""
+    issue = _detail_issue(5002)
+    issue["person_credits"] = []
+    tmp_db.upsert_issue(issue)
+    assert tmp_db.issue_needs_detail(5002) is False
+
+
+def test_list_upsert_leaves_issue_needing_detail(tmp_db: Database) -> None:
+    tmp_db.upsert_issue(_list_issue(5003))
+    assert tmp_db.issue_needs_detail(5003) is True
+
+
+def test_issue_needs_detail_false_for_unknown_issue(tmp_db: Database) -> None:
+    assert tmp_db.issue_needs_detail(424242) is False
+
+
+def test_list_upsert_keeps_credits_of_detailed_issue(tmp_db: Database) -> None:
+    """A list row for an unchanged issue updates list fields but keeps credits."""
+    tmp_db.upsert_issue(_detail_issue(5004))
+    tmp_db.upsert_issue(_list_issue(5004))
+
+    issue = tmp_db.get_issue(5004)
+    assert issue["name"] == "Listed"
+    assert issue["person_credits"] == [{"id": 1, "name": "Writer"}]
+    assert tmp_db.issue_needs_detail(5004) is False
+
+
+def test_list_upsert_with_newer_update_marks_detail_stale(tmp_db: Database) -> None:
+    """CV edited the issue since its details were fetched: keep old credits, refetch later."""
+    tmp_db.upsert_issue(_detail_issue(5005, updated="2026-01-01 00:00:00"))
+    tmp_db.upsert_issue(_list_issue(5005, updated="2026-02-01 00:00:00"))
+
+    assert tmp_db.get_issue(5005)["person_credits"] == [{"id": 1, "name": "Writer"}]
+    assert tmp_db.issue_needs_detail(5005) is True
+
+
+def test_list_upsert_clears_backfill_missing(tmp_db: Database) -> None:
+    tmp_db.upsert_issue(_list_issue(5006))
+    tmp_db.mark_backfill_missing("cv_issue", 5006)
+    tmp_db.upsert_issue(_list_issue(5006))
+
+    row = tmp_db.conn.execute("SELECT backfill_missing FROM cv_issue WHERE id = 5006").fetchone()
+    assert row[0] is None
+
+
+def test_issue_ids_needing_detail_newest_first_skips_missing(tmp_db: Database) -> None:
+    for iid in (6001, 6002, 6003):
+        tmp_db.upsert_issue(_list_issue(iid))
+    tmp_db.upsert_issue(_detail_issue(6004))
+    tmp_db.mark_backfill_missing("cv_issue", 6002)
+    tmp_db.conn.commit()
+
+    assert tmp_db.issue_ids_needing_detail(limit=10)[:2] == [6003, 6001]
+    assert 6004 not in tmp_db.issue_ids_needing_detail(limit=10)
+
+
+def test_migration_marks_existing_issues_with_credits_as_detailed(tmp_path: Path) -> None:
+    """Rows that already hold credit data are treated as detailed after the upgrade."""
+    import sqlite3 as _sqlite3
+
+    db_path = tmp_path / "old.db"
+    db = Database(db_path)
+    db.connect()
+    db.close()
+    conn = _sqlite3.connect(str(db_path))
+    conn.execute("DROP INDEX idx_issue_needs_detail")
+    conn.execute("ALTER TABLE cv_issue DROP COLUMN detail_fetched_at")
+    conn.execute(
+        "INSERT INTO cv_issue (id, volume_id, issue_number, person_credits)"
+        " VALUES (7001, 1, '1', '[{\"id\": 1}]')"
+    )
+    conn.execute("INSERT INTO cv_issue (id, volume_id, issue_number) VALUES (7002, 1, '2')")
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path)
+    db.connect()
+    assert db.issue_needs_detail(7001) is False
+    assert db.issue_needs_detail(7002) is True
+    db.close()

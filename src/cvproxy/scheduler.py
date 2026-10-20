@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from cvproxy.cv_client import NOT_FOUND as _CV_NOT_FOUND
+from cvproxy.cv_client import RATE_LIMITED as _CV_RATE_LIMITED
 
 if TYPE_CHECKING:
     from cvproxy.config import Settings
@@ -111,6 +112,7 @@ def create_scheduler(
       - Releases prefetch: daily (store_date -2w / +1w)
       - Volume backfill: hourly (100 calendar + 50 old/batch, fills new fields)
       - Issue backfill: hourly (150/batch, fills new fields)
+      - Issue detail backfill: hourly (100/batch, credits for list-only issues)
       - Publisher backfill: every 6h (50/batch, fills new fields)
       - Incremental issue sync: daily (date_last_updated last 48h)
     """
@@ -166,6 +168,19 @@ def create_scheduler(
         args=[client, db],
         id="issue_backfill",
         name="Issue backfill",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Issue detail backfill — hourly (credits for issues stored from list responses)
+    scheduler.add_job(
+        _make_tracked("Issue detail backfill", _backfill_issue_details),
+        "cron",
+        minute=5,
+        args=[client, db],
+        id="issue_detail_backfill",
+        name="Issue detail backfill",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
@@ -312,6 +327,7 @@ _VOLUME_CALENDAR_BATCH = 100  # new/updated volumes (calendar-relevant)
 _VOLUME_OLD_BATCH = 50  # older stale rows
 _ISSUE_BATCH = 150
 _PUBLISHER_BATCH = 50  # publishers table is much smaller
+_ISSUE_DETAIL_BATCH = 100
 
 
 async def _backfill_volumes(client: CVClient, db: Database) -> dict[str, Any]:
@@ -456,6 +472,46 @@ async def _backfill_issues(client: CVClient, db: Database) -> dict[str, Any]:
         await asyncio.sleep(sleep_secs)
     db.conn.commit()
     logger.info("Issue backfill: updated %d/%d issues", updated, len(issue_ids))
+    return {"updated": updated, "queued": len(issue_ids)}
+
+
+async def _backfill_issue_details(client: CVClient, db: Database) -> dict[str, Any]:
+    """Fetch /issue/ details for rows stored from list responses (no credits yet).
+
+    List endpoints (release prefetch, incremental sync, volume issue lists)
+    store issues without credits.  Newest issues go first since scrapers ask
+    about those most.  Shares the backfill hourly budget with the other jobs
+    and stops early when CV rate limits.
+    """
+    issue_ids = db.issue_ids_needing_detail(limit=_ISSUE_DETAIL_BATCH)
+    if not issue_ids:
+        logger.debug("Issue detail backfill: nothing to do")
+        return {"updated": 0, "queued": 0}
+
+    logger.info("Issue detail backfill: fetching %d issues", len(issue_ids))
+    updated = 0
+    for iid in issue_ids:
+        if client.total_hourly_calls() > _BACKFILL_HOURLY_BUDGET:
+            logger.info(
+                "Issue detail backfill: pausing after %d upstream calls in the past hour "
+                "(threshold: %d)",
+                client.total_hourly_calls(),
+                _BACKFILL_HOURLY_BUDGET,
+            )
+            break
+        sleep_secs = _backfill_call_interval(client)
+        data = await client.get_issue(iid)
+        if data is _CV_RATE_LIMITED:
+            logger.info("Issue detail backfill: rate limited by CV, stopping this run")
+            break
+        if data is _CV_NOT_FOUND:
+            db.mark_backfill_missing("cv_issue", iid)
+        elif data and data.get("results"):
+            db.upsert_issue(data["results"], commit=False)
+            updated += 1
+        await asyncio.sleep(sleep_secs)
+    db.conn.commit()
+    logger.info("Issue detail backfill: updated %d/%d issues", updated, len(issue_ids))
     return {"updated": updated, "queued": len(issue_ids)}
 
 

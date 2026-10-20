@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse
 
 from cvproxy.config import get_settings
 from cvproxy.cv_client import NOT_FOUND, RATE_LIMITED, CVClient, _RateLimited
-from cvproxy.db import Database, is_past_cutoff
+from cvproxy.db import ISSUE_DETAIL_FIELDS, Database, is_past_cutoff
 from cvproxy.image_cache import ImageCache
 from cvproxy.stats import StatsTracker
 
@@ -982,6 +982,13 @@ async def list_volumes(
 # ---------------------------------------------------------------------------
 
 
+def _wants_issue_detail(field_list: str) -> bool:
+    """True when the response must include fields only /issue/ detail provides."""
+    if not field_list:
+        return True
+    return any(f.strip() in ISSUE_DETAIL_FIELDS for f in field_list.split(","))
+
+
 @router.get("/issue/{issue_id}/", response_model=None)
 async def get_issue(
     request: Request,
@@ -997,13 +1004,21 @@ async def get_issue(
     cache_mode = request.headers.get("X-CV-Cache", "").lower()
     issue = None if cache_mode == "no-cache" else db.get_issue(iid)
 
-    if issue:
-        _date = issue.get("store_date") or issue.get("cover_date")
+    def _serve_local(local: dict[str, Any]) -> dict[str, Any]:
+        _date = local.get("store_date") or local.get("cover_date")
         if is_past_cutoff(_date, get_settings().evict_older_than_years):
             _touch_if_evicting(db, "cv_issue", iid)
-        issue = _apply_field_list(issue, field_list)
         _record(request, endpoint="issue", source="cache", start=t0)
-        return _cv_envelope(issue)
+        return _cv_envelope(_apply_field_list(local, field_list))
+
+    # Rows stored from /issues/ list responses have no credits: fetch the
+    # details once when a request needs them, then serve them from cache.
+    if issue and (
+        cache_mode == "only-if-cached"
+        or not _wants_issue_detail(field_list)
+        or not db.issue_needs_detail(iid)
+    ):
+        return _serve_local(issue)
 
     if cache_mode == "only-if-cached":
         _record(request, endpoint="issue", source="miss", start=t0)
@@ -1025,6 +1040,9 @@ async def get_issue(
             data = {**data, "results": _apply_field_list(data["results"], field_list)}
         _record(request, endpoint="issue", source="upstream", start=t0)
         return data
+    if issue:
+        # Details unavailable right now: the list-shaped row beats an error
+        return _serve_local(issue)
 
     _record(request, endpoint="issue", source="miss", start=t0)
     return _cv_error("Issue not found", status_code=101)

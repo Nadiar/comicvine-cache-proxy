@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from cvproxy.db import Database
 from cvproxy.scheduler import (
     _BACKFILL_HOURLY_BUDGET,
     _BACKFILL_MAX_SLEEP,
@@ -112,3 +113,92 @@ async def test_publisher_backfill_calls_upstream_within_budget() -> None:
     client.get_publisher.assert_called_once_with(42)
     db.upsert_publisher.assert_called_once()
     sleep_mock.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Issue detail backfill
+# ---------------------------------------------------------------------------
+
+
+def _thin_issue(iid: int) -> dict:
+    return {"id": iid, "volume": {"id": 1}, "issue_number": str(iid), "name": f"#{iid}"}
+
+
+def _detail_payload(iid: int) -> dict:
+    return {
+        "status_code": 1, "error": "OK",
+        "results": {
+            "id": iid, "volume": {"id": 1}, "issue_number": str(iid), "name": f"#{iid}",
+            "person_credits": [{"id": 9, "name": "Artist"}], "character_credits": [],
+            "team_credits": [], "location_credits": [], "story_arc_credits": [],
+        },
+    }
+
+
+def _detail_client(responses: dict) -> MagicMock:
+    from unittest.mock import AsyncMock
+
+    client = MagicMock()
+    client.total_hourly_calls.return_value = 0
+    client.get_issue = AsyncMock(side_effect=lambda iid: responses[iid])
+    return client
+
+
+async def test_issue_detail_backfill_fills_list_only_rows(tmp_db: Database) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from cvproxy.cv_client import NOT_FOUND
+    from cvproxy.scheduler import _backfill_issue_details
+
+    for iid in (8001, 8002):
+        tmp_db.upsert_issue(_thin_issue(iid))
+    client = _detail_client({8002: _detail_payload(8002), 8001: NOT_FOUND})
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        result = await _backfill_issue_details(client, tmp_db)
+
+    assert result == {"updated": 1, "queued": 2}
+    assert tmp_db.issue_needs_detail(8002) is False
+    assert tmp_db.get_issue(8002)["person_credits"] == [{"id": 9, "name": "Artist"}]
+    # Not found upstream: skipped on later runs
+    assert 8001 not in tmp_db.issue_ids_needing_detail(limit=10)
+
+
+async def test_issue_detail_backfill_stops_when_rate_limited(tmp_db: Database) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from cvproxy.cv_client import RATE_LIMITED
+    from cvproxy.scheduler import _backfill_issue_details
+
+    for iid in (8101, 8102):
+        tmp_db.upsert_issue(_thin_issue(iid))
+    client = _detail_client({8102: RATE_LIMITED, 8101: _detail_payload(8101)})
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        await _backfill_issue_details(client, tmp_db)
+
+    client.get_issue.assert_called_once_with(8102)
+    assert tmp_db.issue_needs_detail(8101) is True
+
+
+async def test_issue_detail_backfill_pauses_when_budget_exceeded(tmp_db: Database) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from cvproxy.scheduler import _backfill_issue_details
+
+    tmp_db.upsert_issue(_thin_issue(8201))
+    client = _detail_client({})
+    client.total_hourly_calls.return_value = _BACKFILL_HOURLY_BUDGET + 1
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        await _backfill_issue_details(client, tmp_db)
+
+    client.get_issue.assert_not_called()
+
+
+def test_issue_detail_backfill_job_registered() -> None:
+    from cvproxy.config import Settings
+
+    settings = Settings(cv_api_key="testkey", sync_enabled=True)
+    scheduler = create_scheduler(settings, MagicMock(), MagicMock(), MagicMock())
+    assert "issue_detail_backfill" in {job.id for job in scheduler.get_jobs()}

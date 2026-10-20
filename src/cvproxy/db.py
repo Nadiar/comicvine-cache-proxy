@@ -91,6 +91,16 @@ _PUBLISHER_COLS = (
     "date_added, date_last_updated"
 )
 
+#: cv_issue columns only the /issue/ detail endpoint returns (never /issues/ lists)
+ISSUE_DETAIL_FIELDS: tuple[str, ...] = (
+    "character_credits", "person_credits", "team_credits", "location_credits",
+    "story_arc_credits", "concept_credits", "object_credits",
+    "character_died_in", "team_disbanded_in",
+    "first_appearance_characters", "first_appearance_concepts",
+    "first_appearance_locations", "first_appearance_objects",
+    "first_appearance_storyarcs", "first_appearance_teams",
+)
+
 # ---------------------------------------------------------------------------
 # Schema DDL — auto-created on first run if tables are missing
 # ---------------------------------------------------------------------------
@@ -174,7 +184,8 @@ CREATE TABLE IF NOT EXISTS cv_issue (
     date_added TEXT,
     date_last_updated TEXT,
     backfill_missing INTEGER,
-    last_accessed TEXT
+    last_accessed TEXT,
+    detail_fetched_at TEXT
 );
 
 -- When a volume's full issue list was last fetched from upstream
@@ -209,6 +220,8 @@ CREATE INDEX IF NOT EXISTS idx_resp_cache_search_query
 CREATE INDEX IF NOT EXISTS idx_issue_store_date ON cv_issue(store_date)
     WHERE store_date IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_issue_volume_id ON cv_issue(volume_id);
+CREATE INDEX IF NOT EXISTS idx_issue_needs_detail ON cv_issue(id)
+    WHERE detail_fetched_at IS NULL;
 """
 
 _FTS_DDL = """
@@ -330,6 +343,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("date_last_updated", "TEXT"),
         ("last_accessed", "TEXT"),
         ("backfill_missing", "INTEGER"),
+        ("detail_fetched_at", "TEXT"),
     ],
 }
 
@@ -537,12 +551,37 @@ class Database:
         *after* the migration step adds those columns to existing databases.
         """
         self.conn.executescript(_SCHEMA_TABLES_DDL)
+        had_detail_marker = "detail_fetched_at" in {
+            row[1] for row in self.conn.execute("PRAGMA table_info(cv_issue)")
+        }
         _migrate_columns(self.conn)
+        if not had_detail_marker:
+            self._mark_existing_detailed_issues()
         self.conn.executescript(_SCHEMA_INDEXES_DDL)
         try:
             self._setup_fts()
         except sqlite3.OperationalError as exc:
             logger.warning("FTS5 setup failed — full-text search unavailable: %s", exc)
+
+    def _mark_existing_detailed_issues(self) -> None:
+        """Stamp detail_fetched_at on rows that already hold detail-only data.
+
+        Runs once, when the column is added.  Rows without any credit data
+        can't be told apart from list-only rows, so they stay unmarked and get
+        refetched on demand or by the detail backfill.
+        """
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(cv_issue)")}
+        has_detail = " OR ".join(
+            f"{col} IS NOT NULL" for col in ISSUE_DETAIL_FIELDS if col in existing
+        )
+        if not has_detail:
+            return
+        cur = self.conn.execute(
+            "UPDATE cv_issue SET detail_fetched_at = COALESCE(date_last_updated, datetime('now'))"
+            f" WHERE detail_fetched_at IS NULL AND ({has_detail})"  # noqa: S608
+        )
+        self.conn.commit()
+        logger.info("Migrated: marked %d existing issues as detailed", cur.rowcount)
 
     def _setup_fts(self) -> None:
         """Create the FTS virtual table and sync triggers.
@@ -1442,7 +1481,13 @@ class Database:
             self.conn.commit()
 
     def upsert_issue(self, data: dict[str, Any], commit: bool = True) -> None:
-        """Insert or replace an issue from an upstream CV API results dict."""
+        """Insert or update an issue from an upstream CV API results dict.
+
+        Detail responses (``/issue/``, which carry the credit lists) replace the
+        row and stamp ``detail_fetched_at``.  List responses (``/issues/``) only
+        update list fields, so stored credits survive; when CV reports a newer
+        ``date_last_updated`` the stored details are flagged for a refetch.
+        """
         if not data.get("id"):
             return
         if self._cutoff_year:
@@ -1457,57 +1502,62 @@ class Database:
         if isinstance(aliases, list):
             aliases = "\n".join(aliases)
 
-        self.conn.execute(
-            """INSERT OR REPLACE INTO cv_issue
-                   (id, volume_id, name, issue_number, cover_date, store_date,
-                    description, image_url, site_detail_url,
-                    character_credits, person_credits, team_credits,
-                    location_credits, story_arc_credits, associated_images,
-                    aliases, deck, concept_credits, object_credits,
-                    character_died_in, team_disbanded_in,
-                    first_appearance_characters, first_appearance_concepts,
-                    first_appearance_locations, first_appearance_objects,
-                    first_appearance_storyarcs, first_appearance_teams,
-                    has_staff_review, api_detail_url, date_added, date_last_updated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                data.get("id"),
-                volume.get("id"),
-                data.get("name"),
-                data.get("issue_number"),
-                data.get("cover_date"),
-                data.get("store_date"),
-                data.get("description"),
-                image_url,
-                data.get("site_detail_url"),
-                _to_json(data.get("character_credits")),
-                _to_json(data.get("person_credits")),
-                _to_json(data.get("team_credits")),
-                _to_json(data.get("location_credits")),
-                _to_json(data.get("story_arc_credits")),
-                _to_json(data.get("associated_images")),
-                aliases,
-                data.get("deck"),
-                _to_json(data.get("concept_credits")),
-                _to_json(data.get("object_credits")),
-                _to_json(data.get("character_died_in")),
-                _to_json(data.get("team_disbanded_in")),
-                _to_json(data.get("first_appearance_characters")),
-                _to_json(data.get("first_appearance_concepts")),
-                _to_json(data.get("first_appearance_locations")),
-                _to_json(data.get("first_appearance_objects")),
-                _to_json(data.get("first_appearance_storyarcs")),
-                _to_json(data.get("first_appearance_teams")),
-                # CV sends false, or a review object when one exists
-                int(bool(data.get("has_staff_review"))),
-                data.get("api_detail_url"),
-                data.get("date_added"),
-                data.get("date_last_updated"),
-            ],
-        )
+        row: dict[str, Any] = {
+            "id": data.get("id"),
+            "volume_id": volume.get("id"),
+            "name": data.get("name"),
+            "issue_number": data.get("issue_number"),
+            "cover_date": data.get("cover_date"),
+            "store_date": data.get("store_date"),
+            "description": data.get("description"),
+            "image_url": image_url,
+            "site_detail_url": data.get("site_detail_url"),
+            "associated_images": _to_json(data.get("associated_images")),
+            "aliases": aliases,
+            "deck": data.get("deck"),
+            # CV sends false, or a review object when one exists
+            "has_staff_review": int(bool(data.get("has_staff_review"))),
+            "api_detail_url": data.get("api_detail_url"),
+            "date_added": data.get("date_added"),
+            "date_last_updated": data.get("date_last_updated"),
+        }
+        if any(col in data for col in ISSUE_DETAIL_FIELDS):
+            row.update({col: _to_json(data.get(col)) for col in ISSUE_DETAIL_FIELDS})
+            cols = ", ".join(row)
+            self.conn.execute(
+                f"INSERT OR REPLACE INTO cv_issue ({cols}, detail_fetched_at)"  # noqa: S608
+                f" VALUES ({', '.join('?' * len(row))}, datetime('now'))",
+                list(row.values()),
+            )
+        else:
+            updates = ", ".join(f"{col} = excluded.{col}" for col in row if col != "id")
+            self.conn.execute(
+                f"INSERT INTO cv_issue ({', '.join(row)})"  # noqa: S608
+                f" VALUES ({', '.join('?' * len(row))})"
+                f" ON CONFLICT(id) DO UPDATE SET {updates}, backfill_missing = NULL,"
+                " detail_fetched_at = CASE WHEN date_last_updated IS excluded.date_last_updated"
+                " THEN detail_fetched_at END",
+                list(row.values()),
+            )
         if commit:
             self.conn.commit()
+
+    def issue_needs_detail(self, issue_id: int) -> bool:
+        """True when a stored issue has never had its /issue/ detail fetched (or it is stale)."""
+        row = self.conn.execute(
+            "SELECT detail_fetched_at IS NULL FROM cv_issue WHERE id = ?", [issue_id]
+        ).fetchone()
+        return bool(row and row[0])
+
+    def issue_ids_needing_detail(self, limit: int) -> list[int]:
+        """IDs of stored issues lacking detail data, newest first, skipping ones CV lost."""
+        cur = self.conn.execute(
+            "SELECT id FROM cv_issue WHERE detail_fetched_at IS NULL"
+            " AND (backfill_missing IS NULL OR backfill_missing = 0)"
+            " ORDER BY id DESC LIMIT ?",
+            [limit],
+        )
+        return [row[0] for row in cur.fetchall()]
 
     # -- repair helpers ------------------------------------------------------
 

@@ -164,6 +164,7 @@ When `SYNC_ENABLED=true`, the following jobs run automatically:
 | Incremental issue sync | Daily, 1h after prefetch | Re-fetches issues updated in the last 48h |
 | Volume backfill | Hourly at :30 | Re-fetches volumes missing new fields |
 | Issue backfill | Hourly at :45 | Re-fetches issues missing new fields |
+| Issue detail backfill | Hourly at :05 | Fetches credits for issues stored from list responses, newest first |
 | Publisher backfill | Every 6h at :15 | Re-fetches publishers missing new fields |
 | Search cache backfill | Every 2h at :50 | Fetches volumes seen in search results but not yet in DB |
 | Stale data eviction | Daily, 3h after prefetch | Removes expired entities (when eviction is configured) |

@@ -2048,3 +2048,109 @@ def test_volume_only_filter_refreshes_partial_volume(app_client: TestClient) -> 
         assert resp.json()["number_of_total_results"] == 17
 
     assert mock_client.get.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue detail: list-only rows are fetched and cached in full
+# ---------------------------------------------------------------------------
+
+_COMICMANAGER_DETAIL_FIELDS = (
+    "id,volume,name,issue_number,cover_date,description,image,person_credits,"
+    "character_credits,team_credits,location_credits,story_arc_credits,"
+    "site_detail_url,associated_images"
+)
+
+
+def _seed_list_only_issue(db: Database) -> None:
+    db.upsert_issue({
+        "id": 1197116, "volume": {"id": 160294}, "issue_number": "7", "name": "Thin",
+        "date_last_updated": "2026-01-01 00:00:00",
+    })
+
+
+def _issue_detail_response() -> dict:
+    return {
+        "status_code": 1, "error": "OK",
+        "number_of_total_results": 1, "number_of_page_results": 1,
+        "limit": 1, "offset": 0,
+        "results": {
+            "id": 1197116, "volume": {"id": 160294, "name": "Absolute Batman"},
+            "issue_number": "7", "name": "Thin", "description": "Full text",
+            "date_last_updated": "2026-01-01 00:00:00",
+            "person_credits": [{"id": 40439, "name": "Scott Snyder", "role": "writer"}],
+            "character_credits": [{"id": 1699, "name": "Batman"}],
+            "team_credits": [], "location_credits": [], "story_arc_credits": [],
+        },
+    }
+
+
+def test_issue_detail_for_list_only_row_fetches_and_caches(app_client: TestClient) -> None:
+    _seed_list_only_issue(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    mock_client.get_issue = AsyncMock(return_value=_issue_detail_response())
+    app_client.app.state.cv_client = mock_client
+
+    params = {"field_list": _COMICMANAGER_DETAIL_FIELDS}
+    first = app_client.get("/api/issue/4000-1197116/", params=params)
+    second = app_client.get("/api/issue/4000-1197116/", params=params)
+
+    for resp in (first, second):
+        assert resp.status_code == 200
+        result = resp.json()["results"]
+        assert result["person_credits"][0]["name"] == "Scott Snyder"
+        assert result["character_credits"][0]["name"] == "Batman"
+        assert result["description"] == "Full text"
+    mock_client.get_issue.assert_called_once_with(1197116)
+    assert app_client.app.state.db.issue_needs_detail(1197116) is False
+
+
+def test_issue_list_fields_for_list_only_row_served_locally(app_client: TestClient) -> None:
+    _seed_list_only_issue(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get(
+        "/api/issue/4000-1197116/", params={"field_list": "id,name,issue_number,cover_date"}
+    )
+
+    assert resp.json()["results"]["name"] == "Thin"
+    mock_client.get_issue.assert_not_called()
+
+
+def test_issue_detail_for_list_only_row_rate_limited_returns_420(app_client: TestClient) -> None:
+    from cvproxy.cv_client import RATE_LIMITED
+
+    _seed_list_only_issue(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    mock_client.get_issue = AsyncMock(return_value=RATE_LIMITED)
+    mock_client.retry_after = MagicMock(side_effect=[0.0, 90.0])
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get(
+        "/api/issue/4000-1197116/", params={"field_list": _COMICMANAGER_DETAIL_FIELDS}
+    )
+
+    assert resp.status_code == 420
+    assert resp.headers["Retry-After"] == "90"
+
+
+def test_issue_detail_upstream_failure_falls_back_to_list_row(app_client: TestClient) -> None:
+    _seed_list_only_issue(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    mock_client.get_issue = AsyncMock(return_value=None)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get("/api/issue/4000-1197116/")
+
+    assert resp.status_code == 200
+    assert resp.json()["results"]["name"] == "Thin"
+
+
+def test_issue_detail_for_detailed_row_never_goes_upstream(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get("/api/issue/4000-1073108/")
+
+    assert resp.status_code == 200
+    mock_client.get_issue.assert_not_called()
