@@ -1129,7 +1129,7 @@ class Database:
         # Exclude stored queries containing LIKE metacharacters (% _) to prevent
         # them from acting as wildcards in the pattern.
         cur = self.conn.execute(
-            """SELECT params_hash, query FROM cv_response_cache
+            r"""SELECT params_hash, query FROM cv_response_cache
                WHERE resource_type = 'search'
                  AND query IS NOT NULL
                  AND query != ?
