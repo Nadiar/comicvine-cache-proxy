@@ -25,7 +25,7 @@ import time
 from typing import Any
 from urllib.parse import urlencode, parse_qs, urlparse
 
-from fastapi import APIRouter, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Query, Request, Response
 
 from cvproxy.config import get_settings
 from cvproxy.cv_client import CVClient, RATE_LIMITED
@@ -370,6 +370,18 @@ _PUBLISHER_LIST_FIELDS: frozenset[str] = frozenset({
 })
 
 
+_SEARCH_LIST_FIELDS: dict[str, frozenset[str]] = {
+    "volume": _VOLUME_LIST_FIELDS,
+    "issue": _ISSUE_LIST_FIELDS,
+    "publisher": _PUBLISHER_LIST_FIELDS,
+}
+
+
+def _has_duplicate_ids(results: list[dict[str, Any]]) -> bool:
+    ids = [r.get("id") for r in results if r.get("id")]
+    return len(ids) != len(set(ids))
+
+
 def _apply_list_defaults(
     data: dict[str, Any],
     default_fields: frozenset[str],
@@ -424,6 +436,92 @@ def _search_relevance_key(
     return (2, missing, len(name), neg_date)
 
 
+_SEARCH_PAGE_SIZE = 100
+
+#: params_hash values whose remaining upstream pages are being fetched in the background.
+_search_fills_in_progress: set[str] = set()
+
+
+async def _fetch_search_pages(
+    client: CVClient,
+    query: str,
+    resources: str,
+    first_page: int,
+    last_page: int,
+    cv_total: int = 0,
+) -> tuple[list[dict[str, Any]], int, bool]:
+    """Fetch upstream search pages first_page..last_page (1-based, inclusive).
+
+    Stops early on an empty or short page.  Returns (results, cv_total, rate_limited).
+    """
+    results: list[dict[str, Any]] = []
+    for page_num in range(first_page, last_page + 1):
+        page_data = await _guarded_get(
+            client, client.search(query, resources, limit=_SEARCH_PAGE_SIZE, page=page_num)
+        )
+        if page_data is RATE_LIMITED:
+            return results, cv_total, True
+        if not page_data:
+            break
+        page_results = page_data.get("results") or []
+        if not page_results:
+            break
+        if cv_total == 0:
+            cv_total = page_data.get("number_of_total_results", 0)
+        results.extend(page_results)
+        if page_num * _SEARCH_PAGE_SIZE >= cv_total or len(page_results) < _SEARCH_PAGE_SIZE:
+            break
+    return results, cv_total, False
+
+
+def _store_search_results(
+    db: Database,
+    params_hash: str,
+    results: list[dict[str, Any]],
+    cv_total: int,
+    *,
+    query: str,
+    resources: str,
+) -> None:
+    """Upsert volume results into the local DB and cache the combined result list."""
+    # Upsert into local DB so backfill jobs can keep these fresh
+    if "volume" in resources:
+        for item in results:
+            if item.get("id"):
+                try:
+                    db.upsert_volume(item)
+                except Exception:  # noqa: BLE001
+                    pass
+    db.cache_put_search(params_hash, results, cv_total, query=query, resources=resources)
+
+
+async def _fill_search_cache(
+    client: CVClient,
+    db: Database,
+    params_hash: str,
+    query: str,
+    norm_query: str,
+    resources: str,
+    results: list[dict[str, Any]],
+    cv_total: int,
+    next_page: int,
+    last_page: int,
+) -> None:
+    """Background task: fetch the remaining search pages and extend the cached entry."""
+    try:
+        more, cv_total, _ = await _fetch_search_pages(
+            client, query, resources, next_page, last_page, cv_total
+        )
+        if more:
+            _store_search_results(
+                db, params_hash, results + more, cv_total, query=norm_query, resources=resources
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("Search cache fill failed for %r (%s)", query, resources)
+    finally:
+        _search_fills_in_progress.discard(params_hash)
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
@@ -432,6 +530,7 @@ def _search_relevance_key(
 @router.get("/search/")
 async def search(
     request: Request,
+    background_tasks: BackgroundTasks,
     query: str = Query(default="", alias="query"),
     resources: str = Query(default="volume", alias="resources"),
     limit: int = Query(default=100, alias="limit"),
@@ -449,8 +548,11 @@ async def search(
        served without a new upstream call.
     2. Stale check: if local FTS count > len(cached results), the local DB has
        grown (backfill jobs added new volumes) — invalidate and re-fetch.
-    3. On miss/stale: auto-paginate upstream up to search_max_pages, combine all
-       results, upsert each volume into cv_volume, store in cache.
+       Skipped while a background fill for this query is still running.
+    3. On miss/stale: fetch only the upstream pages covering offset+limit, upsert
+       each volume into cv_volume, store in cache, and respond.  The remaining
+       pages (up to search_max_pages) are fetched in a background task that
+       extends the cached entry after the response is sent.
     4. Build response: for each cached result ID, prefer fresh cv_volume data;
        fall back to cached upstream data for IDs not yet in local DB.
     5. Apply relevance sort across the full list, slice by limit/offset, apply
@@ -484,17 +586,19 @@ async def search(
         cached_data = db.cache_get_search(params_hash)
         if cached_data is not None:
             # Stale check: if local FTS has more matching volumes than cache, re-fetch
-            if "volume" in resources:
+            if "volume" in resources and params_hash not in _search_fills_in_progress:
                 local_count = db.count_volumes_fts(query)
                 if local_count > len(cached_data.get("results", [])):
                     cached_data = None  # invalidate
+        if cached_data is not None and _has_duplicate_ids(cached_data.get("results", [])):
+            cached_data = None  # stored by the old offset-paging bug: page 1 repeated
 
         # Superset check: if cache miss, look for a broader query whose complete
         # result set is a superset of this query.  E.g. if "batman" is fully
         # cached (all upstream pages), serve "absolute batman" from it.
         if cached_data is None and cache_mode != "no-cache":
             superset = db.cache_find_superset_search(norm_query, resources)
-            if superset is not None:
+            if superset is not None and not _has_duplicate_ids(superset["results"]):
                 # Store this derived entry so subsequent requests hit directly
                 db.cache_put_search(
                     params_hash,
@@ -537,44 +641,38 @@ async def search(
             return _cv_envelope([], total=0, limit=limit, offset=effective_offset)
 
         client = _get_client(request)
-        all_results: list[dict[str, Any]] = []
-        cv_total = 0
-        fetch_offset = 0
         max_pages = settings.search_max_pages
+        # Only the pages covering the requested slice are fetched before responding
+        pages_needed = min(max_pages, max(1, -(-(effective_offset + limit) // _SEARCH_PAGE_SIZE)))
 
-        for _ in range(max_pages):
-            page_data = await _guarded_get(client, client.search(query, resources, limit=100, offset=fetch_offset))
-            if page_data is RATE_LIMITED:
-                _record(request, endpoint="search", source="miss", start=t0)
-                return _cv_rate_limit_error()
-            if not page_data:
-                break
-            page_results = page_data.get("results", [])
-            if not page_results:
-                break
-            if cv_total == 0:
-                cv_total = page_data.get("number_of_total_results", 0)
-            all_results.extend(page_results)
-            if len(all_results) >= cv_total or len(page_results) < 100:
-                break
-            fetch_offset += 100
+        all_results, cv_total, rate_limited = await _fetch_search_pages(
+            client, query, resources, 1, pages_needed
+        )
+        if rate_limited and not all_results:
+            _record(request, endpoint="search", source="miss", start=t0)
+            return _cv_rate_limit_error()
 
         if not all_results:
             _record(request, endpoint="search", source="miss", start=t0)
             return _cv_envelope([], total=0, limit=limit, offset=effective_offset)
 
-        # Upsert into local DB so backfill jobs can keep these fresh
-        for item in all_results:
-            if "volume" in resources and item.get("id"):
-                try:
-                    db.upsert_volume(item)
-                except Exception:  # noqa: BLE001
-                    pass
-
-        db.cache_put_search(
-            params_hash, all_results, cv_total, query=norm_query, resources=resources
+        _store_search_results(
+            db, params_hash, all_results, cv_total, query=norm_query, resources=resources
         )
         cached_data = {"results": all_results, "total": cv_total}
+
+        more_upstream = (
+            not rate_limited
+            and len(all_results) == pages_needed * _SEARCH_PAGE_SIZE
+            and len(all_results) < cv_total
+            and pages_needed < max_pages
+        )
+        if more_upstream and params_hash not in _search_fills_in_progress:
+            _search_fills_in_progress.add(params_hash)
+            background_tasks.add_task(
+                _fill_search_cache, client, db, params_hash, query, norm_query, resources,
+                list(all_results), cv_total, pages_needed + 1, max_pages,
+            )
         _record(request, endpoint="search", source="upstream", start=t0)
     else:
         _record(request, endpoint="search", source="cache", start=t0)
@@ -608,7 +706,7 @@ async def search(
     page_slice = enriched[effective_offset: effective_offset + limit]
 
     # Apply field_list (never forwarded upstream, always applied here)
-    list_fields = _VOLUME_LIST_FIELDS | {"resource_type"}
+    list_fields = _SEARCH_LIST_FIELDS.get(resource_type, _VOLUME_LIST_FIELDS) | {"resource_type"}
     shaped = [_apply_list_defaults(r, list_fields, field_list) for r in page_slice]
 
     return _cv_envelope(shaped, total=cv_total, limit=limit, offset=effective_offset)

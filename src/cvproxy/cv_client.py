@@ -313,15 +313,16 @@ class CVClient:
         resources: str = "volume",
         *,
         limit: int = 100,
-        offset: int = 0,
+        page: int = 1,
     ) -> dict[str, Any] | None:
+        # CV's /search ignores offset; it pages by 1-based `page`.
         return await self.get(
             "search/",
             {
                 "query": query,
                 "resources": resources,
                 "limit": limit,
-                "offset": offset,
+                "page": page,
             },
         )
 

@@ -52,7 +52,7 @@ All settings via environment variables:
 | `RATE_LIMIT_PER_HOUR_PER_ENDPOINT` | `180` | Upstream calls per hour per CV endpoint path |
 | `SYNC_ENABLED` | `true` | Enable background scheduler |
 | `SYNC_CRON_HOUR` | `3` | UTC hour for daily sync jobs |
-| `SEARCH_MAX_PAGES` | `5` | Max upstream pages fetched per search query (100 results/page) |
+| `SEARCH_MAX_PAGES` | `5` | Max upstream pages fetched per search query (100 results/page). A cold search returns after the pages covering the request; the rest are fetched in the background. |
 | `RESPONSE_CACHE_TTL_DAYS` | `30` | TTL for generic resource cache; `0` = keep forever |
 | `SEARCH_CACHE_TTL_DAYS` | `60` | TTL for search result cache; `0` = keep forever |
 | `CACHE_CUTOFF_YEAR` | `0` | Skip caching issues/volumes older than this publication year (e.g. `1995`). Issues checked against `store_date` then `cover_date`; volumes against `last_issue.cover_date`. `0` = disabled. |

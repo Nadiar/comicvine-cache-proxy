@@ -245,6 +245,138 @@ def test_search_default_fields(app_client: TestClient) -> None:
     assert "resource_type" in result
 
 
+def _search_page(results: list[dict], total: int) -> dict:
+    return {
+        "status_code": 1, "error": "OK",
+        "number_of_total_results": total, "number_of_page_results": len(results),
+        "limit": 100, "offset": 0, "results": results,
+    }
+
+
+def _mock_search_client(pages: dict[int, dict]) -> MagicMock:
+    """CV client whose search() returns pages keyed by 1-based page number."""
+    from unittest.mock import AsyncMock
+
+    mock_client = AsyncMock()
+    mock_client.total_hourly_calls = MagicMock(return_value=0)
+
+    async def fake_search(
+        query: str, resources: str = "volume", *, limit: int = 100, page: int = 1
+    ) -> dict:
+        return pages.get(page, _search_page([], 0))
+
+    mock_client.search = AsyncMock(side_effect=fake_search)
+    return mock_client
+
+
+def test_search_upstream_requests_successive_pages(app_client: TestClient) -> None:
+    """CV search pages by `page`, so each upstream call must request the next page."""
+    page1 = [{"id": i, "name": f"Saga {i}"} for i in range(1, 101)]
+    page2 = [{"id": i, "name": f"Saga {i}"} for i in range(101, 104)]
+    mock_client = _mock_search_client({1: _search_page(page1, 103), 2: _search_page(page2, 103)})
+    app_client.app.state.cv_client = mock_client
+
+    first = app_client.get("/api/search/", params={"query": "Saga", "limit": 100}).json()
+    second = app_client.get(
+        "/api/search/", params={"query": "Saga", "limit": 100, "offset": 100}
+    ).json()
+
+    ids = [r["id"] for r in first["results"] + second["results"]]
+    assert len(ids) == 103
+    assert len(set(ids)) == 103
+    pages_requested = [c.kwargs["page"] for c in mock_client.search.call_args_list]
+    assert pages_requested == [1, 2]
+
+
+def test_search_cold_fetches_needed_pages_then_fills_rest(app_client: TestClient) -> None:
+    """A cold search fetches pages covering offset+limit, then the rest in the background."""
+    def saga_page(n: int) -> dict:
+        ids = range((n - 1) * 100 + 1, min(n * 100, 250) + 1)
+        return _search_page([{"id": i, "name": f"Saga {i}"} for i in ids], 250)
+
+    pages = {n: saga_page(n) for n in (1, 2, 3)}
+    mock_client = _mock_search_client(pages)
+    app_client.app.state.cv_client = mock_client
+
+    data = app_client.get(
+        "/api/search/", params={"query": "Saga", "limit": 10, "offset": 150}
+    ).json()
+
+    assert len(data["results"]) == 10
+    assert data["number_of_total_results"] == 250
+    assert [c.kwargs["page"] for c in mock_client.search.call_args_list] == [1, 2, 3]
+
+    # Background fill cached every page — later pages are served without upstream calls
+    mock_client.search.reset_mock()
+    tail = app_client.get(
+        "/api/search/", params={"query": "Saga", "limit": 100, "offset": 200}
+    ).json()
+    assert len(tail["results"]) == 50
+    mock_client.search.assert_not_called()
+
+
+def test_search_partial_cache_not_refetched_while_fill_in_progress(app_client: TestClient) -> None:
+    """While a background fill runs, a partial cache is served instead of re-fetching."""
+    import hashlib
+
+    from cvproxy.routes import api
+
+    db = app_client.app.state.db
+    params_hash = hashlib.md5(b"q:batman|r:volume").hexdigest()
+    # Local FTS has 3 Batman volumes; the partial cache has only 1 — normally "stale".
+    db.cache_put_search(
+        params_hash, [{"id": 100001, "name": "Batman"}], 3, query="batman", resources="volume"
+    )
+    mock_client = _mock_search_client({})
+    app_client.app.state.cv_client = mock_client
+
+    api._search_fills_in_progress.add(params_hash)
+    try:
+        data = app_client.get("/api/search/", params={"query": "Batman"}).json()
+    finally:
+        api._search_fills_in_progress.discard(params_hash)
+
+    assert [r["id"] for r in data["results"]] == [100001]
+    mock_client.search.assert_not_called()
+
+
+def test_search_refetches_cache_with_duplicate_ids(app_client: TestClient) -> None:
+    """A cached search holding repeated IDs (old offset-paging bug) is re-fetched."""
+    import hashlib
+
+    db = app_client.app.state.db
+    params_hash = hashlib.md5(b"q:saga|r:volume").hexdigest()
+    poisoned = [{"id": 1, "name": "Saga"}, {"id": 2, "name": "Saga 2"}] * 3
+    db.cache_put_search(params_hash, poisoned, 2, query="saga", resources="volume")
+
+    fresh = [{"id": 1, "name": "Saga"}, {"id": 2, "name": "Saga 2"}]
+    mock_client = _mock_search_client({1: _search_page(fresh, 2)})
+    app_client.app.state.cv_client = mock_client
+
+    data = app_client.get("/api/search/", params={"query": "Saga", "limit": 10}).json()
+
+    assert [r["id"] for r in data["results"]] == [1, 2]
+    mock_client.search.assert_called_once()
+
+
+def test_search_issue_default_fields(app_client: TestClient) -> None:
+    """Issue search without field_list returns CV's issue fields, not volume fields."""
+    issue = {
+        "id": 964917, "name": "Saga 1", "issue_number": "1", "cover_date": "2012-03-01",
+        "volume": {"id": 46568, "name": "Saga", "api_detail_url": "a", "site_detail_url": "s"},
+        "image": {}, "site_detail_url": "https://example.com/i",
+    }
+    app_client.app.state.cv_client = _mock_search_client({1: _search_page([issue], 1)})
+
+    data = app_client.get("/api/search/", params={"query": "Saga 1", "resources": "issue"}).json()
+
+    result = data["results"][0]
+    assert result["issue_number"] == "1"
+    assert result["cover_date"] == "2012-03-01"
+    assert result["volume"]["id"] == 46568
+    assert result["resource_type"] == "issue"
+
+
 def test_search_relevance_key_ordering() -> None:
     """Relevance sort key produces the correct tier ordering."""
     from cvproxy.routes.api import _search_relevance_key
