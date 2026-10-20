@@ -52,6 +52,7 @@ All settings via environment variables:
 | `BACKUP_KEEP` | `3` | Snapshots to keep (`0` disables backups) |
 | `RATE_LIMIT_PER_MINUTE` | `100` | Global upstream calls per minute |
 | `RATE_LIMIT_PER_HOUR_PER_ENDPOINT` | `180` | Upstream calls per hour per CV endpoint path |
+| `RATE_STATE_PATH` | `/data/rate_state.json` | Recent upstream call times and cooldown, kept across restarts |
 | `RATE_LIMIT_COOLDOWN_SECONDS` | `600` | Pause on all upstream calls after CV answers 420/429/107 (an upstream `Retry-After` wins) |
 | `SYNC_ENABLED` | `true` | Enable background scheduler |
 | `SYNC_CRON_HOUR` | `3` | UTC hour for daily sync jobs |
@@ -169,6 +170,7 @@ When `SYNC_ENABLED=true`, the following jobs run automatically:
 | Issue detail backfill | Hourly at :05 | Fetches credits for issues stored from list responses, newest first |
 | Publisher backfill | Every 6h at :15 | Re-fetches publishers missing new fields |
 | Search cache backfill | Every 2h at :50 | Fetches volumes seen in search results but not yet in DB |
+| Pending fetch | Every 2 min | Fetches requests that missed the cache while ComicVine was rate limiting, oldest first; backfill on that endpoint waits until they're done |
 | Database backup | Daily at `SYNC_CRON_HOUR`+4 | Compacted snapshot (`VACUUM INTO`) in `BACKUP_DIR`, keeps `BACKUP_KEEP` |
 | Stale data eviction | Daily, 3h after prefetch | Removes expired entities (when eviction is configured) |
 | Image cache cleanup | Daily, 2h after prefetch | Removes expired image cache entries |

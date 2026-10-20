@@ -84,6 +84,7 @@ def app_client(tmp_path: Path) -> Generator[TestClient]:
         db_path=db_path,
         image_cache_dir=tmp_path / "images",
         stats_db_path=tmp_path / "stats.db",
+        rate_state_path=tmp_path / "rate_state.json",
         sync_enabled=False,
     )
     override_settings(settings)
@@ -1635,6 +1636,7 @@ def app_client_eviction_enabled(tmp_path: Path) -> Generator[TestClient]:
         db_path=db_path,
         image_cache_dir=tmp_path / "images",
         stats_db_path=tmp_path / "stats.db",
+        rate_state_path=tmp_path / "rate_state.json",
         sync_enabled=False,
         evict_older_than_years=5,
     )
@@ -1696,6 +1698,7 @@ def test_issue_detail_touches_last_accessed_for_old_issue(
         db_path=db_path,
         image_cache_dir=tmp_path / "images",
         stats_db_path=tmp_path / "stats.db",
+        rate_state_path=tmp_path / "rate_state.json",
         sync_enabled=False,
         evict_older_than_years=5,
     )
@@ -1771,6 +1774,7 @@ def test_admin_evict_disabled_returns_zero_counts(app_client: TestClient) -> Non
         db_path=app_client.app.state.db._path,
         image_cache_dir=app_client.app.state.image_cache._cache_dir,
         stats_db_path=app_client.app.state.stats._path,
+        rate_state_path=app_client.app.state.stats._path.with_name("rate_state.json"),
         sync_enabled=False,
         evict_older_than_years=0,
         response_cache_ttl_days=0,
@@ -1810,6 +1814,7 @@ def test_admin_evict_dry_run_does_not_delete(
         db_path=db_path,
         image_cache_dir=tmp_path / "images",
         stats_db_path=tmp_path / "stats.db",
+        rate_state_path=tmp_path / "rate_state.json",
         sync_enabled=False,
         evict_older_than_years=5,
         response_cache_ttl_days=0,
@@ -2266,3 +2271,148 @@ def test_issue_search_without_local_match_still_returns_420(app_client: TestClie
     )
 
     assert resp.status_code == 420
+
+
+# ---------------------------------------------------------------------------
+# Pending-fetch queue: misses that couldn't reach ComicVine are queued
+# ---------------------------------------------------------------------------
+
+
+def _queued(app_client: TestClient) -> list[tuple[str, str]]:
+    return [(i["kind"], i["key"]) for i in app_client.app.state.db.pending_list(limit=50)]
+
+
+def test_rate_limited_issue_detail_is_queued(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=300.0)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get("/api/issue/4000-999999/")
+
+    assert resp.status_code == 420
+    assert _queued(app_client) == [("issue", "999999")]
+
+
+def test_rate_limited_list_only_issue_detail_is_queued(app_client: TestClient) -> None:
+    _seed_list_only_issue(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=300.0)
+    app_client.app.state.cv_client = mock_client
+
+    app_client.get("/api/issue/4000-1197116/")
+
+    assert _queued(app_client) == [("issue", "1197116")]
+
+
+def test_rate_limited_volume_and_publisher_are_queued(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=300.0)
+    app_client.app.state.cv_client = mock_client
+
+    app_client.get("/api/volume/4050-424242/")
+    app_client.get("/api/publisher/4010-4242/")
+
+    assert sorted(_queued(app_client)) == [("publisher", "4242"), ("volume", "424242")]
+
+
+def test_rate_limited_search_is_queued_even_with_local_fallback(app_client: TestClient) -> None:
+    from cvproxy.routes.api import _search_cache_key
+
+    _seed_green_arrow(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=600.0)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get(
+        "/api/search/", params={"resources": "issue", "query": "Absolute Green Arrow 1"}
+    )
+
+    assert resp.status_code == 200
+    assert _queued(app_client) == [
+        ("search", _search_cache_key("Absolute Green Arrow 1", "issue"))
+    ]
+
+
+def test_rate_limited_volume_refresh_is_queued(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=300.0)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get("/api/issues/", params={"filter": "volume:160294,issue_number:36"})
+
+    assert resp.status_code == 420
+    assert _queued(app_client) == [("volume_issues", "160294")]
+
+
+def test_rate_limited_forwarded_issue_filter_is_queued(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=300.0)
+    app_client.app.state.cv_client = mock_client
+
+    app_client.get("/api/issues/", params={"filter": "store_date:2030-01-01|2030-01-07"})
+
+    queued = app_client.app.state.db.pending_list(limit=10)
+    assert [i["kind"] for i in queued] == ["issues_filter"]
+    assert queued[0]["payload"]["filter"] == "store_date:2030-01-01|2030-01-07"
+
+
+# ---------------------------------------------------------------------------
+# Search: empty answers cached, one upstream page for "<series> <number>"
+# ---------------------------------------------------------------------------
+
+
+def test_empty_search_answer_is_cached(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.search = AsyncMock(return_value=_search_page([], 0))
+    app_client.app.state.cv_client = mock_client
+
+    for _ in range(2):
+        resp = app_client.get("/api/search/", params={"query": "Zzyzx Nonexistent"})
+        assert resp.status_code == 200
+        assert resp.json()["results"] == []
+
+    mock_client.search.assert_called_once()
+
+
+def test_failed_search_is_not_cached_as_empty(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.search = AsyncMock(side_effect=[None, _search_page([], 0)])
+    app_client.app.state.cv_client = mock_client
+
+    for _ in range(2):
+        app_client.get("/api/search/", params={"query": "Zzyzx Nonexistent"})
+
+    assert mock_client.search.call_count == 2
+
+
+def test_issue_number_search_fetches_one_upstream_page(app_client: TestClient) -> None:
+    """ComicVine ORs the words, so later pages of "<series> <number>" are noise."""
+    page1 = [{"id": 5000 + i, "name": f"Issue {i}", "issue_number": "1"} for i in range(100)]
+    mock_client = _mock_cv_client()
+    mock_client.search = AsyncMock(return_value=_search_page(page1, 18369))
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get(
+        "/api/search/", params={"resources": "issue", "query": "Absolute Flash 13", "limit": 12}
+    )
+
+    assert resp.status_code == 200
+    assert len(resp.json()["results"]) == 12
+    assert [c.kwargs["page"] for c in mock_client.search.call_args_list] == [1]
+
+
+def test_cached_empty_issue_search_still_uses_local_matches(app_client: TestClient) -> None:
+    from cvproxy.routes.api import _search_cache_key
+
+    db = app_client.app.state.db
+    _seed_green_arrow(db)
+    db.negative_cache_put("search", _search_cache_key("Absolute Green Arrow 1", "issue"))
+    mock_client = _mock_cv_client()
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get(
+        "/api/search/", params={"resources": "issue", "query": "Absolute Green Arrow 1"}
+    )
+
+    assert [r["id"] for r in resp.json()["results"]] == [1167128]
+    mock_client.search.assert_not_called()

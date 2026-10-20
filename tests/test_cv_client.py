@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from datetime import UTC
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -292,4 +293,52 @@ async def test_cooldown_rechecked_after_pacing_wait() -> None:
 
     assert result is RATE_LIMITED
     upstream.assert_not_called()
+    await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Rate state persists across restarts
+# ---------------------------------------------------------------------------
+
+
+async def test_rate_state_survives_restart(tmp_path: Path) -> None:
+    state = tmp_path / "rate_state.json"
+    first = CVClient(api_key="test", rate_limit_per_minute=6000, state_path=state)
+    ok = {"status_code": 1, "error": "OK", "results": {"id": 1}}
+    with patch.object(first._client, "get", new=AsyncMock(return_value=_json_response(ok))):
+        await first.get("issue/4000-1/")
+    with patch.object(first._client, "get", new=AsyncMock(side_effect=_status_error(420))):
+        await first.get("search/")
+    await first.close()
+
+    second = CVClient(api_key="test", state_path=state)
+
+    assert second.hourly_calls("issue/") == 1
+    assert second.hourly_calls("search/") == 1
+    assert second.retry_after("volume/") > 500  # the cooldown came back too
+    await second.close()
+
+
+async def test_rate_state_drops_calls_older_than_an_hour(tmp_path: Path) -> None:
+    state = tmp_path / "rate_state.json"
+    now = time.time()
+    state.write_text(json.dumps({
+        "windows": {"issue": [now - 7200, now - 60]},
+        "cooldown_until": now - 5,
+    }))
+
+    client = CVClient(api_key="test", state_path=state)
+
+    assert client.hourly_calls("issue/") == 1
+    assert client.retry_after("issue/") == 0
+    await client.close()
+
+
+async def test_rate_state_unreadable_file_starts_empty(tmp_path: Path) -> None:
+    state = tmp_path / "rate_state.json"
+    state.write_text("{not json")
+
+    client = CVClient(api_key="test", state_path=state)
+
+    assert client.total_hourly_calls() == 0
     await client.close()

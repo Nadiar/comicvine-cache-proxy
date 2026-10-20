@@ -94,6 +94,7 @@ def settings(tmp_path: Path) -> Settings:
         db_path=tmp_path / "test.db",
         image_cache_dir=tmp_path / "images",
         stats_db_path=tmp_path / "stats.db",
+        rate_state_path=tmp_path / "rate_state.json",
         sync_enabled=False,
     )
     override_settings(s)

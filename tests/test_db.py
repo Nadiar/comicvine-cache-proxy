@@ -1097,3 +1097,46 @@ def test_backup_to_replaces_existing_file(tmp_db: Database, tmp_path: Path) -> N
     tmp_db.backup_to(dest)
 
     assert dest.read_bytes()[:16] == b"SQLite format 3\x00"
+
+
+# ---------------------------------------------------------------------------
+# Pending-fetch queue
+# ---------------------------------------------------------------------------
+
+
+def test_pending_add_keeps_first_request_time_and_orders_oldest_first(tmp_db: Database) -> None:
+    tmp_db.pending_add("issue", "1", {"id": 1})
+    tmp_db.conn.execute(
+        "UPDATE cv_pending_fetch SET requested_at = datetime('now', '-1 hour') WHERE key = '1'"
+    )
+    tmp_db.pending_add("search", "h", {"query": "q", "resources": "issue"})
+    tmp_db.pending_add("issue", "1", {"id": 1})  # repeat request: no duplicate, keeps place
+
+    items = tmp_db.pending_list(limit=10)
+    assert [(i["kind"], i["key"]) for i in items] == [("issue", "1"), ("search", "h")]
+    assert items[0]["payload"] == {"id": 1}
+    assert items[0]["endpoint"] == "issue/"
+
+
+def test_pending_waiting_is_per_endpoint(tmp_db: Database) -> None:
+    tmp_db.pending_add("issue", "1", {"id": 1})
+
+    assert tmp_db.pending_waiting("issue/") is True
+    assert tmp_db.pending_waiting("volume/") is False
+
+
+def test_pending_done_and_failed(tmp_db: Database) -> None:
+    tmp_db.pending_add("issue", "1", {"id": 1})
+    tmp_db.pending_add("issue", "2", {"id": 2})
+
+    tmp_db.pending_done("issue", "1")
+    tmp_db.pending_failed("issue", "2", max_attempts=2)
+    assert [(i["key"], i["attempts"]) for i in tmp_db.pending_list(limit=10)] == [("2", 1)]
+
+    tmp_db.pending_failed("issue", "2", max_attempts=2)
+    assert tmp_db.pending_list(limit=10) == []
+
+
+def test_pending_add_rejects_unknown_kind(tmp_db: Database) -> None:
+    with pytest.raises(ValueError):
+        tmp_db.pending_add("characters", "1", {})

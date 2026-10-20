@@ -12,6 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from cvproxy.cv_client import NOT_FOUND as _CV_NOT_FOUND
 from cvproxy.cv_client import RATE_LIMITED as _CV_RATE_LIMITED
+from cvproxy.pending import process_pending
 
 if TYPE_CHECKING:
     from cvproxy.config import Settings
@@ -118,6 +119,7 @@ def create_scheduler(
       - Publisher backfill: every 6h (50/batch, fills new fields)
       - Incremental issue sync: daily (date_last_updated last 48h)
       - Database backup: daily (VACUUM INTO backup_dir, keeps backup_keep copies)
+      - Pending fetch: every 2 min (cache misses that hit a rate limit)
     """
     scheduler = AsyncIOScheduler()
     hour = settings.sync_cron_hour  # default 3 AM UTC
@@ -226,6 +228,20 @@ def create_scheduler(
         args=[db, settings],
         id="evict_stale_data",
         name="Stale data eviction",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Pending fetch — every 2 minutes: requests that missed the cache while
+    # ComicVine couldn't be asked.  Not tracked in the history (too frequent).
+    scheduler.add_job(
+        process_pending,
+        "interval",
+        minutes=2,
+        args=[client, db],
+        id="pending_fetch",
+        name="Pending fetch",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
@@ -403,6 +419,9 @@ async def _backfill_volumes(client: CVClient, db: Database) -> dict[str, Any]:
     )
     updated = 0
     for vid in volume_ids:
+        if db.pending_waiting("volume/"):
+            logger.info("Volume backfill: client requests queued for /volume/, pausing")
+            break
         if client.hourly_calls("volume/") >= _BACKFILL_HOURLY_BUDGET:
             logger.info(
                 "Volume backfill: pausing after %d /volume/ calls in the past hour "
@@ -471,6 +490,9 @@ async def _backfill_issues(client: CVClient, db: Database) -> dict[str, Any]:
     logger.info("Issue backfill: fetching %d issues", len(issue_ids))
     updated = 0
     for iid in issue_ids:
+        if db.pending_waiting("issue/"):
+            logger.info("Issue backfill: client requests queued for /issue/, pausing")
+            break
         if client.hourly_calls("issue/") >= _BACKFILL_HOURLY_BUDGET:
             logger.info(
                 "Issue backfill: pausing after %d /issue/ calls in the past hour "
@@ -508,6 +530,9 @@ async def _backfill_issue_details(client: CVClient, db: Database) -> dict[str, A
     logger.info("Issue detail backfill: fetching %d issues", len(issue_ids))
     updated = 0
     for iid in issue_ids:
+        if db.pending_waiting("issue/"):
+            logger.info("Issue detail backfill: client requests queued for /issue/, pausing")
+            break
         if client.hourly_calls("issue/") >= _BACKFILL_HOURLY_BUDGET:
             logger.info(
                 "Issue detail backfill: pausing after %d /issue/ calls in the past hour "
@@ -553,6 +578,9 @@ async def _backfill_publishers(client: CVClient, db: Database) -> dict[str, Any]
     logger.info("Publisher backfill: fetching %d publishers", len(publisher_ids))
     updated = 0
     for pid in publisher_ids:
+        if db.pending_waiting("publisher/"):
+            logger.info("Publisher backfill: client requests queued for /publisher/, pausing")
+            break
         if client.hourly_calls("publisher/") >= _BACKFILL_HOURLY_BUDGET:
             logger.info(
                 "Publisher backfill: pausing after %d /publisher/ calls in the past hour "
@@ -743,6 +771,11 @@ async def _backfill_search_cache_volumes(client: CVClient, db: Database) -> dict
     logger.info("Search cache volume backfill: fetching %d missing volumes", len(missing_ids))
     updated = 0
     for vid in missing_ids:
+        if db.pending_waiting("volume/"):
+            logger.info(
+                "Search cache volume backfill: client requests queued for /volume/, pausing"
+            )
+            break
         if client.hourly_calls("volume/") >= _BACKFILL_HOURLY_BUDGET:
             logger.info(
                 "Search cache volume backfill: pausing after %d /volume/ calls in the past hour "

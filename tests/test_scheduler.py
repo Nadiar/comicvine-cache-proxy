@@ -82,6 +82,7 @@ async def test_publisher_backfill_pauses_when_budget_exceeded() -> None:
     from cvproxy.scheduler import _BACKFILL_HOURLY_BUDGET, _backfill_publishers
 
     db = MagicMock()
+    db.pending_waiting.return_value = False
     db.conn.execute.return_value.fetchall.return_value = [(1,), (2,), (3,)]
 
     client = MagicMock()
@@ -101,6 +102,7 @@ async def test_publisher_backfill_calls_upstream_within_budget() -> None:
     from cvproxy.scheduler import _backfill_publishers
 
     db = MagicMock()
+    db.pending_waiting.return_value = False
     db.conn.execute.return_value.fetchall.return_value = [(42,)]
 
     client = MagicMock()
@@ -277,3 +279,33 @@ async def test_issue_detail_backfill_ignores_other_endpoints_usage(tmp_db: Datab
 
     client.get_issue.assert_called_once_with(8301)
     client.hourly_calls.assert_any_call("issue/")
+
+
+# ---------------------------------------------------------------------------
+# Pending fetches come before backfill
+# ---------------------------------------------------------------------------
+
+
+async def test_backfill_waits_while_requests_are_queued_for_its_endpoint(
+    tmp_db: Database,
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from cvproxy.scheduler import _backfill_issue_details
+
+    tmp_db.upsert_issue(_thin_issue(8401))
+    tmp_db.pending_add("issue", "999", {"id": 999})
+    client = _detail_client({8401: _detail_payload(8401)})
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        await _backfill_issue_details(client, tmp_db)
+
+    client.get_issue.assert_not_called()
+
+
+def test_pending_fetch_job_registered() -> None:
+    from cvproxy.config import Settings
+
+    settings = Settings(cv_api_key="testkey", sync_enabled=True)
+    scheduler = create_scheduler(settings, MagicMock(), MagicMock(), MagicMock())
+    assert "pending_fetch" in {job.id for job in scheduler.get_jobs()}

@@ -91,6 +91,16 @@ _PUBLISHER_COLS = (
     "date_added, date_last_updated"
 )
 
+#: Pending-fetch kinds and the ComicVine endpoint each one calls
+PENDING_ENDPOINTS: dict[str, str] = {
+    "issue": "issue/",
+    "volume": "volume/",
+    "publisher": "publisher/",
+    "volume_issues": "issues/",
+    "issues_filter": "issues/",
+    "search": "search/",
+}
+
 #: cv_issue columns only the /issue/ detail endpoint returns (never /issues/ lists)
 ISSUE_DETAIL_FIELDS: tuple[str, ...] = (
     "character_credits", "person_credits", "team_credits", "location_credits",
@@ -186,6 +196,17 @@ CREATE TABLE IF NOT EXISTS cv_issue (
     backfill_missing INTEGER,
     last_accessed TEXT,
     detail_fetched_at TEXT
+);
+
+-- Requests that missed the cache while ComicVine couldn't be asked
+CREATE TABLE IF NOT EXISTS cv_pending_fetch (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, key)
 );
 
 -- When a volume's full issue list was last fetched from upstream
@@ -1217,6 +1238,62 @@ class Database:
                    (resource_type, params_hash, data_json, cached_at)
                VALUES (?, ?, ?, datetime('now'))""",
             [resource_type, params_hash, json.dumps(results)],
+        )
+        self.conn.commit()
+
+    # -- pending-fetch queue -------------------------------------------------
+
+    def pending_add(self, kind: str, key: str, payload: dict[str, Any]) -> None:
+        """Queue an upstream fetch; a repeat request keeps its original place."""
+        if kind not in PENDING_ENDPOINTS:
+            raise ValueError(f"Unknown pending fetch kind: {kind!r}")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO cv_pending_fetch (kind, key, endpoint, payload)"
+            " VALUES (?, ?, ?, ?)",
+            [kind, key, PENDING_ENDPOINTS[kind], json.dumps(payload)],
+        )
+        self.conn.commit()
+
+    def pending_list(self, limit: int) -> list[dict[str, Any]]:
+        """Queued fetches, oldest request first."""
+        cur = self.conn.execute(
+            "SELECT kind, key, endpoint, payload, attempts FROM cv_pending_fetch"
+            " ORDER BY requested_at, rowid LIMIT ?",
+            [limit],
+        )
+        return [
+            {
+                "kind": row["kind"],
+                "key": row["key"],
+                "endpoint": row["endpoint"],
+                "payload": json.loads(row["payload"]),
+                "attempts": row["attempts"],
+            }
+            for row in cur.fetchall()
+        ]
+
+    def pending_waiting(self, endpoint: str) -> bool:
+        """True when client requests are queued for *endpoint*."""
+        row = self.conn.execute(
+            "SELECT 1 FROM cv_pending_fetch WHERE endpoint = ? LIMIT 1", [endpoint]
+        ).fetchone()
+        return row is not None
+
+    def pending_done(self, kind: str, key: str) -> None:
+        self.conn.execute(
+            "DELETE FROM cv_pending_fetch WHERE kind = ? AND key = ?", [kind, key]
+        )
+        self.conn.commit()
+
+    def pending_failed(self, kind: str, key: str, *, max_attempts: int) -> None:
+        """Count a failed attempt; give up on the fetch after *max_attempts*."""
+        self.conn.execute(
+            "UPDATE cv_pending_fetch SET attempts = attempts + 1 WHERE kind = ? AND key = ?",
+            [kind, key],
+        )
+        self.conn.execute(
+            "DELETE FROM cv_pending_fetch WHERE kind = ? AND key = ? AND attempts >= ?",
+            [kind, key, max_attempts],
         )
         self.conn.commit()
 

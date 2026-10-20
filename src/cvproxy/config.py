@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     # After CV answers 420/429/107, stop calling upstream for this long
     # (or for the upstream Retry-After, when CV sends one).
     rate_limit_cooldown_seconds: float = 600.0
+    # Recent upstream call times and the cooldown, kept across restarts
+    rate_state_path: Path = Path("/data/rate_state.json")
 
     # Server
     host: str = "0.0.0.0"

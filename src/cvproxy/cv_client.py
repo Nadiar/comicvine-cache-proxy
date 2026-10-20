@@ -7,10 +7,12 @@ forward the request upstream.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections import deque
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Final, Literal
 
 import httpx
@@ -73,6 +75,7 @@ class CVClient:
         rate_limit_per_minute: int = 100,
         rate_limit_per_hour_per_endpoint: int = 180,
         rate_limit_cooldown_seconds: float = 600.0,
+        state_path: Path | None = None,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -88,6 +91,9 @@ class CVClient:
         # cooldown is a guess, overridden by an upstream Retry-After header.
         self._cooldown_seconds = rate_limit_cooldown_seconds
         self._cooldown_until: float = 0.0
+        # ComicVine remembers recent calls across our restarts, so we do too
+        self._state_path = state_path
+        self._load_state()
         self._client = httpx.AsyncClient(
             timeout=30.0,
             headers={
@@ -158,6 +164,7 @@ class CVClient:
 
                 if len(window) < self._hourly_limit:
                     window.append(time.time())
+                    self._save_state()
                     return
 
                 # Over limit — compute wait and release lock before sleeping.
@@ -178,6 +185,42 @@ class CVClient:
         if retry_after_header and retry_after_header.strip().isdigit():
             seconds = float(retry_after_header.strip())
         self._cooldown_until = max(self._cooldown_until, time.time() + seconds)
+        self._save_state()
+
+    def _load_state(self) -> None:
+        """Restore call times from the last hour and the cooldown saved by a previous run."""
+        if self._state_path is None or not self._state_path.exists():
+            return
+        try:
+            state = json.loads(self._state_path.read_text(encoding="utf-8"))
+            cutoff = time.time() - 3600.0
+            self._hourly_windows = {
+                key: deque(sorted(ts for ts in stamps if ts > cutoff))
+                for key, stamps in state.get("windows", {}).items()
+            }
+            self._cooldown_until = float(state.get("cooldown_until", 0.0))
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            logger.warning("Ignoring unreadable rate state %s: %s", self._state_path, exc)
+            self._hourly_windows = {}
+            self._cooldown_until = 0.0
+
+    def _save_state(self) -> None:
+        if self._state_path is None:
+            return
+        cutoff = time.time() - 3600.0
+        state = {
+            "windows": {
+                key: [ts for ts in window if ts > cutoff]
+                for key, window in self._hourly_windows.items()
+            },
+            "cooldown_until": self._cooldown_until,
+        }
+        partial = self._state_path.with_name(self._state_path.name + ".tmp")
+        try:
+            partial.write_text(json.dumps(state), encoding="utf-8")
+            partial.replace(self._state_path)
+        except OSError as exc:
+            logger.warning("Could not save rate state to %s: %s", self._state_path, exc)
 
     def retry_after(self, endpoint: str) -> float:
         """Seconds until a request to *endpoint* may go upstream (0 = now).

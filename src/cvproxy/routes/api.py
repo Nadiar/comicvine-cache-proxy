@@ -565,6 +565,26 @@ _SEARCH_PAGE_SIZE = 100
 _search_fills_in_progress: set[str] = set()
 
 
+SearchOutcome = Literal["ok", "rate_limited", "failed"]
+
+
+def _search_cache_key(query: str, resources: str) -> str:
+    """Search cache key: normalised query + resources (not limit/offset)."""
+    return hashlib.md5(f"q:{_normalize_search_query(query)}|r:{resources}".encode()).hexdigest()
+
+
+def _search_page_limit(query: str, resources: str) -> int:
+    """Upstream pages worth fetching for a search.
+
+    ComicVine ORs the query words, so a "<series> <number>" issue search
+    matches thousands of unrelated issues; past page 1 it is noise, and local
+    "<series> #<number>" matches are merged into the ranking anyway.
+    """
+    if resources.split(",")[0].strip() == "issue" and _split_issue_query(query)[1] is not None:
+        return 1
+    return get_settings().search_max_pages
+
+
 async def _fetch_search_pages(
     client: CVClient,
     query: str,
@@ -572,10 +592,12 @@ async def _fetch_search_pages(
     first_page: int,
     last_page: int,
     cv_total: int = 0,
-) -> tuple[list[dict[str, Any]], int, bool]:
+) -> tuple[list[dict[str, Any]], int, SearchOutcome]:
     """Fetch upstream search pages first_page..last_page (1-based, inclusive).
 
-    Stops early on an empty or short page.  Returns (results, cv_total, rate_limited).
+    Stops early on an empty or short page.  Returns (results, cv_total, outcome):
+    "ok" when ComicVine answered (possibly with nothing), "rate_limited", or
+    "failed" when a request errored.
     """
     results: list[dict[str, Any]] = []
     for page_num in range(first_page, last_page + 1):
@@ -584,8 +606,10 @@ async def _fetch_search_pages(
             partial(client.search, query, resources, limit=_SEARCH_PAGE_SIZE, page=page_num),
         )
         if page_data is RATE_LIMITED:
-            return results, cv_total, True
-        if not page_data:
+            return results, cv_total, "rate_limited"
+        if page_data is None:
+            return results, cv_total, "failed"
+        if not page_data:  # NOT_FOUND: nothing matches
             break
         page_results = page_data.get("results") or []
         if not page_results:
@@ -595,7 +619,7 @@ async def _fetch_search_pages(
         results.extend(page_results)
         if page_num * _SEARCH_PAGE_SIZE >= cv_total or len(page_results) < _SEARCH_PAGE_SIZE:
             break
-    return results, cv_total, False
+    return results, cv_total, "ok"
 
 
 def _store_search_results(
@@ -693,15 +717,12 @@ async def search(
 
     db = _get_db(request)
     cache_mode = _get_cache_mode(request)
-    settings = get_settings()
 
     # Cache key: normalized query + resources (not limit/offset — we cache the full result
     # set and slice at serve time).  Leading articles are stripped so "amazing spider-man"
     # and "the amazing spider-man" share the same cache entry.
     norm_query = _normalize_search_query(query)
-    params_hash = hashlib.md5(
-        f"q:{norm_query}|r:{resources}".encode()
-    ).hexdigest()
+    params_hash = _search_cache_key(query, resources)
 
     cached_data: dict[str, Any] | None = None
 
@@ -769,19 +790,34 @@ async def search(
             return _cv_envelope([], total=0, limit=limit, offset=effective_offset)
 
         client = _get_client(request)
-        max_pages = settings.search_max_pages
+        max_pages = _search_page_limit(query, resources)
         # Only the pages covering the requested slice are fetched before responding
         pages_needed = min(max_pages, max(1, -(-(effective_offset + limit) // _SEARCH_PAGE_SIZE)))
 
-        all_results, cv_total, rate_limited = await _fetch_search_pages(
-            client, query, resources, 1, pages_needed
+        # ComicVine recently answered "nothing" for this search: don't ask again
+        known_empty = cache_mode != "no-cache" and db.negative_cache_hit(
+            "search", params_hash, ttl_hours=_NEGATIVE_CACHE_TTL_HOURS
         )
+        all_results: list[dict[str, Any]]
+        outcome: SearchOutcome
+        if known_empty:
+            all_results, cv_total, outcome = [], 0, "ok"
+        else:
+            all_results, cv_total, outcome = await _fetch_search_pages(
+                client, query, resources, 1, pages_needed
+            )
+        rate_limited = outcome == "rate_limited"
         if not all_results:
-            # ComicVine couldn't answer: serve local "<series> #<number>" matches
-            # rather than nothing.  Not cached, so the next search asks upstream again.
+            if outcome == "ok" and not known_empty:
+                db.negative_cache_put("search", params_hash)
+            elif rate_limited:
+                db.pending_add("search", params_hash, {"query": query, "resources": resources})
+            # No upstream results: serve local "<series> #<number>" matches rather
+            # than nothing.  Not cached, so the next search asks upstream again.
             local_matches = _local_issue_search_matches(db, query, resources)
             if not local_matches:
-                _record(request, endpoint="search", source="miss", start=t0)
+                source = "cache" if known_empty else "miss"
+                _record(request, endpoint="search", source=source, start=t0)
                 if rate_limited:
                     return _cv_rate_limit_error(client, "search/")
                 return _cv_envelope([], total=0, limit=limit, offset=effective_offset)
@@ -886,6 +922,7 @@ async def get_volume(
         client, "volume/", partial(client.get_volume, vid)
     )
     if data is RATE_LIMITED:
+        db.pending_add("volume", str(vid), {"id": vid})
         _record(request, endpoint="volume", source="miss", start=t0)
         return _cv_rate_limit_error(client, "volume/")
     if data and data.get("results"):
@@ -1035,6 +1072,7 @@ async def get_issue(
         client, "issue/", partial(client.get_issue, iid)
     )
     if data is RATE_LIMITED:
+        db.pending_add("issue", str(iid), {"id": iid})
         _record(request, endpoint="issue", source="miss", start=t0)
         return _cv_rate_limit_error(client, "issue/")
     if data and data.get("results"):
@@ -1196,6 +1234,10 @@ async def list_issues(
             )
             if can_refresh:
                 outcome = await _refresh_volume_issues(client, db, incomplete[0])
+                if outcome == "rate_limited":
+                    db.pending_add(
+                        "volume_issues", str(incomplete[0]), {"volume_id": incomplete[0]}
+                    )
                 if outcome == "rate_limited" and not results:
                     _record(request, endpoint="issues", source="miss", start=t0)
                     return _cv_rate_limit_error(client, "issues/")
@@ -1227,6 +1269,10 @@ async def list_issues(
         upstream_params2["sort"] = sort
     data = await _guarded_get(client, "issues/", partial(client.get, "issues/", upstream_params2))
     if data is RATE_LIMITED:
+        db.pending_add(
+            "issues_filter", negative_key,
+            {"filter": filter, "negative_key": negative_key if volume_lookup else None},
+        )
         _record(request, endpoint="issues", source="miss", start=t0)
         return _cv_rate_limit_error(client, "issues/")
     # Only an explicit "nothing matches" from CV is remembered — never a failure —
@@ -1287,6 +1333,7 @@ async def get_publisher(
         client, "publisher/", partial(client.get_publisher, pid)
     )
     if data is RATE_LIMITED:
+        db.pending_add("publisher", str(pid), {"id": pid})
         _record(request, endpoint="publisher", source="miss", start=t0)
         return _cv_rate_limit_error(client, "publisher/")
     if data and data.get("results"):

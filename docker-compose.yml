@@ -34,6 +34,8 @@ services:
       - RATE_LIMIT_PER_HOUR_PER_ENDPOINT=180
       # Seconds to stop calling CV after it answers "rate limited" (420/429/107).
       - RATE_LIMIT_COOLDOWN_SECONDS=600
+      # Recent upstream call times and cooldown, kept across restarts
+      - RATE_STATE_PATH=/data/rate_state.json
 
       # -----------------------------------------------------------------------
       # Background scheduler
