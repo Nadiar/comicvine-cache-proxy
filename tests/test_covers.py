@@ -183,3 +183,83 @@ async def test_hash_covers_skips_comicvine_placeholder_image(tmp_db: Database) -
     assert rows[9040] == (9040, None, None, placeholder)
     assert rows[9041][1] is not None
     assert not any("6373148-blank" in url for url in requested)
+
+
+# ---------------------------------------------------------------------------
+# Hardening: download cap, allowed hosts, hostile images
+# ---------------------------------------------------------------------------
+
+
+async def test_hash_covers_does_not_start_an_issue_that_would_exceed_the_cap(
+    tmp_db: Database,
+) -> None:
+    _issue(tmp_db, 9051, ORIGINAL.format("a"))
+    _issue(tmp_db, 9050, ORIGINAL.format("b"), [ORIGINAL.format("c"), ORIGINAL.format("d")])
+    transport, requested = _cdn({
+        sized_url(ORIGINAL.format(x), "scale_medium"): _jpeg(3) for x in "abcd"
+    })
+
+    result = await hash_covers(tmp_db, limit=2, delay=0, transport=transport)
+
+    assert result["issues"] == 1
+    assert len(requested) == 1  # 9050's three covers would have overshot the cap of 2
+
+
+async def test_hash_covers_only_fetches_comicvine_https(tmp_db: Database) -> None:
+    internal = "http://169.254.169.254/latest/original/meta.jpg"
+    _issue(tmp_db, 9060, internal)
+    transport, requested = _cdn({})
+
+    await hash_covers(tmp_db, limit=10, delay=0, transport=transport)
+
+    assert requested == []
+    assert [r for r in _covers(tmp_db) if r[0] == 9060] == [(9060, None, None, internal)]
+
+
+async def test_hash_covers_does_not_follow_redirects_off_comicvine(tmp_db: Database) -> None:
+    _issue(tmp_db, 9061, ORIGINAL.format("moved"))
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if "comicvine" in request.url.host:
+            return httpx.Response(302, headers={"Location": "http://10.0.0.5/internal.jpg"})
+        return httpx.Response(200, content=_jpeg(4))
+
+    await hash_covers(tmp_db, limit=10, delay=0, transport=httpx.MockTransport(handler))
+
+    assert not any("10.0.0.5" in url for url in requested)
+    assert [r[1] for r in _covers(tmp_db) if r[0] == 9061] == [None]
+
+
+async def test_hash_covers_records_oversized_image_instead_of_failing_the_run(
+    tmp_db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A decompression bomb must not abort every hourly run on the same issue."""
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)  # our 64x96 test JPEG is "too big"
+    _issue(tmp_db, 9071, ORIGINAL.format("bomb"))
+    _issue(tmp_db, 9070, ORIGINAL.format("next"))
+    transport, _ = _cdn({
+        sized_url(ORIGINAL.format("bomb"), "scale_medium"): _jpeg(5),
+        sized_url(ORIGINAL.format("next"), "scale_medium"): _jpeg(6),
+    })
+
+    result = await hash_covers(tmp_db, limit=10, delay=0, transport=transport)
+
+    assert result["failed"] == 2 and result["issues"] == 2
+    assert {r[0] for r in _covers(tmp_db)} >= {9070, 9071}
+
+
+async def test_hash_covers_rejects_oversized_download(
+    tmp_db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cvproxy.covers as covers
+
+    monkeypatch.setattr(covers, "_MAX_IMAGE_BYTES", 100)
+    _issue(tmp_db, 9080, ORIGINAL.format("huge"))
+    transport, _ = _cdn({sized_url(ORIGINAL.format("huge"), "scale_medium"): _jpeg(5)})
+
+    result = await hash_covers(tmp_db, limit=10, delay=0, transport=transport)
+
+    assert result["failed"] == 1
+    assert [r[1] for r in _covers(tmp_db) if r[0] == 9080] == [None]
