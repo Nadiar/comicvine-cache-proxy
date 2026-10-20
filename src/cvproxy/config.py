@@ -14,8 +14,7 @@ class Settings(BaseSettings):
     # ComicVine API
     cv_api_key: str
     cv_api_base_url: str = "https://comicvine.gamespot.com/api"
-    # CV asks for roughly one request per second; faster bursts trigger HTTP 420.
-    rate_limit_per_minute: int = 60
+    rate_limit_per_minute: int = 100
 
     # Database
     db_path: Path = Path("/data/localcv.db")

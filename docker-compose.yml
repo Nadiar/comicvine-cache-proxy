@@ -29,9 +29,8 @@ services:
       # ComicVine API
       # -----------------------------------------------------------------------
       - CV_API_BASE_URL=https://comicvine.gamespot.com/api
-      # CV enforces 200 req/hr per endpoint path and ~1 req/s overall.
-      # Defaults leave a safety buffer.
-      - RATE_LIMIT_PER_MINUTE=60
+      # CV allows 200 req/min and 500 req/hr per endpoint. Defaults leave a safety buffer.
+      - RATE_LIMIT_PER_MINUTE=100
       - RATE_LIMIT_PER_HOUR_PER_ENDPOINT=180
       # Seconds to stop calling CV after it answers "rate limited" (420/429/107).
       - RATE_LIMIT_COOLDOWN_SECONDS=600

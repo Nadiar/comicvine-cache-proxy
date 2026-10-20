@@ -31,6 +31,23 @@ API keys are free and can be obtained by creating an account at <https://comicvi
 
 Exceeding the limit returns a response with `status_code: 107` and `error: "Rate Limit Exceeded"`. The limit resets at the top of each clock hour.
 
+These limits aren't stated on the public documentation page (checked 2026-10-20).
+
+### Observed rate-limit behaviour (cvproxy, 2026-10-19)
+
+- **HTTP 420.** ComicVine can also signal a limit with **HTTP 420** and an empty reason phrase (`HTTP/1.1 420`) instead of a JSON envelope. A client that only checks the JSON `status_code`, or only HTTP 429, will miss it. cvproxy treated 420 as a generic error and sent its clients an empty "OK" result. Handle 420, 429 and `status_code: 107`.
+- **Refused well below the published limits.** The 420s began after ~19 `/issues/` calls in the hour, and only 98 calls across all endpoints in 90 minutes. Bursts of back-to-back requests seem to be enough to trigger a refusal. Another tool sharing the same key may also have contributed.
+- **No `Retry-After`** header came with the 420. Honour one if it ever appears.
+- **After a refusal, pause every endpoint, not only the one that was refused.** Retrying during the block may extend it.
+
+### cvproxy settings (deliberately below the limits)
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `RATE_LIMIT_PER_MINUTE` | 100 | Half the 200/min limit; requests are spaced evenly, not sent in bursts |
+| `RATE_LIMIT_PER_HOUR_PER_ENDPOINT` | 180 | Headroom for other tools sharing the key |
+| `RATE_LIMIT_COOLDOWN_SECONDS` | 600 | How long ComicVine's block lasts is unknown; an upstream `Retry-After` wins |
+
 ---
 
 ## Response Format
@@ -74,6 +91,8 @@ Every response is wrapped in a standard envelope:
 | 105  | Subscriber only video is for subscribers only |
 | 107  | Rate Limit Exceeded |
 
+Rate limiting may also arrive as **HTTP 420** (or 429) with no JSON envelope, so check the HTTP status before parsing the body (see [Rate Limiting](#rate-limiting)).
+
 ---
 
 ## Common Query Parameters
@@ -113,6 +132,10 @@ filter=date_last_updated:2026-01-01 00:00:00|2026-01-02 00:00:00
 ```
 filter=id:12345|67890|11111
 ```
+
+**Empty results.** A filter that matches nothing normally returns `status_code: 1`, `error: "OK"`, `number_of_total_results: 0` and `results: []`. cvproxy's incremental sync also treats `status_code: 101` (Object Not Found) on a `date_last_updated` range for `/issues/` as an empty window. Treat both as "no results", not as errors.
+
+**`issue_number` is a string, matched exactly.** Values are not always integers. Seen in the data: `0`, `0.5`, `½`, `1.MU`, `-1`, and stray values such as `196905`. Clients often strip leading zeros (`001` becomes `1`), so normalise both sides before comparing, rather than relying on the filter to treat `001` and `1` as the same. Only strip zeros that precede another digit, so `0` and `0.5` stay as they are.
 
 ---
 
@@ -226,7 +249,7 @@ GET /api/issues/?api_key=KEY&format=json&filter=volume:160294
 | `associated_images` | list | Additional images |
 | `deck` | string | Short summary |
 | `description` | string | Full HTML description |
-| `has_staff_review` | boolean | Whether there is a staff review |
+| `has_staff_review` | boolean \| object | `false`, or a review object when a staff review exists. Don't assume a boolean. |
 | `date_added` | datetime | When the record was added to CV |
 | `date_last_updated` | datetime | When the record was last updated |
 | `character_credits` | list | Characters appearing (detail only) |
@@ -244,6 +267,16 @@ GET /api/issues/?api_key=KEY&format=json&filter=volume:160294
 | `first_appearance_objects` | list | Objects with first appearance here (detail only) |
 | `first_appearance_storyarcs` | list | Story arcs introduced here (detail only) |
 | `first_appearance_teams` | list | Teams introduced here (detail only) |
+
+**Credit entries.** Each item in a `*_credits` list looks like this (`role` appears only in `person_credits`):
+
+```json
+{"api_detail_url": "https://comicvine.gamespot.com/api/person/4040-129430/", "id": 129430,
+ "name": "Enma Akiyama", "site_detail_url": "https://comicvine.gamespot.com/enma-akiyama/4040-129430/",
+ "role": "writer, artist, cover"}
+```
+
+The two URLs make up most of each entry's ~200 bytes. In cvproxy's database, `character_credits` and `person_credits` account for about two-thirds of all stored issue data (1.45 GB of 2.15 GB in October 2026). An issue with no credits of a kind returns an empty list (`[]`) for it on the detail endpoint.
 
 ---
 
@@ -731,6 +764,12 @@ When no `field_list` is specified, CV list endpoints return a standard subset of
 
 **Detail endpoints** return the complete field set including all relational arrays.
 
+`/issues/` list results contain exactly these fields (verified March 2026): `aliases`, `api_detail_url`, `associated_images`, `cover_date`, `date_added`, `date_last_updated`, `deck`, `description`, `has_staff_review`, `id`, `image`, `issue_number`, `name`, `site_detail_url`, `store_date`, `volume`.
+
+**Caching implication.** An issue stored from a list response is **not** the same as one fetched from `/issue/{id}/`. It has none of the `*_credits`, `character_died_in`, `team_disbanded_in` or `first_appearance_*` fields. A cache that serves list-sourced rows to detail requests returns empty credits, and a later list response must not overwrite a row whose details were already fetched. cvproxy tracks this in `cv_issue.detail_fetched_at`. Rows without it are fetched from `/issue/{id}/` on demand, or by the hourly issue-detail backfill. When a list response shows a newer `date_last_updated` than the stored details, the details are refetched.
+
+**`count_of_issues`** on a volume can be checked against the issues stored locally to tell whether a volume's issue list is complete. It can lag behind newly added issues and may be `0` for a new volume, so cvproxy doesn't treat `0` as "complete", and re-fetches the whole list at most once a day.
+
 ---
 
 ## Description Field — HTML Content
@@ -755,7 +794,7 @@ for attempt in range(3):
 
 ### Rate Limit — Retry Strategy
 
-When `status_code: 107` is returned, the request should not be retried immediately. A practical backoff sequence is to wait **1, 2, 3, 4 minutes** between retries. The rate limit resets at the top of each clock hour, so a maximum total wait of ~20 minutes is sufficient.
+When `status_code: 107`, HTTP 420 or HTTP 429 is returned, the request should not be retried immediately. A practical backoff sequence is to wait **1, 2, 3, 4 minutes** between retries. The rate limit resets at the top of each clock hour, so a maximum total wait of ~20 minutes is sufficient.
 
 ### User-Agent Header
 

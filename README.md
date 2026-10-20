@@ -50,7 +50,7 @@ All settings via environment variables:
 | `STATS_DB_PATH` | `/data/stats.db` | Request stats database path |
 | `BACKUP_DIR` | `/data/backups` | Where nightly database snapshots are written |
 | `BACKUP_KEEP` | `3` | Snapshots to keep (`0` disables backups) |
-| `RATE_LIMIT_PER_MINUTE` | `60` | Global upstream calls per minute |
+| `RATE_LIMIT_PER_MINUTE` | `100` | Global upstream calls per minute |
 | `RATE_LIMIT_PER_HOUR_PER_ENDPOINT` | `180` | Upstream calls per hour per CV endpoint path |
 | `RATE_LIMIT_COOLDOWN_SECONDS` | `600` | Pause on all upstream calls after CV answers 420/429/107 (an upstream `Retry-After` wins) |
 | `SYNC_ENABLED` | `true` | Enable background scheduler |
