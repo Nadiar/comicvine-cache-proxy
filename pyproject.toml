@@ -13,6 +13,8 @@ dependencies = [
     "apscheduler>=3.11",
     "pydantic-settings>=2.7",
     "pysqlite3-binary>=0.5",
+    "imagehash>=4.3",
+    "Pillow>=10",
 ]
 
 [project.optional-dependencies]

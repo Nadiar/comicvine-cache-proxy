@@ -500,3 +500,18 @@ async def test_mcl_gap_backfill_without_file_does_nothing(tmp_db: Database) -> N
     assert result == {"volumes_missing": 0, "volumes_added": 0,
                       "issues_missing": 0, "issues_added": 0}
     client.get.assert_not_called()
+
+
+def test_cover_hash_job_registered_only_when_enabled() -> None:
+    from cvproxy.config import Settings
+
+    off = create_scheduler(
+        Settings(cv_api_key="k", sync_enabled=True, cover_hash_per_hour=0),
+        MagicMock(), MagicMock(), MagicMock(),
+    )
+    on = create_scheduler(
+        Settings(cv_api_key="k", sync_enabled=True, cover_hash_per_hour=600),
+        MagicMock(), MagicMock(), MagicMock(),
+    )
+    assert "cover_hash_backfill" not in {job.id for job in off.get_jobs()}
+    assert "cover_hash_backfill" in {job.id for job in on.get_jobs()}

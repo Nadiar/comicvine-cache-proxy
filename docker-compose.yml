@@ -28,6 +28,8 @@ services:
       # - CV_DB_EXPORT_PATH=/data/export/comicvine.db
       # Daily copy of the community latest.mcl (ComicManager fallback). Unset = off.
       # - MCL_EXPORT_PATH=/data/export/latest.mcl
+      # Cover images hashed per hour for ComicManager cover matching (CDN, not API). 0 = off
+      # - COVER_HASH_PER_HOUR=600
 
       # -----------------------------------------------------------------------
       # ComicVine API

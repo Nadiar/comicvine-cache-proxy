@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from cvproxy.covers import hash_covers
 from cvproxy.cv_client import NOT_FOUND as _CV_NOT_FOUND
 from cvproxy.cv_client import RATE_LIMITED as _CV_RATE_LIMITED
 from cvproxy.mcl import read_mcl, refresh_mcl
@@ -124,6 +125,7 @@ def create_scheduler(
       - comicvine.db export: daily, when cv_db_export_path is set
       - latest.mcl refresh: daily, when mcl_export_path is set
       - MCL gap backfill: daily, fetches volumes/issues the MCL has and we don't
+      - Cover hash backfill: hourly, when cover_hash_per_hour > 0
     """
     scheduler = AsyncIOScheduler()
     hour = settings.sync_cron_hour  # default 3 AM UTC
@@ -305,6 +307,20 @@ def create_scheduler(
             args=[client, db, settings],
             id="mcl_gap_backfill",
             name="MCL gap backfill",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # Cover hash backfill — hourly, when enabled (images from the CDN, not the API)
+    if settings.cover_hash_per_hour > 0:
+        scheduler.add_job(
+            _make_tracked("Cover hash backfill", _backfill_cover_hashes),
+            "cron",
+            minute=20,
+            args=[db, settings],
+            id="cover_hash_backfill",
+            name="Cover hash backfill",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -906,6 +922,11 @@ async def _backfill_from_mcl(
         )
     logger.info("MCL gap backfill: %s", result)
     return result
+
+
+async def _backfill_cover_hashes(db: Database, settings: Settings) -> dict[str, Any]:
+    """Hash up to cover_hash_per_hour cover images of issues missing from comic_covers."""
+    return await hash_covers(db, limit=settings.cover_hash_per_hour)
 
 
 async def _backfill_search_cache_volumes(client: CVClient, db: Database) -> dict[str, Any]:

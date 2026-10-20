@@ -52,6 +52,7 @@ All settings via environment variables:
 | `BACKUP_KEEP` | `3` | Snapshots to keep (`0` disables backups) |
 | `CV_DB_EXPORT_PATH` | *(unset)* | Write a ComicManager-compatible `comicvine.db` here daily; unset disables the export |
 | `MCL_EXPORT_PATH` | *(unset)* | Keep a daily copy of the community `latest.mcl` here; unset disables it |
+| `COVER_HASH_PER_HOUR` | `0` | Cover images hashed per hour into `comic_covers` for ComicManager cover matching (CDN downloads, not API calls); `0` disables |
 | `MCL_SOURCE_URL` | Gitea `Update Missing` folder (API listing) | Where to look for the newest `*_latest.mcl` |
 | `RATE_LIMIT_PER_MINUTE` | `100` | Global upstream calls per minute |
 | `RATE_LIMIT_PER_HOUR_PER_ENDPOINT` | `180` | Upstream calls per hour per CV endpoint path |
@@ -179,6 +180,7 @@ When `SYNC_ENABLED=true`, the following jobs run automatically:
 | Pending fetch | Every 2 min | Fetches requests that missed the cache while ComicVine was rate limiting, oldest first; backfill on that endpoint waits until they're done |
 | comicvine.db export | Daily at `SYNC_CRON_HOUR`+5 | Only when `CV_DB_EXPORT_PATH` is set; see below |
 | latest.mcl refresh | Daily at `SYNC_CRON_HOUR`+5:30 | Only when `MCL_EXPORT_PATH` is set; replaces the file only when it changed |
+| Cover hash backfill | Hourly at :20 | Only when `COVER_HASH_PER_HOUR` > 0; hashes covers of issues missing from `comic_covers`, newest first |
 | MCL gap backfill | Daily at `SYNC_CRON_HOUR`+6 | Fetches volumes and issues listed in `latest.mcl` but missing locally, 100 IDs per request |
 | Database backup | Daily at `SYNC_CRON_HOUR`+4 | Compacted snapshot (`VACUUM INTO`) in `BACKUP_DIR`, keeps `BACKUP_KEEP` |
 | Stale data eviction | Daily, 3h after prefetch | Removes expired entities (when eviction is configured) |
@@ -210,7 +212,7 @@ volumes:
 
 Limits:
 
-- **Cover hashes:** `comic_covers` holds only the hashes imported with the original `localcv.db`. Nothing computes them for newer issues, so cover matching can't find those issues.
+- **Cover hashes:** with `COVER_HASH_PER_HOUR` set, cvproxy adds `comic_covers` rows for newer issues. It uses the `imagehash` pHash and average hash that ComicManager computes, applied to the `scale_medium` image, which hashes the same as the original. Issues whose details haven't been fetched only get their main cover, not variants. Without it, only the hashes imported with the original `localcv.db` exist.
 - **Credits:** issues stored only from list responses show empty credits until the issue detail backfill reaches them.
 
 ## Development

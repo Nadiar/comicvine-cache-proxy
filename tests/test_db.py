@@ -1204,11 +1204,10 @@ def test_export_keeps_larger_of_stored_and_actual_issue_counts(
 
 
 def test_export_copies_comic_covers_when_present(tmp_db: Database, tmp_path: Path) -> None:
-    tmp_db.conn.executescript(
-        """CREATE TABLE comic_covers (id INTEGER PRIMARY KEY, cvid INTEGER,
-               ct_phash TEXT, ct_ahash TEXT, cv_url TEXT);
-           INSERT INTO comic_covers VALUES (1, 1073108, 'abcd', 'ef01', 'https://x/c.jpg');"""
+    tmp_db.conn.execute(
+        "INSERT INTO comic_covers VALUES (1, 1073108, 'abcd', 'ef01', 'https://x/c.jpg')"
     )
+    tmp_db.conn.commit()
     dest = tmp_path / "comicvine.db"
 
     counts = tmp_db.export_comicvine_db(dest)

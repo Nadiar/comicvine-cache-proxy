@@ -225,6 +225,16 @@ CREATE TABLE IF NOT EXISTS cv_issue (
     detail_fetched_at TEXT
 );
 
+-- Cover image hashes ComicManager matches against (localcv.db layout);
+-- NULL hashes mark an image that couldn't be fetched or decoded
+CREATE TABLE IF NOT EXISTS comic_covers (
+    id INTEGER PRIMARY KEY,
+    cvid INTEGER,
+    ct_phash TEXT,
+    ct_ahash TEXT,
+    cv_url TEXT
+);
+
 -- Requests that missed the cache while ComicVine couldn't be asked
 CREATE TABLE IF NOT EXISTS cv_pending_fetch (
     kind TEXT NOT NULL,
@@ -268,6 +278,7 @@ CREATE INDEX IF NOT EXISTS idx_resp_cache_search_query
 CREATE INDEX IF NOT EXISTS idx_issue_store_date ON cv_issue(store_date)
     WHERE store_date IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_issue_volume_id ON cv_issue(volume_id);
+CREATE INDEX IF NOT EXISTS idx_comic_covers_cvid ON comic_covers(cvid);
 CREATE INDEX IF NOT EXISTS idx_issue_needs_detail ON cv_issue(id)
     WHERE detail_fetched_at IS NULL;
 """
@@ -1209,6 +1220,44 @@ class Database:
             row and row["count_of_issues"]
             and row["local_count"] >= row["count_of_issues"]
         )
+
+    def cover_hash_candidates(self, limit: int) -> list[tuple[int, list[str]]]:
+        """Issues with a cover image but no comic_covers row, newest first.
+
+        Returns (issue_id, image URLs): the main cover, then variant covers from
+        associated_images (only stored for issues whose details were fetched).
+
+        Uses its own read-only connection so it can run on a worker thread: once
+        the backlog is gone, finding the few new issues scans most of cv_issue.
+        """
+        conn = sqlite3.connect(f"{self._path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                """SELECT i.id, i.image_url, i.associated_images FROM cv_issue i
+                   WHERE i.image_url IS NOT NULL
+                     AND NOT EXISTS (SELECT 1 FROM comic_covers c WHERE c.cvid = i.id)
+                   ORDER BY i.id DESC LIMIT ?""",
+                [limit],
+            ).fetchall()
+        finally:
+            conn.close()
+        candidates = []
+        for issue_id, image_url, associated in rows:
+            urls = [image_url]
+            for image in json.loads(associated or "[]"):
+                url = image.get("original_url") if isinstance(image, dict) else None
+                if url and url not in urls:
+                    urls.append(url)
+            candidates.append((issue_id, urls))
+        return candidates
+
+    def insert_cover_hashes(self, rows: list[tuple[int, str | None, str | None, str]]) -> None:
+        """Store (cvid, pHash, average hash, image URL) rows in comic_covers."""
+        self.conn.executemany(
+            "INSERT INTO comic_covers (cvid, ct_phash, ct_ahash, cv_url) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        self.conn.commit()
 
     def existing_ids(self, table: str) -> set[int]:
         """All IDs stored in cv_volume or cv_issue."""
