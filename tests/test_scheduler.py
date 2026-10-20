@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from cvproxy.db import Database
@@ -159,7 +160,9 @@ async def test_issue_detail_backfill_fills_list_only_rows(tmp_db: Database) -> N
 
     assert result == {"updated": 1, "queued": 2}
     assert tmp_db.issue_needs_detail(8002) is False
-    assert tmp_db.get_issue(8002)["person_credits"] == [{"id": 9, "name": "Artist"}]
+    issue = tmp_db.get_issue(8002)
+    assert issue is not None
+    assert issue["person_credits"] == [{"id": 9, "name": "Artist"}]
     # Not found upstream: skipped on later runs
     assert 8001 not in tmp_db.issue_ids_needing_detail(limit=10)
 
@@ -202,3 +205,57 @@ def test_issue_detail_backfill_job_registered() -> None:
     settings = Settings(cv_api_key="testkey", sync_enabled=True)
     scheduler = create_scheduler(settings, MagicMock(), MagicMock(), MagicMock())
     assert "issue_detail_backfill" in {job.id for job in scheduler.get_jobs()}
+
+
+# ---------------------------------------------------------------------------
+# Database backup job
+# ---------------------------------------------------------------------------
+
+
+async def test_backup_job_writes_snapshot_and_keeps_newest(
+    tmp_db: Database, tmp_path: Path
+) -> None:
+    import os
+
+    from cvproxy.config import Settings
+    from cvproxy.scheduler import _backup_database
+
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    for day in range(1, 5):
+        old = backup_dir / f"localcv-2026010{day}-030000.db"
+        old.write_bytes(b"old")
+        os.utime(old, (day * 86400, day * 86400))
+    unrelated = backup_dir / "notes.txt"
+    unrelated.write_text("keep me")
+    settings = Settings(cv_api_key="k", backup_dir=backup_dir, backup_keep=3)
+
+    result = await _backup_database(tmp_db, settings)
+
+    kept = sorted(p.name for p in backup_dir.glob("localcv-*.db"))
+    assert len(kept) == 3
+    assert result["backup"] in kept
+    assert "localcv-20260104-030000.db" in kept  # newest old one survives
+    assert "localcv-20260101-030000.db" not in kept
+    assert unrelated.exists()
+    assert result["removed"] == 2
+
+
+async def test_backup_job_disabled_when_keep_is_zero(tmp_db: Database, tmp_path: Path) -> None:
+    from cvproxy.config import Settings
+    from cvproxy.scheduler import _backup_database
+
+    settings = Settings(cv_api_key="k", backup_dir=tmp_path / "backups", backup_keep=0)
+
+    result = await _backup_database(tmp_db, settings)
+
+    assert result == {"backup": None, "removed": 0}
+    assert not (tmp_path / "backups").exists()
+
+
+def test_backup_job_registered() -> None:
+    from cvproxy.config import Settings
+
+    settings = Settings(cv_api_key="testkey", sync_enabled=True)
+    scheduler = create_scheduler(settings, MagicMock(), MagicMock(), MagicMock())
+    assert "database_backup" in {job.id for job in scheduler.get_jobs()}

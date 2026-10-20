@@ -1063,3 +1063,37 @@ def test_migration_marks_existing_issues_with_credits_as_detailed(tmp_path: Path
     assert db.issue_needs_detail(7001) is False
     assert db.issue_needs_detail(7002) is True
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# WAL size cap and backups
+# ---------------------------------------------------------------------------
+
+
+def test_connect_caps_wal_size(tmp_db: Database) -> None:
+    """Without a limit the WAL file keeps its peak size forever."""
+    limit = tmp_db.conn.execute("PRAGMA journal_size_limit").fetchone()[0]
+    assert 0 < limit <= 128 * 1024 * 1024
+
+
+def test_backup_to_writes_consistent_copy(tmp_db: Database, tmp_path: Path) -> None:
+    dest = tmp_path / "backups" / "copy.db"
+    dest.parent.mkdir()
+
+    tmp_db.backup_to(dest)
+
+    copy = Database(dest)
+    copy.connect()
+    assert copy.get_volume(160294)["name"] == "Absolute Batman"
+    assert copy.get_issue(1073108) is not None
+    copy.close()
+    assert not list(dest.parent.glob("*.partial"))
+
+
+def test_backup_to_replaces_existing_file(tmp_db: Database, tmp_path: Path) -> None:
+    dest = tmp_path / "copy.db"
+    dest.write_bytes(b"stale")
+
+    tmp_db.backup_to(dest)
+
+    assert dest.read_bytes()[:16] == b"SQLite format 3\x00"

@@ -115,6 +115,7 @@ def create_scheduler(
       - Issue detail backfill: hourly (100/batch, credits for list-only issues)
       - Publisher backfill: every 6h (50/batch, fills new fields)
       - Incremental issue sync: daily (date_last_updated last 48h)
+      - Database backup: daily (VACUUM INTO backup_dir, keeps backup_keep copies)
     """
     scheduler = AsyncIOScheduler()
     hour = settings.sync_cron_hour  # default 3 AM UTC
@@ -223,6 +224,20 @@ def create_scheduler(
         args=[db, settings],
         id="evict_stale_data",
         name="Stale data eviction",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Database backup — daily, after eviction has trimmed the data
+    scheduler.add_job(
+        _make_tracked("Database backup", _backup_database),
+        "cron",
+        hour=(hour + 4) % 24,
+        minute=0,
+        args=[db, settings],
+        id="database_backup",
+        name="Database backup",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
@@ -686,6 +701,28 @@ evict_stale_data = _evict_stale_data
 # ---------------------------------------------------------------------------
 
 _SEARCH_BACKFILL_BATCH = 50
+
+
+async def _backup_database(db: Database, settings: Settings) -> dict[str, Any]:
+    """Snapshot the database into backup_dir, keeping the newest backup_keep copies.
+
+    VACUUM INTO runs on a worker thread with its own connection, so requests
+    and the other jobs keep using the main connection meanwhile.
+    """
+    if settings.backup_keep <= 0:
+        return {"backup": None, "removed": 0}
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    name = f"localcv-{datetime.now(UTC):%Y%m%d-%H%M%S}.db"
+    await asyncio.to_thread(db.backup_to, settings.backup_dir / name)
+
+    backups = sorted(
+        settings.backup_dir.glob("localcv-*.db"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    stale = backups[settings.backup_keep:]
+    for path in stale:
+        path.unlink()
+    logger.info("Database backup written: %s (removed %d old)", name, len(stale))
+    return {"backup": name, "removed": len(stale)}
 
 
 async def _backfill_search_cache_volumes(client: CVClient, db: Database) -> dict[str, Any]:

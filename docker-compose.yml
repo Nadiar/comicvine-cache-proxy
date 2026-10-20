@@ -21,6 +21,9 @@ services:
       - DB_PATH=/data/localcv.db
       - IMAGE_CACHE_DIR=/data/images
       - STATS_DB_PATH=/data/stats.db
+      # Nightly database snapshots (BACKUP_KEEP=0 disables them)
+      - BACKUP_DIR=/data/backups
+      - BACKUP_KEEP=3
 
       # -----------------------------------------------------------------------
       # ComicVine API

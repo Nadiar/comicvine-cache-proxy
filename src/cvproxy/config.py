@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     # Stats
     stats_db_path: Path = Path("/data/stats.db")
 
+    # Nightly database snapshots; backup_keep = 0 disables them
+    backup_dir: Path = Path("/data/backups")
+    backup_keep: int = 3
+
     # Background sync
     sync_enabled: bool = True
     sync_cron_hour: int = 3  # UTC hour for daily sync

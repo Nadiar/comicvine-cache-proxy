@@ -48,6 +48,8 @@ All settings via environment variables:
 | `IMAGE_CACHE_DIR` | `/data/images` | Disk image cache directory |
 | `IMAGE_CACHE_TTL_DAYS` | `14` | Image cache sliding TTL (days) |
 | `STATS_DB_PATH` | `/data/stats.db` | Request stats database path |
+| `BACKUP_DIR` | `/data/backups` | Where nightly database snapshots are written |
+| `BACKUP_KEEP` | `3` | Snapshots to keep (`0` disables backups) |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Global upstream calls per minute |
 | `RATE_LIMIT_PER_HOUR_PER_ENDPOINT` | `180` | Upstream calls per hour per CV endpoint path |
 | `RATE_LIMIT_COOLDOWN_SECONDS` | `600` | Pause on all upstream calls after CV answers 420/429/107 (an upstream `Retry-After` wins) |
@@ -167,6 +169,7 @@ When `SYNC_ENABLED=true`, the following jobs run automatically:
 | Issue detail backfill | Hourly at :05 | Fetches credits for issues stored from list responses, newest first |
 | Publisher backfill | Every 6h at :15 | Re-fetches publishers missing new fields |
 | Search cache backfill | Every 2h at :50 | Fetches volumes seen in search results but not yet in DB |
+| Database backup | Daily at `SYNC_CRON_HOUR`+4 | Compacted snapshot (`VACUUM INTO`) in `BACKUP_DIR`, keeps `BACKUP_KEEP` |
 | Stale data eviction | Daily, 3h after prefetch | Removes expired entities (when eviction is configured) |
 | Image cache cleanup | Daily, 2h after prefetch | Removes expired image cache entries |
 

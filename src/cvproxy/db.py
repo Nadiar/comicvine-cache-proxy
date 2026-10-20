@@ -538,10 +538,28 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        # Truncate the WAL back to 64 MB after checkpoints; otherwise it keeps
+        # its peak size (GBs after a bulk update) forever.
+        self._conn.execute("PRAGMA journal_size_limit=67108864")
         self._conn.execute("PRAGMA cache_size=-131072")
         self._conn.execute("PRAGMA mmap_size=1073741824")
         self._conn.execute("PRAGMA temp_store=MEMORY")
         self._ensure_schema()
+
+    def backup_to(self, dest: Path) -> None:
+        """Write a compacted, consistent snapshot of the database to *dest*.
+
+        VACUUM INTO reads a single WAL snapshot through its own connection, so it
+        can run on a worker thread without blocking writers on the main one.
+        """
+        partial = dest.with_name(dest.name + ".partial")
+        partial.unlink(missing_ok=True)
+        conn = sqlite3.connect(str(self._path))
+        try:
+            conn.execute("VACUUM INTO ?", [str(partial)])
+        finally:
+            conn.close()
+        partial.replace(dest)
 
     def _ensure_schema(self) -> None:
         """Create tables, migrate columns, then create indexes.
