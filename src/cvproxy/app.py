@@ -23,6 +23,9 @@ from cvproxy.db import Database
 from cvproxy.image_cache import ImageCache
 from cvproxy.routes.api import router as api_router
 from cvproxy.scheduler import (
+    _backfill_from_mcl,
+    _export_comicvine_db,
+    _refresh_mcl,
     create_scheduler,
     evict_stale_data,
     get_scheduler_log,
@@ -604,6 +607,46 @@ def create_app() -> FastAPI:
 
         job_id = _start_job("Cache eviction", {"dry_run": dry_run}, _run())
         return {"status": "started", "job_id": job_id, "dry_run": dry_run}
+
+    # Admin — comicvine.db export
+    @app.post("/admin/export/comicvine-db")
+    async def admin_export_comicvine_db() -> dict[str, Any]:
+        """Write the ComicManager-compatible comicvine.db now (CV_DB_EXPORT_PATH).
+
+        Returns immediately with a job_id; poll GET /admin/jobs/{job_id} for status.
+        """
+        settings = get_settings()
+        if settings.cv_db_export_path is None:
+            raise HTTPException(status_code=400, detail="CV_DB_EXPORT_PATH is not set")
+        db: Database = app.state.db
+        job_id = _start_job(
+            "comicvine.db export",
+            {"path": str(settings.cv_db_export_path)},
+            _export_comicvine_db(db, settings),
+        )
+        return {"status": "started", "job_id": job_id, "path": str(settings.cv_db_export_path)}
+
+    # Admin — latest.mcl refresh and gap backfill
+    @app.post("/admin/mcl/refresh")
+    async def admin_refresh_mcl() -> dict[str, Any]:
+        """Download the newest community latest.mcl now (MCL_EXPORT_PATH)."""
+        settings = get_settings()
+        if settings.mcl_export_path is None:
+            raise HTTPException(status_code=400, detail="MCL_EXPORT_PATH is not set")
+        job_id = _start_job("latest.mcl refresh", {}, _refresh_mcl(settings))
+        return {"status": "started", "job_id": job_id}
+
+    @app.post("/admin/mcl/backfill")
+    async def admin_backfill_from_mcl() -> dict[str, Any]:
+        """Fetch the volumes and issues latest.mcl lists but cvproxy doesn't have."""
+        settings = get_settings()
+        if settings.mcl_export_path is None:
+            raise HTTPException(status_code=400, detail="MCL_EXPORT_PATH is not set")
+        job_id = _start_job(
+            "MCL gap backfill", {},
+            _backfill_from_mcl(app.state.cv_client, app.state.db, settings),
+        )
+        return {"status": "started", "job_id": job_id}
 
     # Admin — FTS index rebuild
     @app.post("/admin/rebuild/fts")

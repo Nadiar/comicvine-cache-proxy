@@ -2416,3 +2416,29 @@ def test_cached_empty_issue_search_still_uses_local_matches(app_client: TestClie
 
     assert [r["id"] for r in resp.json()["results"]] == [1167128]
     mock_client.search.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Admin: comicvine.db export
+# ---------------------------------------------------------------------------
+
+
+def test_admin_export_comicvine_db_writes_file(app_client: TestClient, tmp_path: Path) -> None:
+    from cvproxy.config import get_settings, override_settings
+
+    dest = tmp_path / "export" / "comicvine.db"
+    override_settings(get_settings().model_copy(update={"cv_db_export_path": dest}))
+
+    resp = app_client.post("/admin/export/comicvine-db")
+
+    assert resp.status_code == 200
+    job = _poll_job(app_client, resp.json()["job_id"], max_polls=50)
+    assert job["status"] == "done"
+    assert job["result"]["path"] == str(dest)
+    assert dest.exists()
+
+
+def test_admin_export_comicvine_db_requires_path(app_client: TestClient) -> None:
+    resp = app_client.post("/admin/export/comicvine-db")
+
+    assert resp.status_code == 400

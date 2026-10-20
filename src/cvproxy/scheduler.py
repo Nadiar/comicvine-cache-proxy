@@ -12,6 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from cvproxy.cv_client import NOT_FOUND as _CV_NOT_FOUND
 from cvproxy.cv_client import RATE_LIMITED as _CV_RATE_LIMITED
+from cvproxy.mcl import read_mcl, refresh_mcl
 from cvproxy.pending import process_pending
 
 if TYPE_CHECKING:
@@ -120,6 +121,9 @@ def create_scheduler(
       - Incremental issue sync: daily (date_last_updated last 48h)
       - Database backup: daily (VACUUM INTO backup_dir, keeps backup_keep copies)
       - Pending fetch: every 2 min (cache misses that hit a rate limit)
+      - comicvine.db export: daily, when cv_db_export_path is set
+      - latest.mcl refresh: daily, when mcl_export_path is set
+      - MCL gap backfill: daily, fetches volumes/issues the MCL has and we don't
     """
     scheduler = AsyncIOScheduler()
     hour = settings.sync_cron_hour  # default 3 AM UTC
@@ -260,6 +264,51 @@ def create_scheduler(
         max_instances=1,
         coalesce=True,
     )
+
+    # comicvine.db export — daily after the backup, only when a path is set
+    if settings.cv_db_export_path is not None:
+        scheduler.add_job(
+            _make_tracked("comicvine.db export", _export_comicvine_db),
+            "cron",
+            hour=(hour + 5) % 24,
+            minute=0,
+            args=[db, settings],
+            id="comicvine_db_export",
+            name="comicvine.db export",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # latest.mcl refresh — daily, only when a path is set
+    if settings.mcl_export_path is not None:
+        scheduler.add_job(
+            _make_tracked("latest.mcl refresh", _refresh_mcl),
+            "cron",
+            hour=(hour + 5) % 24,
+            minute=30,
+            args=[settings],
+            id="mcl_refresh",
+            name="latest.mcl refresh",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # MCL gap backfill — daily, after the MCL refresh, only when a path is set
+    if settings.mcl_export_path is not None:
+        scheduler.add_job(
+            _make_tracked("MCL gap backfill", _backfill_from_mcl),
+            "cron",
+            hour=(hour + 6) % 24,
+            minute=0,
+            args=[client, db, settings],
+            id="mcl_gap_backfill",
+            name="MCL gap backfill",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
 
     # Search-cache volume backfill — every 2 hours
     scheduler.add_job(
@@ -753,6 +802,110 @@ async def _backup_database(db: Database, settings: Settings) -> dict[str, Any]:
         path.unlink()
     logger.info("Database backup written: %s (removed %d old)", name, len(stale))
     return {"backup": name, "removed": len(stale)}
+
+
+async def _export_comicvine_db(db: Database, settings: Settings) -> dict[str, Any]:
+    """Publish a ComicManager-compatible comicvine.db at cv_db_export_path.
+
+    Runs on a worker thread with its own connection, like the backup.  The
+    file is built next to the live database (local disk) and then moved.
+    """
+    dest = settings.cv_db_export_path
+    if dest is None:
+        return {"path": None}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    counts = await asyncio.to_thread(
+        db.export_comicvine_db, dest, staging_dir=settings.db_path.parent
+    )
+    logger.info("comicvine.db export written to %s: %s", dest, counts)
+    return {"path": str(dest), **counts}
+
+
+async def _refresh_mcl(settings: Settings) -> dict[str, Any]:
+    """Download the newest community latest.mcl to mcl_export_path."""
+    if settings.mcl_export_path is None:
+        return {"updated": False}
+    settings.mcl_export_path.parent.mkdir(parents=True, exist_ok=True)
+    return await refresh_mcl(settings.mcl_source_url, settings.mcl_export_path)
+
+
+#: IDs per list request when filling gaps (ComicVine's maximum page size).
+_MCL_ID_BATCH = 100
+
+
+async def _fetch_ids_in_batches(
+    client: CVClient,
+    db: Database,
+    endpoint: str,
+    ids: list[int],
+    store: Any,
+) -> tuple[int, bool]:
+    """Fetch *ids* from a list endpoint with ``filter=id:a|b|...``.
+
+    Returns (rows stored, whether ComicVine refused a request).
+    """
+    stored = 0
+    for start in range(0, len(ids), _MCL_ID_BATCH):
+        if db.pending_waiting(endpoint):
+            logger.info("MCL gap backfill: client requests queued for /%s, pausing", endpoint)
+            break
+        if client.hourly_calls(endpoint) >= _BACKFILL_HOURLY_BUDGET:
+            logger.info("MCL gap backfill: /%s backfill budget used, pausing", endpoint)
+            break
+        batch = ids[start:start + _MCL_ID_BATCH]
+        sleep_secs = _backfill_call_interval(client, endpoint)
+        data = await client.get(
+            endpoint,
+            {"filter": "id:" + "|".join(str(i) for i in batch), "limit": _MCL_ID_BATCH},
+        )
+        if data is _CV_RATE_LIMITED:
+            logger.info("MCL gap backfill: rate limited by CV, stopping this run")
+            return stored, True
+        if data:
+            stored += store(data.get("results") or [])
+        await asyncio.sleep(sleep_secs)
+    return stored, False
+
+
+async def _backfill_from_mcl(
+    client: CVClient, db: Database, settings: Settings
+) -> dict[str, Any]:
+    """Fetch volumes and issues the community MCL lists but cvproxy doesn't have.
+
+    The MCL maps every ComicVine volume to its full issue list, so the gaps
+    can be filled 100 IDs per list request (newest IDs first) rather than one
+    request per item.  Issues arrive list-shaped; the issue detail backfill
+    adds their credits later.
+    """
+    result = {"volumes_missing": 0, "volumes_added": 0, "issues_missing": 0, "issues_added": 0}
+    path = settings.mcl_export_path
+    if path is None or not path.exists():
+        return result
+    mcl = await asyncio.to_thread(read_mcl, path)
+
+    def store_volumes(rows: list[dict[str, Any]]) -> int:
+        for row in rows:
+            db.upsert_volume(row, commit=False)
+        db.conn.commit()
+        return len(rows)
+
+    missing_volumes = sorted(set(mcl) - db.existing_ids("cv_volume"), reverse=True)
+    result["volumes_missing"] = len(missing_volumes)
+    result["volumes_added"], refused = await _fetch_ids_in_batches(
+        client, db, "volumes/", missing_volumes, store_volumes
+    )
+
+    local_issues = db.existing_ids("cv_issue")
+    missing_issues = sorted(
+        {iid for ids in mcl.values() for iid in ids} - local_issues, reverse=True
+    )
+    result["issues_missing"] = len(missing_issues)
+    if not refused:  # after a refusal every endpoint waits out the cooldown
+        result["issues_added"], _ = await _fetch_ids_in_batches(
+            client, db, "issues/", missing_issues, db.insert_new_issues
+        )
+    logger.info("MCL gap backfill: %s", result)
+    return result
 
 
 async def _backfill_search_cache_volumes(client: CVClient, db: Database) -> dict[str, Any]:

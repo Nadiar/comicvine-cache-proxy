@@ -1140,3 +1140,106 @@ def test_pending_done_and_failed(tmp_db: Database) -> None:
 def test_pending_add_rejects_unknown_kind(tmp_db: Database) -> None:
     with pytest.raises(ValueError):
         tmp_db.pending_add("characters", "1", {})
+
+
+# ---------------------------------------------------------------------------
+# comicvine.db export (ComicManager-compatible localcv layout)
+# ---------------------------------------------------------------------------
+
+
+def _open_like_comicmanager(path: Path) -> Any:
+    import sqlite3
+
+    # ComicManager opens the file as never-changing
+    return sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+
+
+def test_export_supports_comicmanager_queries(tmp_db: Database, tmp_path: Path) -> None:
+    dest = tmp_path / "export" / "comicvine.db"
+    dest.parent.mkdir()
+
+    counts = tmp_db.export_comicvine_db(dest)
+
+    assert counts["cv_issue"] == 2 and counts["cv_volume"] == 2
+    conn = _open_like_comicmanager(dest)
+    row = conn.execute(
+        """SELECT i.id, i.volume_id, i.name, i.issue_number, i.cover_date, i.description,
+                  i.image_url, i.site_detail_url, i.character_credits, i.person_credits,
+                  i.team_credits, i.location_credits, i.story_arc_credits,
+                  v.name, v.start_year, v.count_of_issues, p.name
+           FROM cv_issue i
+           JOIN cv_volume v ON i.volume_id = v.id
+           LEFT JOIN cv_publisher p ON v.publisher_id = p.id
+           WHERE i.id = 1073108"""
+    ).fetchone()
+    assert row[0] == 1073108
+    assert row[6] == "https://example.com/issue1.jpg"
+    assert row[13:] == ("Absolute Batman", "2024", 17, "DC Comics")
+    # Empty credit lists are written as JSON arrays, like the updater script
+    assert row[8:13] == ("[]", "[]", "[]", "[]", "[]")
+    assert conn.execute("SELECT COUNT(*) FROM comic_covers").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT name FROM cv_volume WHERE id IN (SELECT rowid FROM volume_fts"
+        " WHERE volume_fts MATCH 'absolute')"
+    ).fetchall() == [("Absolute Batman",)]
+    conn.close()
+    assert not list(dest.parent.glob("*.partial"))
+
+
+def test_export_keeps_larger_of_stored_and_actual_issue_counts(
+    tmp_db: Database, tmp_path: Path
+) -> None:
+    tmp_db.upsert_volume({"id": 7100, "name": "Stale Count", "count_of_issues": 1})
+    for n in (1, 2, 3):
+        tmp_db.upsert_issue({"id": 7100 + n, "volume": {"id": 7100}, "issue_number": str(n)})
+    dest = tmp_path / "comicvine.db"
+
+    tmp_db.export_comicvine_db(dest)
+
+    conn = _open_like_comicmanager(dest)
+    counts = dict(conn.execute("SELECT id, count_of_issues FROM cv_volume").fetchall())
+    conn.close()
+    assert counts[7100] == 3  # ComicVine's count was stale; local issues win
+    assert counts[160294] == 17  # 2 issues stored locally; ComicVine's 17 stays
+
+
+def test_export_copies_comic_covers_when_present(tmp_db: Database, tmp_path: Path) -> None:
+    tmp_db.conn.executescript(
+        """CREATE TABLE comic_covers (id INTEGER PRIMARY KEY, cvid INTEGER,
+               ct_phash TEXT, ct_ahash TEXT, cv_url TEXT);
+           INSERT INTO comic_covers VALUES (1, 1073108, 'abcd', 'ef01', 'https://x/c.jpg');"""
+    )
+    dest = tmp_path / "comicvine.db"
+
+    counts = tmp_db.export_comicvine_db(dest)
+
+    assert counts["comic_covers"] == 1
+    conn = _open_like_comicmanager(dest)
+    assert conn.execute(
+        "SELECT cvid, ct_phash, ct_ahash, cv_url FROM comic_covers"
+    ).fetchall() == [(1073108, "abcd", "ef01", "https://x/c.jpg")]
+    conn.close()
+
+
+def test_export_replaces_existing_file_atomically(tmp_db: Database, tmp_path: Path) -> None:
+    dest = tmp_path / "comicvine.db"
+    dest.write_bytes(b"old export")
+
+    tmp_db.export_comicvine_db(dest)
+
+    assert dest.read_bytes()[:16] == b"SQLite format 3\x00"
+    assert not (tmp_path / "comicvine.db.partial").exists()
+
+
+def test_export_built_in_staging_dir_then_moved(tmp_db: Database, tmp_path: Path) -> None:
+    """Build on local disk, then copy + rename into the (possibly network) destination."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    dest = tmp_path / "nfs" / "comicvine.db"
+    dest.parent.mkdir()
+
+    tmp_db.export_comicvine_db(dest, staging_dir=staging)
+
+    assert dest.read_bytes()[:16] == b"SQLite format 3\x00"
+    assert list(staging.iterdir()) == []
+    assert [p.name for p in dest.parent.iterdir()] == ["comicvine.db"]

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -110,6 +111,32 @@ ISSUE_DETAIL_FIELDS: tuple[str, ...] = (
     "first_appearance_locations", "first_appearance_objects",
     "first_appearance_storyarcs", "first_appearance_teams",
 )
+
+#: Schema of the exported comicvine.db: the localcv.db distribution layout read
+#: by ComicManager and kept current by its sqlite_cv_updater.py script.
+_LOCALCV_EXPORT_DDL = """
+CREATE TABLE cv_publisher (
+    id INTEGER PRIMARY KEY, name TEXT, image_url TEXT, site_detail_url TEXT
+);
+CREATE TABLE cv_volume (
+    id INTEGER PRIMARY KEY, name TEXT, aliases TEXT, start_year TEXT,
+    publisher_id INTEGER REFERENCES cv_publisher(id), count_of_issues INTEGER,
+    description TEXT, image_url TEXT, site_detail_url TEXT
+);
+CREATE TABLE cv_issue (
+    id INTEGER PRIMARY KEY, volume_id INTEGER REFERENCES cv_volume(id), name TEXT,
+    issue_number TEXT, cover_date TEXT, store_date TEXT, description TEXT,
+    image_url TEXT, site_detail_url TEXT,
+    character_credits TEXT, person_credits TEXT, team_credits TEXT,
+    location_credits TEXT, story_arc_credits TEXT, associated_images TEXT
+);
+CREATE TABLE comic_covers (
+    id INTEGER PRIMARY KEY, cvid INTEGER, ct_phash TEXT, ct_ahash TEXT, cv_url TEXT
+);
+CREATE INDEX idx_issue_volume_id ON cv_issue(volume_id);
+CREATE INDEX idx_comic_covers_cvid ON comic_covers(cvid);
+CREATE VIRTUAL TABLE volume_fts USING fts5(name, aliases, content=cv_volume, content_rowid=id);
+"""
 
 # ---------------------------------------------------------------------------
 # Schema DDL — auto-created on first run if tables are missing
@@ -581,6 +608,80 @@ class Database:
         finally:
             conn.close()
         partial.replace(dest)
+
+    def export_comicvine_db(
+        self, dest: Path, *, staging_dir: Path | None = None
+    ) -> dict[str, int]:
+        """Write a ComicManager-compatible comicvine.db (localcv layout) to *dest*.
+
+        Reads the live database through a read-only ATTACH on its own
+        connection, inside one transaction, so the export is a consistent
+        snapshot and can run on a worker thread without blocking writers.
+        Matches sqlite_cv_updater.py: empty credit lists are written as "[]",
+        and count_of_issues never stays below the number of stored issues.
+        The file is renamed into place at the end, because ComicManager opens
+        it with immutable=1 and must never see it change underneath it.
+
+        With *staging_dir* the file is built there (local disk) and then copied
+        next to *dest* before the rename; SQLite writes over NFS are slow and
+        its locking there is unreliable.  Returns each exported table's row count.
+        """
+        build_dir = staging_dir or dest.parent
+        partial = build_dir / (dest.name + ".partial")
+        partial.unlink(missing_ok=True)
+        out = sqlite3.connect(str(partial), uri=True)  # uri=True lets ATTACH take a URI
+        try:
+            out.executescript(_LOCALCV_EXPORT_DDL)
+            source = f"{self._path.resolve().as_uri()}?mode=ro"
+            out.execute("ATTACH DATABASE ? AS src", [source])
+            has_covers = out.execute(
+                "SELECT 1 FROM src.sqlite_master WHERE type='table' AND name='comic_covers'"
+            ).fetchone()
+            out.execute("BEGIN")
+            out.execute(
+                "INSERT INTO cv_publisher"
+                " SELECT id, name, image_url, site_detail_url FROM src.cv_publisher"
+            )
+            out.execute(
+                """INSERT INTO cv_volume
+                   SELECT v.id, v.name, v.aliases, v.start_year, v.publisher_id,
+                          CASE WHEN n.issues IS NULL THEN v.count_of_issues
+                               ELSE MAX(COALESCE(v.count_of_issues, 0), n.issues) END,
+                          v.description, v.image_url, v.site_detail_url
+                   FROM src.cv_volume v
+                   LEFT JOIN (SELECT volume_id, COUNT(*) AS issues FROM src.cv_issue
+                              GROUP BY volume_id) n ON n.volume_id = v.id"""
+            )
+            out.execute(
+                """INSERT INTO cv_issue
+                   SELECT id, volume_id, name, issue_number, cover_date, store_date,
+                          description, image_url, site_detail_url,
+                          COALESCE(character_credits, '[]'), COALESCE(person_credits, '[]'),
+                          COALESCE(team_credits, '[]'), COALESCE(location_credits, '[]'),
+                          COALESCE(story_arc_credits, '[]'), COALESCE(associated_images, '[]')
+                   FROM src.cv_issue"""
+            )
+            if has_covers:
+                out.execute(
+                    "INSERT INTO comic_covers"
+                    " SELECT id, cvid, ct_phash, ct_ahash, cv_url FROM src.comic_covers"
+                )
+            out.execute("COMMIT")
+            out.execute("DETACH DATABASE src")
+            out.execute("INSERT INTO volume_fts(volume_fts) VALUES ('rebuild')")
+            out.commit()
+            counts = {
+                table: out.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+                for table in ("cv_publisher", "cv_volume", "cv_issue", "comic_covers")
+            }
+        finally:
+            out.close()
+        published = dest.with_name(dest.name + ".partial")
+        if published != partial:
+            shutil.copyfile(partial, published)
+            partial.unlink()
+        published.replace(dest)
+        return counts
 
     def _ensure_schema(self) -> None:
         """Create tables, migrate columns, then create indexes.
@@ -1108,6 +1209,12 @@ class Database:
             row and row["count_of_issues"]
             and row["local_count"] >= row["count_of_issues"]
         )
+
+    def existing_ids(self, table: str) -> set[int]:
+        """All IDs stored in cv_volume or cv_issue."""
+        if table not in ("cv_volume", "cv_issue"):
+            raise ValueError(f"Unsupported table: {table!r}")
+        return {row[0] for row in self.conn.execute(f"SELECT id FROM {table}")}  # noqa: S608
 
     def mark_volume_issues_synced(self, volume_id: int) -> None:
         self.conn.execute(

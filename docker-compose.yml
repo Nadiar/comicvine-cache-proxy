@@ -24,6 +24,10 @@ services:
       # Nightly database snapshots (BACKUP_KEEP=0 disables them)
       - BACKUP_DIR=/data/backups
       - BACKUP_KEEP=3
+      # Daily ComicManager-compatible comicvine.db (localcv layout). Unset = off.
+      # - CV_DB_EXPORT_PATH=/data/export/comicvine.db
+      # Daily copy of the community latest.mcl (ComicManager fallback). Unset = off.
+      # - MCL_EXPORT_PATH=/data/export/latest.mcl
 
       # -----------------------------------------------------------------------
       # ComicVine API

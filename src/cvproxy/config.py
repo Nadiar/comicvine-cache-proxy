@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     backup_dir: Path = Path("/data/backups")
     backup_keep: int = 3
 
+    # Nightly ComicManager-compatible comicvine.db (localcv layout); unset = off
+    cv_db_export_path: Path | None = None
+    # Daily copy of the community missing-comics list for ComicManager; unset = off
+    mcl_export_path: Path | None = None
+    mcl_source_url: str = (
+        "https://gitea.baerentsen.space/api/v1/repos/FrederikBaerentsen/"
+        "ComicRack_Scripts/contents/Update%20Missing?ref=master"
+    )
+
     # Background sync
     sync_enabled: bool = True
     sync_cron_hour: int = 3  # UTC hour for daily sync

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 from cvproxy.db import Database
@@ -309,3 +310,193 @@ def test_pending_fetch_job_registered() -> None:
     settings = Settings(cv_api_key="testkey", sync_enabled=True)
     scheduler = create_scheduler(settings, MagicMock(), MagicMock(), MagicMock())
     assert "pending_fetch" in {job.id for job in scheduler.get_jobs()}
+
+
+# ---------------------------------------------------------------------------
+# comicvine.db export job
+# ---------------------------------------------------------------------------
+
+
+async def test_export_job_writes_file(tmp_db: Database, tmp_path: Path) -> None:
+    from cvproxy.config import Settings
+    from cvproxy.scheduler import _export_comicvine_db
+
+    dest = tmp_path / "export" / "comicvine.db"
+    settings = Settings(cv_api_key="k", cv_db_export_path=dest)
+
+    result = await _export_comicvine_db(tmp_db, settings)
+
+    assert dest.exists()
+    assert result["path"] == str(dest)
+    assert result["cv_issue"] == 2
+
+
+async def test_export_job_disabled_without_path(tmp_db: Database) -> None:
+    from cvproxy.config import Settings
+    from cvproxy.scheduler import _export_comicvine_db
+
+    result = await _export_comicvine_db(tmp_db, Settings(cv_api_key="k"))
+
+    assert result == {"path": None}
+
+
+def test_export_job_registered_only_when_configured(tmp_path: Path) -> None:
+    from cvproxy.config import Settings
+
+    plain = create_scheduler(
+        Settings(cv_api_key="k", sync_enabled=True), MagicMock(), MagicMock(), MagicMock()
+    )
+    exporting = create_scheduler(
+        Settings(cv_api_key="k", sync_enabled=True, cv_db_export_path=tmp_path / "cv.db"),
+        MagicMock(), MagicMock(), MagicMock(),
+    )
+    assert "comicvine_db_export" not in {job.id for job in plain.get_jobs()}
+    assert "comicvine_db_export" in {job.id for job in exporting.get_jobs()}
+
+
+async def test_export_job_builds_on_local_disk_next_to_database(
+    tmp_db: Database, tmp_path: Path
+) -> None:
+    from unittest.mock import patch
+
+    from cvproxy.config import Settings
+    from cvproxy.scheduler import _export_comicvine_db
+
+    dest = tmp_path / "export" / "comicvine.db"
+    settings = Settings(cv_api_key="k", cv_db_export_path=dest, db_path=tmp_path / "test.db")
+
+    with patch.object(tmp_db, "export_comicvine_db", wraps=tmp_db.export_comicvine_db) as spy:
+        await _export_comicvine_db(tmp_db, settings)
+
+    assert spy.call_args.kwargs["staging_dir"] == tmp_path
+
+
+def test_mcl_refresh_job_registered_only_when_configured(tmp_path: Path) -> None:
+    from cvproxy.config import Settings
+
+    plain = create_scheduler(
+        Settings(cv_api_key="k", sync_enabled=True), MagicMock(), MagicMock(), MagicMock()
+    )
+    refreshing = create_scheduler(
+        Settings(cv_api_key="k", sync_enabled=True, mcl_export_path=tmp_path / "latest.mcl"),
+        MagicMock(), MagicMock(), MagicMock(),
+    )
+    assert "mcl_refresh" not in {job.id for job in plain.get_jobs()}
+    assert "mcl_refresh" in {job.id for job in refreshing.get_jobs()}
+
+
+# ---------------------------------------------------------------------------
+# MCL gap backfill
+# ---------------------------------------------------------------------------
+
+
+def _mcl_settings(tmp_path: Path, body: str) -> Any:
+    from cvproxy.config import Settings
+
+    path = tmp_path / "latest.mcl"
+    path.write_text(body)
+    return Settings(cv_api_key="k", mcl_export_path=path)
+
+
+def _gap_client(responses: dict[str, Any]) -> MagicMock:
+    from unittest.mock import AsyncMock
+
+    client = MagicMock()
+    client.hourly_calls.return_value = 0
+    client.get = AsyncMock(side_effect=lambda endpoint, params: responses[endpoint])
+    return client
+
+
+async def test_mcl_gap_backfill_fetches_missing_volumes_then_issues(
+    tmp_db: Database, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from cvproxy.scheduler import _backfill_from_mcl
+
+    # 160294 is local (1073108 stored, 999001 not); 555555 isn't local at all
+    settings = _mcl_settings(
+        tmp_path, "Missing;2026-10-20\n160294;1073108,999001;1,7\n555555;999002;1\n"
+    )
+    client = _gap_client({
+        "volumes/": {"status_code": 1, "results": [{"id": 555555, "name": "New Volume"}]},
+        "issues/": {"status_code": 1, "results": [
+            {"id": 999001, "volume": {"id": 160294}, "issue_number": "7"},
+            {"id": 999002, "volume": {"id": 555555}, "issue_number": "1"},
+        ]},
+    })
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        result = await _backfill_from_mcl(client, tmp_db, settings)
+
+    assert result == {"volumes_missing": 1, "volumes_added": 1,
+                      "issues_missing": 2, "issues_added": 2}
+    endpoints = [c.args[0] for c in client.get.call_args_list]
+    assert endpoints == ["volumes/", "issues/"]
+    assert client.get.call_args_list[0].args[1]["filter"] == "id:555555"
+    assert client.get.call_args_list[1].args[1]["filter"] == "id:999002|999001"
+    assert tmp_db.get_volume(555555) is not None
+    assert tmp_db.get_issue(999001) is not None
+
+
+async def test_mcl_gap_backfill_batches_100_ids_per_call(
+    tmp_db: Database, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from cvproxy.scheduler import _backfill_from_mcl
+
+    ids = ",".join(str(900_000 + i) for i in range(150))
+    settings = _mcl_settings(tmp_path, f"160294;{ids};{','.join(['1'] * 150)}\n")
+    client = _gap_client({"issues/": {"status_code": 1, "results": []}})
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        await _backfill_from_mcl(client, tmp_db, settings)
+
+    sizes = [len(c.args[1]["filter"].removeprefix("id:").split("|"))
+             for c in client.get.call_args_list]
+    assert sizes == [100, 50]
+
+
+async def test_mcl_gap_backfill_stops_when_rate_limited(tmp_db: Database, tmp_path: Path) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from cvproxy.cv_client import RATE_LIMITED
+    from cvproxy.scheduler import _backfill_from_mcl
+
+    settings = _mcl_settings(tmp_path, "555555;999002;1\n555556;999003;1\n")
+    client = _gap_client({"volumes/": RATE_LIMITED, "issues/": {"status_code": 1, "results": []}})
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        await _backfill_from_mcl(client, tmp_db, settings)
+
+    assert [c.args[0] for c in client.get.call_args_list] == ["volumes/"]
+
+
+async def test_mcl_gap_backfill_waits_for_queued_client_requests(
+    tmp_db: Database, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from cvproxy.scheduler import _backfill_from_mcl
+
+    settings = _mcl_settings(tmp_path, "555555;999002;1\n")
+    tmp_db.pending_add("issues_filter", "k", {"filter": "volume:1", "negative_key": None})
+    client = _gap_client({"volumes/": {"status_code": 1, "results": []}})
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        await _backfill_from_mcl(client, tmp_db, settings)
+
+    assert [c.args[0] for c in client.get.call_args_list] == ["volumes/"]
+
+
+async def test_mcl_gap_backfill_without_file_does_nothing(tmp_db: Database) -> None:
+    from cvproxy.config import Settings
+    from cvproxy.scheduler import _backfill_from_mcl
+
+    client = _gap_client({})
+    result = await _backfill_from_mcl(client, tmp_db, Settings(cv_api_key="k"))
+
+    assert result == {"volumes_missing": 0, "volumes_added": 0,
+                      "issues_missing": 0, "issues_added": 0}
+    client.get.assert_not_called()

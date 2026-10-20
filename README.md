@@ -50,6 +50,9 @@ All settings via environment variables:
 | `STATS_DB_PATH` | `/data/stats.db` | Request stats database path |
 | `BACKUP_DIR` | `/data/backups` | Where nightly database snapshots are written |
 | `BACKUP_KEEP` | `3` | Snapshots to keep (`0` disables backups) |
+| `CV_DB_EXPORT_PATH` | *(unset)* | Write a ComicManager-compatible `comicvine.db` here daily; unset disables the export |
+| `MCL_EXPORT_PATH` | *(unset)* | Keep a daily copy of the community `latest.mcl` here; unset disables it |
+| `MCL_SOURCE_URL` | Gitea `Update Missing` folder (API listing) | Where to look for the newest `*_latest.mcl` |
 | `RATE_LIMIT_PER_MINUTE` | `100` | Global upstream calls per minute |
 | `RATE_LIMIT_PER_HOUR_PER_ENDPOINT` | `180` | Upstream calls per hour per CV endpoint path |
 | `RATE_STATE_PATH` | `/data/rate_state.json` | Recent upstream call times and cooldown, kept across restarts |
@@ -114,6 +117,9 @@ All admin endpoints return immediately with a `job_id`. Poll `GET /admin/jobs/{j
 | `POST /admin/evict` | Evict stale data (`?dry_run=true` previews without deleting) |
 | `POST /admin/cleanup/images` | Remove expired image cache entries immediately |
 | `POST /admin/rebuild/fts` | Rebuild FTS5 search indexes |
+| `POST /admin/export/comicvine-db` | Write the `comicvine.db` export now (needs `CV_DB_EXPORT_PATH`) |
+| `POST /admin/mcl/refresh` | Download the newest `latest.mcl` now (needs `MCL_EXPORT_PATH`) |
+| `POST /admin/mcl/backfill` | Fetch volumes/issues listed in `latest.mcl` but missing locally |
 | `GET /admin/jobs` | List all background jobs |
 | `GET /admin/jobs/{id}` | Poll job status |
 | `DELETE /admin/jobs/{id}` | Cancel a running job |
@@ -171,11 +177,41 @@ When `SYNC_ENABLED=true`, the following jobs run automatically:
 | Publisher backfill | Every 6h at :15 | Re-fetches publishers missing new fields |
 | Search cache backfill | Every 2h at :50 | Fetches volumes seen in search results but not yet in DB |
 | Pending fetch | Every 2 min | Fetches requests that missed the cache while ComicVine was rate limiting, oldest first; backfill on that endpoint waits until they're done |
+| comicvine.db export | Daily at `SYNC_CRON_HOUR`+5 | Only when `CV_DB_EXPORT_PATH` is set; see below |
+| latest.mcl refresh | Daily at `SYNC_CRON_HOUR`+5:30 | Only when `MCL_EXPORT_PATH` is set; replaces the file only when it changed |
+| MCL gap backfill | Daily at `SYNC_CRON_HOUR`+6 | Fetches volumes and issues listed in `latest.mcl` but missing locally, 100 IDs per request |
 | Database backup | Daily at `SYNC_CRON_HOUR`+4 | Compacted snapshot (`VACUUM INTO`) in `BACKUP_DIR`, keeps `BACKUP_KEEP` |
 | Stale data eviction | Daily, 3h after prefetch | Removes expired entities (when eviction is configured) |
 | Image cache cleanup | Daily, 2h after prefetch | Removes expired image cache entries |
 
 Backfill jobs are rate-paced to stay within the hourly CV API budget, leaving headroom for live proxy traffic.
+
+## comicvine.db Export (ComicManager)
+
+With `CV_DB_EXPORT_PATH` set, a daily job writes a `comicvine.db` in the layout of the `localcv.db` distribution that ComicManager reads (and `sqlite_cv_updater.py` maintains):
+
+- `cv_publisher`, `cv_volume`, `cv_issue`, `comic_covers`, plus the `volume_fts` search index
+- empty credit lists written as `[]`
+- `count_of_issues` is never lower than the number of stored issues
+
+The file is built as `comicvine.db.partial` on local disk next to cvproxy's own database, copied into the destination folder (which can be a network share), and renamed into place. ComicManager opens it with `immutable=1`, so it must never see the file change. Consumers should **mount the directory, not the file**. A single-file bind mount keeps showing the old file after the rename.
+
+`MCL_EXPORT_PATH` (usually the same folder, as `latest.mcl`) keeps a copy of the community missing-comics list. ComicManager only reads it as a fallback when `comicvine.db` is missing.
+
+```yaml
+# cvproxy
+environment:
+  - CV_DB_EXPORT_PATH=/data/export/comicvine.db
+  - MCL_EXPORT_PATH=/data/export/latest.mcl
+# ComicManager (web and worker)
+volumes:
+  - /path/to/cvproxy/data/export:/cv_db:ro
+```
+
+Limits:
+
+- **Cover hashes:** `comic_covers` holds only the hashes imported with the original `localcv.db`. Nothing computes them for newer issues, so cover matching can't find those issues.
+- **Credits:** issues stored only from list responses show empty credits until the issue detail backfill reaches them.
 
 ## Development
 
