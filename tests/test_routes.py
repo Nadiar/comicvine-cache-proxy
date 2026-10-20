@@ -63,7 +63,6 @@ def _mock_cv_client() -> AsyncMock:
     mock_client = AsyncMock()
     mock_client.total_hourly_calls = MagicMock(return_value=0)
     mock_client.retry_after = MagicMock(return_value=0.0)
-    mock_client.seconds_until_total_below = MagicMock(return_value=0.0)
     return mock_client
 
 
@@ -581,11 +580,11 @@ def test_upstream_rate_limit_response_propagated_to_client(app_client: TestClien
     assert data["error"] == "Rate Limit Exceeded"
 
 
-def test_route_returns_rate_limit_error_when_above_190_threshold(app_client: TestClient) -> None:
-    """When total_hourly_calls() >= 190 the route must refuse upstream with 420 / 107."""
+def test_route_returns_rate_limit_error_during_cooldown(app_client: TestClient) -> None:
+    """While the client is cooling down after a refusal the route answers 420 / 107."""
     cv_client = app_client.app.state.cv_client
-    with patch.object(cv_client, "total_hourly_calls", return_value=190):
-        resp = app_client.get("/api/issue/4000-999999/")
+    cv_client._start_cooldown()
+    resp = app_client.get("/api/issue/4000-999999/")
 
     assert resp.status_code == 420
     assert int(resp.headers["Retry-After"]) >= 1
@@ -594,11 +593,11 @@ def test_route_returns_rate_limit_error_when_above_190_threshold(app_client: Tes
     assert data["error"] == "Rate Limit Exceeded"
 
 
-def test_route_does_not_rate_limit_below_threshold(app_client: TestClient) -> None:
-    """Below the threshold the route should attempt upstream (returning miss/101, not 107)."""
-    cv_client = app_client.app.state.cv_client
-    with patch.object(cv_client, "total_hourly_calls", return_value=0):
-        resp = app_client.get("/api/issue/4000-999999/")
+def test_route_does_not_rate_limit_with_heavy_use_elsewhere(app_client: TestClient) -> None:
+    """Heavy use of other endpoints doesn't stop /issue/ (returns miss/101, not 107)."""
+    _fill_window(app_client, "search", 179)
+    _fill_window(app_client, "volume", 179)
+    resp = app_client.get("/api/issue/4000-999999/")
 
     assert resp.status_code == 200
     data = resp.json()
@@ -2154,3 +2153,116 @@ def test_issue_detail_for_detailed_row_never_goes_upstream(app_client: TestClien
 
     assert resp.status_code == 200
     mock_client.get_issue.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Per-endpoint upstream budget; local fallback for issue search
+# ---------------------------------------------------------------------------
+
+
+def _fill_window(app_client: TestClient, endpoint_key: str, count: int) -> None:
+    """Record *count* recent upstream calls against one endpoint of the real client."""
+    import time
+    from collections import deque
+
+    now = time.time()
+    app_client.app.state.cv_client._hourly_windows[endpoint_key] = deque(
+        now - 60 + i * 0.01 for i in range(count)
+    )
+
+
+def test_full_issue_window_does_not_block_search(app_client: TestClient) -> None:
+    """ComicVine budgets each endpoint separately; /issue/ usage must not stop /search/."""
+    cv_client = app_client.app.state.cv_client
+    _fill_window(app_client, "issue", cv_client.hourly_limit)
+    search = AsyncMock(return_value=_search_page([{"id": 7, "name": "Seven"}], 1))
+
+    with patch.object(cv_client, "search", new=search):
+        resp = app_client.get("/api/search/", params={"query": "Seven Seas"})
+
+    assert resp.status_code == 200
+    search.assert_called_once()
+
+
+def test_full_endpoint_window_blocks_that_endpoint(app_client: TestClient) -> None:
+    cv_client = app_client.app.state.cv_client
+    _fill_window(app_client, "issue", cv_client.hourly_limit)
+    get_issue = AsyncMock()
+
+    with patch.object(cv_client, "get_issue", new=get_issue):
+        resp = app_client.get("/api/issue/4000-999999/")
+
+    assert resp.status_code == 420
+    assert int(resp.headers["Retry-After"]) > 3000  # oldest call ages out in ~59 min
+    get_issue.assert_not_called()
+
+
+def _seed_green_arrow(db: Database) -> None:
+    db.upsert_volume({"id": 172003, "name": "Absolute Green Arrow", "count_of_issues": 5})
+    db.upsert_issue({
+        "id": 1167128, "volume": {"id": 172003}, "issue_number": "1", "name": "Part One",
+        "person_credits": [],
+    })
+
+
+def test_issue_search_falls_back_to_local_series_match_when_rate_limited(
+    app_client: TestClient,
+) -> None:
+    _seed_green_arrow(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=600.0)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get(
+        "/api/search/",
+        params={"resources": "issue", "query": "Absolute Green Arrow 1", "limit": 12},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status_code"] == 1
+    assert [r["id"] for r in data["results"]] == [1167128]
+    assert data["results"][0]["volume"]["name"] == "Absolute Green Arrow"
+    mock_client.search.assert_not_called()
+
+
+def test_issue_search_local_fallback_is_not_cached(app_client: TestClient) -> None:
+    """The fallback is partial, so the next search must still ask ComicVine."""
+    _seed_green_arrow(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=600.0)
+    app_client.app.state.cv_client = mock_client
+    params = {"resources": "issue", "query": "Absolute Green Arrow 1"}
+
+    app_client.get("/api/search/", params=params)
+    mock_client.retry_after = MagicMock(return_value=0.0)
+    mock_client.search = AsyncMock(return_value=_search_page([], 0))
+    app_client.get("/api/search/", params=params)
+
+    mock_client.search.assert_called_once()
+
+
+def test_issue_search_falls_back_to_local_when_upstream_fails(app_client: TestClient) -> None:
+    _seed_green_arrow(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    mock_client.search = AsyncMock(return_value=None)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get(
+        "/api/search/", params={"resources": "issue", "query": "Absolute Green Arrow #1"}
+    )
+
+    assert resp.status_code == 200
+    assert [r["id"] for r in resp.json()["results"]] == [1167128]
+
+
+def test_issue_search_without_local_match_still_returns_420(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=600.0)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get(
+        "/api/search/", params={"resources": "issue", "query": "Unknown Series 4"}
+    )
+
+    assert resp.status_code == 420

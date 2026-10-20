@@ -103,11 +103,6 @@ router = APIRouter(prefix="/api")
 # Rate limit helpers
 # ---------------------------------------------------------------------------
 
-#: When total upstream calls in the past hour reach this value we stop
-#: forwarding to the upstream and return a rate-limit busy response instead,
-#: reserving headroom for manual/diagnostic queries.
-_RATE_LIMIT_UPSTREAM_THRESHOLD = 190
-
 
 def _cv_rate_limit_error(client: CVClient, endpoint: str) -> JSONResponse:
     """CV rate limit envelope (status_code 107) sent as HTTP 420 with Retry-After.
@@ -131,15 +126,12 @@ def _cv_rate_limit_error(client: CVClient, endpoint: str) -> JSONResponse:
     )
 
 
-def _is_rate_limit_busy(client: CVClient) -> bool:
-    """True when the total hourly upstream call count is at or above the threshold."""
-    return client.total_hourly_calls() >= _RATE_LIMIT_UPSTREAM_THRESHOLD
-
-
 def _upstream_retry_after(client: CVClient, endpoint: str) -> float:
-    """Seconds until a live request to *endpoint* may go upstream (0 = now)."""
-    if _is_rate_limit_busy(client):
-        return max(1.0, client.seconds_until_total_below(_RATE_LIMIT_UPSTREAM_THRESHOLD))
+    """Seconds until a live request to *endpoint* may go upstream (0 = now).
+
+    ComicVine budgets each resource path separately, so only this endpoint's
+    hourly window and the post-refusal cooldown count — not other endpoints.
+    """
     return client.retry_after(endpoint)
 
 
@@ -339,8 +331,8 @@ async def _guarded_get(  # noqa: UP047
     """Pre-flight budget check before calling upstream.
 
     Returns RATE_LIMITED without calling *call* while CV is cooling down, the
-    endpoint's hourly window is full, or the overall threshold is reached, so
-    live requests answer 420 instead of sleeping until quota frees up.
+    endpoint's hourly window is full, so live requests answer 420 instead of
+    sleeping until quota frees up.
     """
     if _upstream_retry_after(client, endpoint) > 0:
         return RATE_LIMITED
@@ -533,6 +525,16 @@ def _issue_sort_key(
 def _search_sort_key(result: dict[str, Any], query: str) -> tuple[int, int, int, str]:
     """Relevance key for a volume/publisher search result."""
     return _search_relevance_key(result.get("name"), query, result.get("date_last_updated"))
+
+
+def _local_issue_search_matches(
+    db: Database, query: str, resources: str
+) -> list[dict[str, Any]]:
+    """Local "<series> #<number>" issue matches, for when ComicVine can't be searched."""
+    if resources.split(",")[0].strip() != "issue":
+        return []
+    series, number = _split_issue_query(query)
+    return list(db.find_series_issues(series, number)) if number is not None else []
 
 
 def _rank_issue_results(
@@ -774,32 +776,36 @@ async def search(
         all_results, cv_total, rate_limited = await _fetch_search_pages(
             client, query, resources, 1, pages_needed
         )
-        if rate_limited and not all_results:
-            _record(request, endpoint="search", source="miss", start=t0)
-            return _cv_rate_limit_error(client, "search/")
-
         if not all_results:
-            _record(request, endpoint="search", source="miss", start=t0)
-            return _cv_envelope([], total=0, limit=limit, offset=effective_offset)
-
-        _store_search_results(
-            db, params_hash, all_results, cv_total, query=norm_query, resources=resources
-        )
-        cached_data = {"results": all_results, "total": cv_total}
-
-        more_upstream = (
-            not rate_limited
-            and len(all_results) == pages_needed * _SEARCH_PAGE_SIZE
-            and len(all_results) < cv_total
-            and pages_needed < max_pages
-        )
-        if more_upstream and params_hash not in _search_fills_in_progress:
-            _search_fills_in_progress.add(params_hash)
-            background_tasks.add_task(
-                _fill_search_cache, client, db, params_hash, query, norm_query, resources,
-                list(all_results), cv_total, pages_needed + 1, max_pages,
+            # ComicVine couldn't answer: serve local "<series> #<number>" matches
+            # rather than nothing.  Not cached, so the next search asks upstream again.
+            local_matches = _local_issue_search_matches(db, query, resources)
+            if not local_matches:
+                _record(request, endpoint="search", source="miss", start=t0)
+                if rate_limited:
+                    return _cv_rate_limit_error(client, "search/")
+                return _cv_envelope([], total=0, limit=limit, offset=effective_offset)
+            cached_data = {"results": local_matches, "total": len(local_matches)}
+            _record(request, endpoint="search", source="cache", start=t0)
+        else:
+            _store_search_results(
+                db, params_hash, all_results, cv_total, query=norm_query, resources=resources
             )
-        _record(request, endpoint="search", source="upstream", start=t0)
+            cached_data = {"results": all_results, "total": cv_total}
+
+            more_upstream = (
+                not rate_limited
+                and len(all_results) == pages_needed * _SEARCH_PAGE_SIZE
+                and len(all_results) < cv_total
+                and pages_needed < max_pages
+            )
+            if more_upstream and params_hash not in _search_fills_in_progress:
+                _search_fills_in_progress.add(params_hash)
+                background_tasks.add_task(
+                    _fill_search_cache, client, db, params_hash, query, norm_query, resources,
+                    list(all_results), cv_total, pages_needed + 1, max_pages,
+                )
+            _record(request, endpoint="search", source="upstream", start=t0)
     else:
         _record(request, endpoint="search", source="cache", start=t0)
 

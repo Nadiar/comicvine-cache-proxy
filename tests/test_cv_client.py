@@ -262,17 +262,17 @@ async def test_retry_after_when_endpoint_hourly_window_full() -> None:
     await client.close()
 
 
-async def test_seconds_until_total_below_threshold() -> None:
+async def test_hourly_calls_counts_one_endpoint() -> None:
     from collections import deque
 
     client = CVClient(api_key="test")
     now = time.time()
-    client._hourly_windows["issues"] = deque([now - 3500, now - 100])
-    client._hourly_windows["issue"] = deque([now - 3000])
+    client._hourly_windows["issue"] = deque([now - 3700, now - 3000, now - 10])
+    client._hourly_windows["issues"] = deque([now - 5])
 
-    # 3 calls, threshold 3: the oldest (100 s left) must age out first.
-    assert 90 < client.seconds_until_total_below(3) <= 100
-    assert client.seconds_until_total_below(4) == 0
+    assert client.hourly_calls("issue/4000-1/") == 2  # stale entry excluded
+    assert client.hourly_calls("issues/") == 1
+    assert client.hourly_calls("search/") == 0
     await client.close()
 
 

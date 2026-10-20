@@ -64,9 +64,11 @@ def _make_tracked(name: str, fn: Any) -> Any:
 # Backfill rate pacing
 # ---------------------------------------------------------------------------
 
-#: Maximum upstream calls the backfill jobs may consume per hour.  The
-#: remainder of the hourly budget is reserved for live client requests.
-_BACKFILL_HOURLY_BUDGET = 149
+#: Upstream calls per hour the backfill jobs may make to any one endpoint.
+#: ComicVine budgets each resource path separately; the rest of that path's
+#: hourly window (rate_limit_per_hour_per_endpoint, 180) is kept for live
+#: requests.  Jobs that call the same endpoint share this budget.
+_BACKFILL_HOURLY_BUDGET = 120
 
 #: Hard cap on the time to sleep between individual backfill calls (seconds).
 _BACKFILL_MAX_SLEEP = 120.0
@@ -75,11 +77,11 @@ _BACKFILL_MAX_SLEEP = 120.0
 _BACKFILL_MIN_SLEEP = 2.0
 
 
-def _backfill_call_interval(client: CVClient) -> float:
-    """Compute seconds to sleep after each backfill upstream call.
+def _backfill_call_interval(client: CVClient, endpoint: str) -> float:
+    """Compute seconds to sleep after each backfill upstream call to *endpoint*.
 
-    Divides the remaining seconds in the current clock-hour by the remaining
-    backfill budget.  This spreads the allowed calls evenly across the hour so
+    Divides the remaining seconds in the current clock-hour by the endpoint's
+    remaining backfill budget.  This spreads the allowed calls evenly across the hour so
     that live client requests always have headroom between background fetches.
 
     Example: 45 min left, 100 budget remaining → sleep 27 s per call.
@@ -89,7 +91,7 @@ def _backfill_call_interval(client: CVClient) -> float:
         1.0,
         3600.0 - (now_utc.minute * 60 + now_utc.second + now_utc.microsecond / 1_000_000),
     )
-    used = client.total_hourly_calls()
+    used = client.hourly_calls(endpoint)
     remaining_budget = max(1, _BACKFILL_HOURLY_BUDGET - used)
     interval = secs_left_in_hour / remaining_budget
     return max(_BACKFILL_MIN_SLEEP, min(interval, _BACKFILL_MAX_SLEEP))
@@ -401,15 +403,15 @@ async def _backfill_volumes(client: CVClient, db: Database) -> dict[str, Any]:
     )
     updated = 0
     for vid in volume_ids:
-        if client.total_hourly_calls() > _BACKFILL_HOURLY_BUDGET:
+        if client.hourly_calls("volume/") >= _BACKFILL_HOURLY_BUDGET:
             logger.info(
-                "Volume backfill: pausing after %d upstream calls in the past hour "
-                "(threshold: %d)",
-                client.total_hourly_calls(),
+                "Volume backfill: pausing after %d /volume/ calls in the past hour "
+                "(backfill budget: %d)",
+                client.hourly_calls("volume/"),
                 _BACKFILL_HOURLY_BUDGET,
             )
             break
-        sleep_secs = _backfill_call_interval(client)
+        sleep_secs = _backfill_call_interval(client, "volume/")
         data = await client.get_volume(vid)
         if data is _CV_NOT_FOUND:
             db.mark_backfill_missing("cv_volume", vid)
@@ -469,15 +471,15 @@ async def _backfill_issues(client: CVClient, db: Database) -> dict[str, Any]:
     logger.info("Issue backfill: fetching %d issues", len(issue_ids))
     updated = 0
     for iid in issue_ids:
-        if client.total_hourly_calls() > _BACKFILL_HOURLY_BUDGET:
+        if client.hourly_calls("issue/") >= _BACKFILL_HOURLY_BUDGET:
             logger.info(
-                "Issue backfill: pausing after %d upstream calls in the past hour "
-                "(threshold: %d)",
-                client.total_hourly_calls(),
+                "Issue backfill: pausing after %d /issue/ calls in the past hour "
+                "(backfill budget: %d)",
+                client.hourly_calls("issue/"),
                 _BACKFILL_HOURLY_BUDGET,
             )
             break
-        sleep_secs = _backfill_call_interval(client)
+        sleep_secs = _backfill_call_interval(client, "issue/")
         data = await client.get_issue(iid)
         if data is _CV_NOT_FOUND:
             db.mark_backfill_missing("cv_issue", iid)
@@ -506,15 +508,15 @@ async def _backfill_issue_details(client: CVClient, db: Database) -> dict[str, A
     logger.info("Issue detail backfill: fetching %d issues", len(issue_ids))
     updated = 0
     for iid in issue_ids:
-        if client.total_hourly_calls() > _BACKFILL_HOURLY_BUDGET:
+        if client.hourly_calls("issue/") >= _BACKFILL_HOURLY_BUDGET:
             logger.info(
-                "Issue detail backfill: pausing after %d upstream calls in the past hour "
-                "(threshold: %d)",
-                client.total_hourly_calls(),
+                "Issue detail backfill: pausing after %d /issue/ calls in the past hour "
+                "(backfill budget: %d)",
+                client.hourly_calls("issue/"),
                 _BACKFILL_HOURLY_BUDGET,
             )
             break
-        sleep_secs = _backfill_call_interval(client)
+        sleep_secs = _backfill_call_interval(client, "issue/")
         data = await client.get_issue(iid)
         if data is _CV_RATE_LIMITED:
             logger.info("Issue detail backfill: rate limited by CV, stopping this run")
@@ -551,15 +553,15 @@ async def _backfill_publishers(client: CVClient, db: Database) -> dict[str, Any]
     logger.info("Publisher backfill: fetching %d publishers", len(publisher_ids))
     updated = 0
     for pid in publisher_ids:
-        if client.total_hourly_calls() > _BACKFILL_HOURLY_BUDGET:
+        if client.hourly_calls("publisher/") >= _BACKFILL_HOURLY_BUDGET:
             logger.info(
-                "Publisher backfill: pausing after %d upstream calls in the past hour "
-                "(threshold: %d)",
-                client.total_hourly_calls(),
+                "Publisher backfill: pausing after %d /publisher/ calls in the past hour "
+                "(backfill budget: %d)",
+                client.hourly_calls("publisher/"),
                 _BACKFILL_HOURLY_BUDGET,
             )
             break
-        sleep_secs = _backfill_call_interval(client)
+        sleep_secs = _backfill_call_interval(client, "publisher/")
         data = await client.get_publisher(pid)
         if data is _CV_NOT_FOUND:
             db.mark_backfill_missing("cv_publisher", pid)
@@ -741,15 +743,15 @@ async def _backfill_search_cache_volumes(client: CVClient, db: Database) -> dict
     logger.info("Search cache volume backfill: fetching %d missing volumes", len(missing_ids))
     updated = 0
     for vid in missing_ids:
-        if client.total_hourly_calls() > _BACKFILL_HOURLY_BUDGET:
+        if client.hourly_calls("volume/") >= _BACKFILL_HOURLY_BUDGET:
             logger.info(
-                "Search cache volume backfill: pausing after %d upstream calls in the past hour "
-                "(threshold: %d)",
-                client.total_hourly_calls(),
+                "Search cache volume backfill: pausing after %d /volume/ calls in the past hour "
+                "(backfill budget: %d)",
+                client.hourly_calls("volume/"),
                 _BACKFILL_HOURLY_BUDGET,
             )
             break
-        sleep_secs = _backfill_call_interval(client)
+        sleep_secs = _backfill_call_interval(client, "volume/")
         data = await client.get_volume(vid)
         if data is _CV_NOT_FOUND:
             db.mark_backfill_missing("cv_volume", vid)

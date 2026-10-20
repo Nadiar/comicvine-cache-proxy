@@ -17,14 +17,14 @@ from cvproxy.scheduler import (
 
 def _mock_client(used: int) -> MagicMock:
     client = MagicMock()
-    client.total_hourly_calls.return_value = used
+    client.hourly_calls.return_value = used
     return client
 
 
 def test_interval_is_clamped_above_minimum() -> None:
     """Even with no budget consumed at the start of the hour the interval is >= min."""
     client = _mock_client(used=0)
-    result = _backfill_call_interval(client)
+    result = _backfill_call_interval(client, "issue/")
     assert result >= _BACKFILL_MIN_SLEEP
 
 
@@ -32,15 +32,15 @@ def test_interval_is_clamped_below_maximum() -> None:
     """When nearly all budget is consumed the interval never exceeds the cap."""
     # Only 1 call left in the budget → secs_left / 1 could be up to 3600.
     client = _mock_client(used=_BACKFILL_HOURLY_BUDGET - 1)
-    result = _backfill_call_interval(client)
+    result = _backfill_call_interval(client, "issue/")
     assert result <= _BACKFILL_MAX_SLEEP
 
 
 def test_interval_increases_as_budget_is_consumed() -> None:
     """With fewer remaining calls the interval between calls should grow."""
-    interval_with_full_budget = _backfill_call_interval(_mock_client(used=0))
+    interval_with_full_budget = _backfill_call_interval(_mock_client(used=0), "issue/")
     half_budget_client = _mock_client(used=_BACKFILL_HOURLY_BUDGET // 2)
-    interval_with_half_budget = _backfill_call_interval(half_budget_client)
+    interval_with_half_budget = _backfill_call_interval(half_budget_client, "issue/")
     # Can't assert strict ordering because both might be clamped at min/max,
     # but at least the half-budget interval must be >= full-budget interval.
     assert interval_with_half_budget >= interval_with_full_budget
@@ -49,8 +49,8 @@ def test_interval_increases_as_budget_is_consumed() -> None:
 def test_interval_when_budget_exhausted_returns_max_sleep() -> None:
     """When the full budget is consumed (used >= threshold) remaining_budget clamps to 1."""
     client = _mock_client(used=_BACKFILL_HOURLY_BUDGET)
-    result = _backfill_call_interval(client)
-    # remaining_budget = max(1, 149-149) = 1 → secs_left / 1 is large → capped at max.
+    result = _backfill_call_interval(client, "issue/")
+    # remaining_budget = max(1, budget - budget) = 1 → secs_left / 1 is large → capped at max.
     assert result == _BACKFILL_MAX_SLEEP
 
 
@@ -85,7 +85,7 @@ async def test_publisher_backfill_pauses_when_budget_exceeded() -> None:
     db.conn.execute.return_value.fetchall.return_value = [(1,), (2,), (3,)]
 
     client = MagicMock()
-    client.total_hourly_calls.return_value = _BACKFILL_HOURLY_BUDGET + 1
+    client.hourly_calls.return_value = _BACKFILL_HOURLY_BUDGET + 1
     client.get_publisher = AsyncMock(return_value={"results": {"id": 1, "name": "DC"}})
 
     with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
@@ -104,7 +104,7 @@ async def test_publisher_backfill_calls_upstream_within_budget() -> None:
     db.conn.execute.return_value.fetchall.return_value = [(42,)]
 
     client = MagicMock()
-    client.total_hourly_calls.return_value = 0
+    client.hourly_calls.return_value = 0
     client.get_publisher = AsyncMock(return_value={"results": {"id": 42, "name": "Marvel"}})
 
     sleep_mock = AsyncMock()
@@ -140,7 +140,7 @@ def _detail_client(responses: dict) -> MagicMock:
     from unittest.mock import AsyncMock
 
     client = MagicMock()
-    client.total_hourly_calls.return_value = 0
+    client.hourly_calls.return_value = 0
     client.get_issue = AsyncMock(side_effect=lambda iid: responses[iid])
     return client
 
@@ -191,7 +191,7 @@ async def test_issue_detail_backfill_pauses_when_budget_exceeded(tmp_db: Databas
 
     tmp_db.upsert_issue(_thin_issue(8201))
     client = _detail_client({})
-    client.total_hourly_calls.return_value = _BACKFILL_HOURLY_BUDGET + 1
+    client.hourly_calls.return_value = _BACKFILL_HOURLY_BUDGET + 1
 
     with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
         await _backfill_issue_details(client, tmp_db)
@@ -259,3 +259,21 @@ def test_backup_job_registered() -> None:
     settings = Settings(cv_api_key="testkey", sync_enabled=True)
     scheduler = create_scheduler(settings, MagicMock(), MagicMock(), MagicMock())
     assert "database_backup" in {job.id for job in scheduler.get_jobs()}
+
+
+async def test_issue_detail_backfill_ignores_other_endpoints_usage(tmp_db: Database) -> None:
+    """Busy /search/ or /volume/ budgets must not stop the /issue/ backfill."""
+    from unittest.mock import AsyncMock, patch
+
+    from cvproxy.scheduler import _backfill_issue_details
+
+    tmp_db.upsert_issue(_thin_issue(8301))
+    client = _detail_client({8301: _detail_payload(8301)})
+    client.hourly_calls.side_effect = lambda endpoint: 0 if endpoint.startswith("issue") else 999
+    client.total_hourly_calls.return_value = 999
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        await _backfill_issue_details(client, tmp_db)
+
+    client.get_issue.assert_called_once_with(8301)
+    client.hourly_calls.assert_any_call("issue/")

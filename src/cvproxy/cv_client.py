@@ -195,15 +195,15 @@ class CVClient:
                 waits.append(active[len(active) - self._hourly_limit] + 3600.0 - now)
         return max(0.0, *waits)
 
-    def seconds_until_total_below(self, threshold: int) -> float:
-        """Seconds until the all-endpoint hourly call count drops below *threshold*."""
-        now = time.time()
-        active = sorted(
-            ts for window in self._hourly_windows.values() for ts in window if ts > now - 3600.0
-        )
-        if len(active) < threshold:
-            return 0.0
-        return max(0.0, active[len(active) - threshold] + 3600.0 - now)
+    def hourly_calls(self, endpoint: str) -> int:
+        """Upstream calls made to *endpoint*'s path in the sliding 1-hour window.
+
+        ComicVine budgets each resource path separately, so pacing decisions
+        should look at this count rather than the all-endpoint total.
+        """
+        cutoff = time.time() - 3600.0
+        window = self._hourly_windows.get(self._endpoint_key(endpoint), ())
+        return sum(1 for ts in window if ts > cutoff)
 
     # -- public API ----------------------------------------------------------
 
@@ -331,8 +331,8 @@ class CVClient:
     def total_hourly_calls(self) -> int:
         """Return the total upstream API calls made in the sliding 1-hour window.
 
-        Sums all per-endpoint windows so the scheduler and route handlers can
-        cheaply check against a single global threshold without locking.
+        Sums all per-endpoint windows.  Shown on the dashboard only: budgets are
+        enforced per endpoint (see :meth:`hourly_calls` and :meth:`retry_after`).
         """
         now = time.time()
         cutoff = now - 3600.0
