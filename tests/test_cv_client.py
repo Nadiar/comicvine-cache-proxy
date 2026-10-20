@@ -193,3 +193,100 @@ def test_next_clock_hour_utc_is_always_in_future() -> None:
     assert dt > datetime.now(timezone.utc)
     assert dt.minute == 0
     assert dt.second == 0
+
+
+# ---------------------------------------------------------------------------
+# HTTP 420, cooldown, retry_after
+# ---------------------------------------------------------------------------
+
+
+def _status_error(status_code: int, headers: dict[str, str] | None = None) -> httpx.HTTPStatusError:
+    resp = httpx.Response(status_code, headers=headers or {})
+    resp.request = httpx.Request("GET", "https://comicvine.gamespot.com/api/issues/")
+    return httpx.HTTPStatusError(str(status_code), request=resp.request, response=resp)
+
+
+async def test_get_returns_rate_limited_on_http_420() -> None:
+    """ComicVine signals rate limiting with HTTP 420, not only 429."""
+    client = CVClient(api_key="test")
+    with patch.object(client._client, "get", new=AsyncMock(side_effect=_status_error(420))):
+        result = await client.get("issues/")
+
+    assert result is RATE_LIMITED
+    await client.close()
+
+
+async def test_rate_limit_starts_cooldown_without_further_upstream_calls() -> None:
+    """After a 420 the client refuses upstream calls until the cooldown ends."""
+    client = CVClient(api_key="test", rate_limit_per_minute=6000, rate_limit_cooldown_seconds=300)
+    upstream = AsyncMock(side_effect=_status_error(420))
+    with patch.object(client._client, "get", new=upstream):
+        await client.get("issues/")
+        second = await client.get("issue/4000-1/")
+
+    assert second is RATE_LIMITED
+    assert upstream.call_count == 1
+    assert 290 < client.retry_after("issue/4000-1/") <= 300
+    await client.close()
+
+
+async def test_rate_limit_cooldown_honours_upstream_retry_after_header() -> None:
+    client = CVClient(api_key="test", rate_limit_cooldown_seconds=300)
+    error = _status_error(420, headers={"Retry-After": "1200"})
+    with patch.object(client._client, "get", new=AsyncMock(side_effect=error)):
+        await client.get("issues/")
+
+    assert 1190 < client.retry_after("issues/") <= 1200
+    await client.close()
+
+
+async def test_retry_after_is_zero_when_budget_available() -> None:
+    client = CVClient(api_key="test")
+    assert client.retry_after("issues/") == 0
+    await client.close()
+
+
+async def test_retry_after_when_endpoint_hourly_window_full() -> None:
+    """A full per-endpoint window reports when its oldest slot frees up."""
+    from collections import deque
+
+    client = CVClient(api_key="test", rate_limit_per_hour_per_endpoint=2)
+    now = time.time()
+    client._hourly_windows["issues"] = deque([now - 3000, now - 10])
+
+    assert 590 < client.retry_after("issues/") <= 600
+    assert client.retry_after("volumes/") == 0
+    await client.close()
+
+
+async def test_seconds_until_total_below_threshold() -> None:
+    from collections import deque
+
+    client = CVClient(api_key="test")
+    now = time.time()
+    client._hourly_windows["issues"] = deque([now - 3500, now - 100])
+    client._hourly_windows["issue"] = deque([now - 3000])
+
+    # 3 calls, threshold 3: the oldest (100 s left) must age out first.
+    assert 90 < client.seconds_until_total_below(3) <= 100
+    assert client.seconds_until_total_below(4) == 0
+    await client.close()
+
+
+async def test_cooldown_rechecked_after_pacing_wait() -> None:
+    """Requests queued behind the pacer must not go out once a 420 has landed."""
+    client = CVClient(api_key="test", rate_limit_cooldown_seconds=300)
+    upstream = AsyncMock()
+
+    async def _420_arrives_while_waiting() -> None:
+        client._start_cooldown()
+
+    with (
+        patch.object(client, "_wait_for_rate_limit", new=_420_arrives_while_waiting),
+        patch.object(client._client, "get", new=upstream),
+    ):
+        result = await client.get("issues/")
+
+    assert result is RATE_LIMITED
+    upstream.assert_not_called()
+    await client.close()

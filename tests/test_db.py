@@ -882,3 +882,71 @@ def test_cache_find_superset_search_skips_exact_match(tmp_db: Database) -> None:
     )
     result = tmp_db.cache_find_superset_search("absolute batman", "volume")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Volume issue-list completeness, insert-only-new, negative cache
+# ---------------------------------------------------------------------------
+
+
+def test_volume_issues_complete_when_local_count_matches(tmp_db: Database) -> None:
+    tmp_db.upsert_volume({"id": 157161, "name": "100 Bullets", "count_of_issues": 1})
+    tmp_db.upsert_issue({"id": 900001, "volume": {"id": 157161}, "issue_number": "1"})
+
+    assert tmp_db.volume_issues_complete(157161, sync_ttl_hours=24) is True
+
+
+def test_volume_issues_incomplete_when_rows_missing(tmp_db: Database) -> None:
+    # Fixture volume 160294 has count_of_issues=17 but only 2 local issues
+    assert tmp_db.volume_issues_complete(160294, sync_ttl_hours=24) is False
+
+
+def test_volume_issues_incomplete_for_unknown_volume(tmp_db: Database) -> None:
+    assert tmp_db.volume_issues_complete(424242, sync_ttl_hours=24) is False
+
+
+def test_volume_issues_complete_after_recent_sync(tmp_db: Database) -> None:
+    tmp_db.mark_volume_issues_synced(160294)
+    assert tmp_db.volume_issues_complete(160294, sync_ttl_hours=24) is True
+
+
+def test_volume_issues_sync_expires(tmp_db: Database) -> None:
+    tmp_db.conn.execute(
+        "INSERT INTO cv_volume_issue_sync (volume_id, synced_at) "
+        "VALUES (160294, datetime('now', '-25 hours'))"
+    )
+    assert tmp_db.volume_issues_complete(160294, sync_ttl_hours=24) is False
+
+
+def test_insert_new_issues_does_not_overwrite_detailed_rows(tmp_db: Database) -> None:
+    """List-shaped rows must not clobber issues that already have full details."""
+    inserted = tmp_db.insert_new_issues([
+        {"id": 1073108, "volume": {"id": 160294}, "issue_number": "1", "name": "thin"},
+        {"id": 1073200, "volume": {"id": 160294}, "issue_number": "5", "name": "new"},
+    ])
+
+    assert inserted == 1
+    assert tmp_db.get_issue(1073108)["description"] == "First issue"
+    assert tmp_db.get_issue(1073200)["name"] == "new"
+
+
+def test_negative_cache_round_trip(tmp_db: Database) -> None:
+    assert tmp_db.negative_cache_hit("issues", "k1", ttl_hours=24) is False
+    tmp_db.negative_cache_put("issues", "k1")
+    assert tmp_db.negative_cache_hit("issues", "k1", ttl_hours=24) is True
+    assert tmp_db.negative_cache_hit("issues", "k2", ttl_hours=24) is False
+
+
+def test_negative_cache_expires(tmp_db: Database) -> None:
+    tmp_db.negative_cache_put("issues", "k1")
+    tmp_db.conn.execute(
+        "UPDATE cv_response_cache SET cached_at = datetime('now', '-25 hours')"
+        " WHERE resource_type = 'negative:issues'"
+    )
+    assert tmp_db.negative_cache_hit("issues", "k1", ttl_hours=24) is False
+
+
+def test_volume_with_zero_issue_count_is_not_complete(tmp_db: Database) -> None:
+    """count_of_issues=0 may just be stale; don't answer authoritatively from it."""
+    tmp_db.upsert_volume({"id": 424243, "name": "Brand New", "count_of_issues": 0})
+    assert tmp_db.volume_issues_complete(424243, sync_ttl_hours=24) is False

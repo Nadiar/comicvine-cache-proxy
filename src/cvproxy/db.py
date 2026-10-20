@@ -174,6 +174,12 @@ CREATE TABLE IF NOT EXISTS cv_issue (
     last_accessed TEXT
 );
 
+-- When a volume's full issue list was last fetched from upstream
+CREATE TABLE IF NOT EXISTS cv_volume_issue_sync (
+    volume_id INTEGER PRIMARY KEY,
+    synced_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS cv_response_cache (
     resource_type TEXT NOT NULL,
     resource_id   INTEGER,
@@ -995,6 +1001,60 @@ class Database:
         )
         return [_row_to_issue(r) for r in cur.fetchall()], total
 
+    def volume_issues_complete(self, volume_id: int, *, sync_ttl_hours: float) -> bool:
+        """True when the local issue list for *volume_id* can be trusted as complete.
+
+        Either the full list was fetched within *sync_ttl_hours*, or the volume
+        is known and holds at least ``count_of_issues`` (> 0) local issue rows.
+        A zero count is not trusted: it may predate the volume's first issue.
+        """
+        synced = self.conn.execute(
+            "SELECT 1 FROM cv_volume_issue_sync"
+            " WHERE volume_id = ? AND synced_at > datetime('now', ?)",
+            [volume_id, f"-{sync_ttl_hours} hours"],
+        ).fetchone()
+        if synced:
+            return True
+        row = self.conn.execute(
+            "SELECT count_of_issues, "
+            "(SELECT COUNT(*) FROM cv_issue WHERE volume_id = v.id) AS local_count "
+            "FROM cv_volume v WHERE id = ?",
+            [volume_id],
+        ).fetchone()
+        return bool(
+            row and row["count_of_issues"]
+            and row["local_count"] >= row["count_of_issues"]
+        )
+
+    def mark_volume_issues_synced(self, volume_id: int) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cv_volume_issue_sync (volume_id, synced_at) "
+            "VALUES (?, datetime('now'))",
+            [volume_id],
+        )
+        self.conn.commit()
+
+    def insert_new_issues(self, issues: list[dict[str, Any]]) -> int:
+        """Insert issues whose IDs aren't stored yet; returns the number inserted.
+
+        List endpoints return fewer fields than issue detail, so existing rows
+        are left alone rather than overwritten with thinner data.
+        """
+        ids = [i["id"] for i in issues if i.get("id")]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        existing = {
+            row[0] for row in self.conn.execute(
+                f"SELECT id FROM cv_issue WHERE id IN ({placeholders})", ids
+            )
+        }
+        new = [i for i in issues if i.get("id") and i["id"] not in existing]
+        for issue in new:
+            self.upsert_issue(issue, commit=False)
+        self.conn.commit()
+        return len(new)
+
     # -- publishers ----------------------------------------------------------
 
     def search_publishers_by_name(
@@ -1097,6 +1157,19 @@ class Database:
             [resource_type, params_hash, json.dumps(results)],
         )
         self.conn.commit()
+
+    def negative_cache_hit(self, resource_type: str, key: str, *, ttl_hours: float) -> bool:
+        """True when upstream answered *key* with no results within *ttl_hours*."""
+        row = self.conn.execute(
+            "SELECT 1 FROM cv_response_cache WHERE resource_type = ? AND params_hash = ?"
+            " AND cached_at > datetime('now', ?)",
+            [f"negative:{resource_type}", key, f"-{ttl_hours} hours"],
+        ).fetchone()
+        return row is not None
+
+    def negative_cache_put(self, resource_type: str, key: str) -> None:
+        """Remember that upstream returned no results for *key*."""
+        self.cache_put_list(f"negative:{resource_type}", key, [])
 
     def get_search_cache_missing_volume_ids(self, limit: int = 200) -> list[int]:
         """Return volume IDs referenced in search caches that are absent from cv_volume.

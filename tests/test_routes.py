@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -51,6 +52,15 @@ def _seed_db(db: Database) -> None:
     db.upsert_issue(_issue(1073112, 160294, "Issue 3", "3", None, "2025-02-04", "Third issue no cover date"))
 
 
+def _mock_cv_client() -> AsyncMock:
+    """AsyncMock CVClient whose synchronous budget methods report spare capacity."""
+    mock_client = AsyncMock()
+    mock_client.total_hourly_calls = MagicMock(return_value=0)
+    mock_client.retry_after = MagicMock(return_value=0.0)
+    mock_client.seconds_until_total_below = MagicMock(return_value=0.0)
+    return mock_client
+
+
 def _create_test_db(db_path: Path) -> None:
     db = Database(db_path)
     db.connect()
@@ -75,6 +85,10 @@ def app_client(tmp_path: Path) -> Generator[TestClient]:
 
     app = create_app()
     with TestClient(app) as client:
+        # Never reach the real ComicVine: every upstream request fails with 503.
+        client.app.state.cv_client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(503))
+        )
         yield client
 
 
@@ -255,9 +269,8 @@ def _search_page(results: list[dict], total: int) -> dict:
 
 def _mock_search_client(pages: dict[int, dict]) -> MagicMock:
     """CV client whose search() returns pages keyed by 1-based page number."""
-    from unittest.mock import AsyncMock
 
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.total_hourly_calls = MagicMock(return_value=0)
 
     async def fake_search(
@@ -547,28 +560,28 @@ def test_dashboard_data_records_after_search(app_client: TestClient) -> None:
 
 
 def test_upstream_rate_limit_response_propagated_to_client(app_client: TestClient) -> None:
-    """When CVClient.get_issue() returns RATE_LIMITED the route must return status 107."""
-    from unittest.mock import AsyncMock
-
+    """When CVClient.get_issue() returns RATE_LIMITED the route must answer HTTP 420 / 107."""
     from cvproxy.cv_client import RATE_LIMITED
 
     cv_client = app_client.app.state.cv_client
     with patch.object(cv_client, "get_issue", new=AsyncMock(return_value=RATE_LIMITED)):
         resp = app_client.get("/api/issue/4000-999999/")
 
-    assert resp.status_code == 200
+    assert resp.status_code == 420
+    assert int(resp.headers["Retry-After"]) >= 1
     data = resp.json()
     assert data["status_code"] == 107
     assert data["error"] == "Rate Limit Exceeded"
 
 
 def test_route_returns_rate_limit_error_when_above_190_threshold(app_client: TestClient) -> None:
-    """When total_hourly_calls() >= 190 the route must refuse upstream and return 107."""
+    """When total_hourly_calls() >= 190 the route must refuse upstream with 420 / 107."""
     cv_client = app_client.app.state.cv_client
     with patch.object(cv_client, "total_hourly_calls", return_value=190):
         resp = app_client.get("/api/issue/4000-999999/")
 
-    assert resp.status_code == 200
+    assert resp.status_code == 420
+    assert int(resp.headers["Retry-After"]) >= 1
     data = resp.json()
     assert data["status_code"] == 107
     assert data["error"] == "Rate Limit Exceeded"
@@ -693,9 +706,8 @@ def test_list_volumes_cache_control_flow(app_client: TestClient) -> None:
     assert resp.json()["number_of_page_results"] == 0
 
     # step 3: no-cache should fetch from upstream and upsert it
-    from unittest.mock import AsyncMock
 
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.total_hourly_calls = MagicMock(return_value=0)
     mock_client.get.return_value = {
         "status_code": 1,
@@ -744,9 +756,8 @@ def test_generic_single_cache_control_flow(app_client: TestClient) -> None:
     assert resp.json()["status_code"] == 101
 
     # step 3: no-cache should fetch upstream and cache
-    from unittest.mock import AsyncMock
 
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.total_hourly_calls = MagicMock(return_value=0)
     mock_client.get.return_value = {
         "status_code": 1,
@@ -806,7 +817,6 @@ def test_list_issues_single_volume_still_works(app_client: TestClient) -> None:
 
 def test_get_volume_upstream_hit_upserts_to_db(app_client: TestClient) -> None:
     """Volume fetched from upstream should be stored in DB for future cache hits."""
-    from unittest.mock import AsyncMock
 
     upstream_response = {
         "status_code": 1,
@@ -829,7 +839,7 @@ def test_get_volume_upstream_hit_upserts_to_db(app_client: TestClient) -> None:
         },
     }
 
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.total_hourly_calls = MagicMock(return_value=0)
     mock_client.get_volume.return_value = upstream_response
     app_client.app.state.cv_client = mock_client
@@ -848,7 +858,6 @@ def test_get_volume_upstream_hit_upserts_to_db(app_client: TestClient) -> None:
 
 def test_get_issue_upstream_hit_upserts_to_db(app_client: TestClient) -> None:
     """Issue fetched from upstream should be stored in DB for future cache hits."""
-    from unittest.mock import AsyncMock
 
     upstream_response = {
         "status_code": 1,
@@ -876,7 +885,7 @@ def test_get_issue_upstream_hit_upserts_to_db(app_client: TestClient) -> None:
         },
     }
 
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.total_hourly_calls = MagicMock(return_value=0)
     mock_client.get_issue.return_value = upstream_response
     app_client.app.state.cv_client = mock_client
@@ -894,7 +903,6 @@ def test_get_issue_upstream_hit_upserts_to_db(app_client: TestClient) -> None:
 
 def test_get_publisher_upstream_hit_upserts_to_db(app_client: TestClient) -> None:
     """Publisher fetched from upstream should be stored in DB for future cache hits."""
-    from unittest.mock import AsyncMock
 
     upstream_response = {
         "status_code": 1,
@@ -910,7 +918,7 @@ def test_get_publisher_upstream_hit_upserts_to_db(app_client: TestClient) -> Non
         },
     }
 
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.total_hourly_calls = MagicMock(return_value=0)
     mock_client.get_publisher.return_value = upstream_response
     app_client.app.state.cv_client = mock_client
@@ -962,9 +970,8 @@ def test_list_issues_field_list_filters_each_result(app_client: TestClient) -> N
 
 def test_get_volume_field_list_applied_on_upstream_miss(app_client: TestClient) -> None:
     """field_list should be applied even when data comes from upstream (not in DB)."""
-    from unittest.mock import AsyncMock
 
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.total_hourly_calls = MagicMock(return_value=0)
     mock_client.get_volume.return_value = {
         "status_code": 1,
@@ -994,9 +1001,8 @@ def test_get_volume_field_list_applied_on_upstream_miss(app_client: TestClient) 
 
 def test_get_issue_field_list_applied_on_upstream_miss(app_client: TestClient) -> None:
     """field_list should be applied even when issue comes from upstream (not in DB)."""
-    from unittest.mock import AsyncMock
 
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.total_hourly_calls = MagicMock(return_value=0)
     mock_client.get_issue.return_value = {
         "status_code": 1,
@@ -1026,9 +1032,8 @@ def test_get_issue_field_list_applied_on_upstream_miss(app_client: TestClient) -
 
 def test_get_publisher_field_list_applied_on_upstream_miss(app_client: TestClient) -> None:
     """field_list should be applied even when publisher comes from upstream (not in DB)."""
-    from unittest.mock import AsyncMock
 
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.total_hourly_calls = MagicMock(return_value=0)
     mock_client.get_publisher.return_value = {
         "status_code": 1,
@@ -1307,8 +1312,7 @@ def test_generic_single_serves_from_cache(app_client: TestClient) -> None:
 
 def test_generic_single_fetches_and_caches_on_miss(app_client: TestClient) -> None:
     """Fetch from upstream and cache on cache miss."""
-    from unittest.mock import AsyncMock
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.get.return_value = {
         "status_code": 1, "error": "OK",
         "results": {"id": 9001, "name": "The Flash"},
@@ -1325,8 +1329,7 @@ def test_generic_single_fetches_and_caches_on_miss(app_client: TestClient) -> No
 
 def test_generic_single_returns_cv_error_when_not_found(app_client: TestClient) -> None:
     """Return CV error envelope when upstream returns None."""
-    from unittest.mock import AsyncMock
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.get.return_value = None
     app_client.app.state.cv_client = mock_client
 
@@ -1351,9 +1354,8 @@ def test_generic_single_field_list_filters_cached_result(app_client: TestClient)
 def test_generic_list_fetches_and_caches_on_miss(app_client: TestClient) -> None:
     """Test generic_list fetches from upstream on cache miss and stores results."""
 
-    from unittest.mock import AsyncMock
     from cvproxy.routes.api import _params_hash
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.get.return_value = {
         "status_code": 1, "error": "OK",
         "number_of_total_results": 2, "number_of_page_results": 2,
@@ -1392,7 +1394,6 @@ def test_generic_list_serves_subset_from_cache(app_client: TestClient) -> None:
 
 def test_generic_list_same_filter_different_limit_hits_cache(app_client: TestClient) -> None:
     """Second request with smaller limit should NOT call upstream."""
-    from unittest.mock import AsyncMock
     from cvproxy.routes.api import _params_hash
     db: Database = app_client.app.state.db
     items = [{"id": i} for i in range(10)]
@@ -1404,7 +1405,7 @@ def test_generic_list_same_filter_different_limit_hits_cache(app_client: TestCli
         nonlocal call_count
         call_count += 1
         return None
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.get = mock_get
     app_client.app.state.cv_client = mock_client
 
@@ -1482,8 +1483,7 @@ def test_get_volume_with_invalid_id_returns_cv_error(app_client: TestClient) -> 
 
 def test_generic_single_no_field_list_forwarded_to_upstream(app_client: TestClient) -> None:
     """field_list should NOT be forwarded to upstream so cache has full fields."""
-    from unittest.mock import AsyncMock
-    mock_client = AsyncMock()
+    mock_client = _mock_cv_client()
     mock_client.get.return_value = {
         "status_code": 1, "error": "OK",
         "results": {"id": 44444, "name": "Superman", "aliases": "Man of Steel"},
@@ -1824,3 +1824,220 @@ def test_admin_evict_dry_run_does_not_delete(
             "SELECT id FROM cv_issue WHERE id = 8888001"
         ).fetchone()
         assert row is not None
+
+
+# ---------------------------------------------------------------------------
+# Issue filters: authoritative local answers, volume refresh, negative cache
+# ---------------------------------------------------------------------------
+
+
+def _issues_page(results: list[dict], total: int) -> dict:
+    return {
+        "status_code": 1, "error": "OK",
+        "number_of_total_results": total, "number_of_page_results": len(results),
+        "limit": 100, "offset": 0, "results": results,
+    }
+
+
+def _seed_one_issue_volume(db: Database) -> None:
+    db.upsert_volume({"id": 157161, "name": "100 Bullets", "count_of_issues": 1})
+    db.upsert_issue({"id": 900001, "volume": {"id": 157161}, "issue_number": "1", "name": "One"})
+
+
+def test_issue_filter_complete_volume_answers_empty_without_upstream(
+    app_client: TestClient,
+) -> None:
+    _seed_one_issue_volume(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    app_client.app.state.cv_client = mock_client
+
+    for _ in range(2):
+        resp = app_client.get(
+            "/api/issues/", params={"filter": "volume:157161,issue_number:36"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status_code"] == 1
+        assert data["error"] == "OK"
+        assert data["number_of_total_results"] == 0
+        assert data["results"] == []
+
+    mock_client.get.assert_not_called()
+
+
+def test_issue_filter_complete_volume_matches_normalized_number(app_client: TestClient) -> None:
+    _seed_one_issue_volume(app_client.app.state.db)
+    mock_client = _mock_cv_client()
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get("/api/issues/", params={"filter": "volume:157161,issue_number:001"})
+
+    assert [r["id"] for r in resp.json()["results"]] == [900001]
+    mock_client.get.assert_not_called()
+
+
+def test_issue_filter_incomplete_volume_refreshes_whole_volume_once(
+    app_client: TestClient,
+) -> None:
+    """Volume 160294 has count_of_issues=17 but only 3 local rows."""
+    upstream_issues = [
+        {"id": 1073108 if n == 1 else 2000000 + n, "volume": {"id": 160294},
+         "issue_number": str(n), "name": f"thin {n}"}
+        for n in range(1, 18)
+    ]
+    mock_client = _mock_cv_client()
+    mock_client.get = AsyncMock(return_value=_issues_page(upstream_issues, 17))
+    app_client.app.state.cv_client = mock_client
+
+    first = app_client.get("/api/issues/", params={"filter": "volume:160294,issue_number:36"})
+    second = app_client.get("/api/issues/", params={"filter": "volume:160294,issue_number:12"})
+
+    assert first.status_code == 200
+    assert first.json()["results"] == []
+    assert [r["id"] for r in second.json()["results"]] == [2000012]
+    assert mock_client.get.call_count == 1
+    endpoint, params = mock_client.get.call_args.args
+    assert endpoint == "issues/"
+    assert params["filter"] == "volume:160294"
+    # The detailed row was not clobbered by the thin list row
+    assert app_client.app.state.db.get_issue(1073108)["description"] == "First issue"
+
+
+def test_issue_filter_refresh_rate_limited_returns_420(app_client: TestClient) -> None:
+    from cvproxy.cv_client import RATE_LIMITED
+
+    mock_client = _mock_cv_client()
+    mock_client.get = AsyncMock(return_value=RATE_LIMITED)
+    # Budget looks free before the call; upstream then refuses and a cooldown starts.
+    mock_client.retry_after = MagicMock(side_effect=[0.0, 120.0])
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get("/api/issues/", params={"filter": "volume:160294,issue_number:36"})
+
+    assert resp.status_code == 420
+    assert resp.headers["Retry-After"] == "120"
+    data = resp.json()
+    assert data["status_code"] == 107
+    assert data["error"] == "Rate Limit Exceeded"
+    assert data["results"] == []
+    assert mock_client.get.call_count == 1
+
+
+def test_issue_filter_forwarded_empty_result_is_negative_cached(app_client: TestClient) -> None:
+    """Filters that can't be answered locally are forwarded once, then served empty."""
+    mock_client = _mock_cv_client()
+    mock_client.get = AsyncMock(return_value=_issues_page([], 0))
+    app_client.app.state.cv_client = mock_client
+
+    for f in ["volume:777|778,issue_number:5", "volume:777|778,issue_number:005"]:
+        resp = app_client.get("/api/issues/", params={"filter": f})
+        assert resp.status_code == 200
+        assert resp.json()["results"] == []
+
+    assert mock_client.get.call_count == 1
+
+
+def test_issue_filter_rate_limit_is_not_negative_cached(app_client: TestClient) -> None:
+    from cvproxy.cv_client import RATE_LIMITED
+
+    mock_client = _mock_cv_client()
+    mock_client.get = AsyncMock(side_effect=[RATE_LIMITED, _issues_page([], 0)])
+    app_client.app.state.cv_client = mock_client
+
+    first = app_client.get("/api/issues/", params={"filter": "volume:777|778,issue_number:5"})
+    second = app_client.get("/api/issues/", params={"filter": "volume:777|778,issue_number:5"})
+
+    assert first.status_code == 420
+    assert second.status_code == 200
+    assert mock_client.get.call_count == 2
+
+
+def test_issue_filter_large_volume_forwards_single_filter(app_client: TestClient) -> None:
+    """Volumes too large to refresh cheaply forward the exact filter instead."""
+    app_client.app.state.db.upsert_volume({"id": 555, "name": "Huge", "count_of_issues": 5000})
+    mock_client = _mock_cv_client()
+    mock_client.get = AsyncMock(return_value=_issues_page([], 0))
+    app_client.app.state.cv_client = mock_client
+
+    app_client.get("/api/issues/", params={"filter": "volume:555,issue_number:9999"})
+
+    assert mock_client.get.call_count == 1
+    assert mock_client.get.call_args.args[1]["filter"] == "volume:555,issue_number:9999"
+
+
+def test_rate_limited_route_returns_420_without_calling_upstream(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=30.0)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get("/api/issue/4000-999999/")
+
+    assert resp.status_code == 420
+    assert resp.headers["Retry-After"] == "30"
+    assert resp.json()["status_code"] == 107
+    mock_client.get_issue.assert_not_called()
+
+
+def test_local_issue_hits_still_served_while_rate_limited(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=600.0)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get("/api/issues/", params={"filter": "volume:160294,issue_number:1"})
+
+    assert resp.status_code == 200
+    assert [r["id"] for r in resp.json()["results"]] == [1073108]
+
+
+def test_rate_limited_search_returns_420(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=45.0)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get("/api/search/", params={"query": "Nothing Cached Here"})
+
+    assert resp.status_code == 420
+    assert resp.headers["Retry-After"] == "45"
+    mock_client.search.assert_not_called()
+
+
+def test_rate_limited_xml_request_keeps_420(app_client: TestClient) -> None:
+    mock_client = _mock_cv_client()
+    mock_client.retry_after = MagicMock(return_value=30.0)
+    app_client.app.state.cv_client = mock_client
+
+    resp = app_client.get("/api/issue/4000-999999/", params={"format": "xml"})
+
+    assert resp.status_code == 420
+    assert resp.headers["Retry-After"] == "30"
+    assert "<status_code>107</status_code>" in resp.text
+
+
+def test_store_date_empty_answer_is_not_negative_cached(app_client: TestClient) -> None:
+    """Release windows fill in over time, so an empty answer must not stick."""
+    mock_client = _mock_cv_client()
+    mock_client.get = AsyncMock(return_value=_issues_page([], 0))
+    app_client.app.state.cv_client = mock_client
+
+    for _ in range(2):
+        app_client.get("/api/issues/", params={"filter": "store_date:2030-01-01|2030-01-07"})
+
+    assert mock_client.get.call_count == 2
+
+
+def test_volume_only_filter_refreshes_partial_volume(app_client: TestClient) -> None:
+    """volume:X alone must not be answered from a partial local issue list."""
+    local_ids = {1: 1073108, 2: 1073109, 3: 1073112}
+    upstream_issues = [
+        {"id": local_ids.get(n, 3000000 + n), "volume": {"id": 160294}, "issue_number": str(n)}
+        for n in range(1, 18)
+    ]
+    mock_client = _mock_cv_client()
+    mock_client.get = AsyncMock(return_value=_issues_page(upstream_issues, 17))
+    app_client.app.state.cv_client = mock_client
+
+    for _ in range(2):
+        resp = app_client.get("/api/issues/", params={"filter": "volume:160294"})
+        assert resp.json()["number_of_total_results"] == 17
+
+    assert mock_client.get.call_count == 1

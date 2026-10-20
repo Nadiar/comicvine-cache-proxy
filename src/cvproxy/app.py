@@ -201,6 +201,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         base_url=settings.cv_api_base_url,
         rate_limit_per_minute=settings.rate_limit_per_minute,
         rate_limit_per_hour_per_endpoint=settings.rate_limit_per_hour_per_endpoint,
+        rate_limit_cooldown_seconds=settings.rate_limit_cooldown_seconds,
     )
     app.state.cv_client = client
 

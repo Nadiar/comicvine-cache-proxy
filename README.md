@@ -48,8 +48,9 @@ All settings via environment variables:
 | `IMAGE_CACHE_DIR` | `/data/images` | Disk image cache directory |
 | `IMAGE_CACHE_TTL_DAYS` | `14` | Image cache sliding TTL (days) |
 | `STATS_DB_PATH` | `/data/stats.db` | Request stats database path |
-| `RATE_LIMIT_PER_MINUTE` | `100` | Global upstream calls per minute |
+| `RATE_LIMIT_PER_MINUTE` | `60` | Global upstream calls per minute |
 | `RATE_LIMIT_PER_HOUR_PER_ENDPOINT` | `180` | Upstream calls per hour per CV endpoint path |
+| `RATE_LIMIT_COOLDOWN_SECONDS` | `600` | Pause on all upstream calls after CV answers 420/429/107 (an upstream `Retry-After` wins) |
 | `SYNC_ENABLED` | `true` | Enable background scheduler |
 | `SYNC_CRON_HOUR` | `3` | UTC hour for daily sync jobs |
 | `SEARCH_MAX_PAGES` | `5` | Max upstream pages fetched per search query (100 results/page). A cold search returns after the pages covering the request; the rest are fetched in the background. |

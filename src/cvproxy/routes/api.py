@@ -18,17 +18,22 @@ see exactly the same response shape they expect from comicvine.gamespot.com.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
+import math
 import re
 import time
-from typing import Any
+from collections.abc import Awaitable, Callable
+from functools import partial
+from typing import Any, Literal
 from urllib.parse import urlencode, parse_qs, urlparse
 
 from fastapi import APIRouter, BackgroundTasks, Query, Request, Response
+from fastapi.responses import JSONResponse
 
 from cvproxy.config import get_settings
-from cvproxy.cv_client import CVClient, RATE_LIMITED
+from cvproxy.cv_client import CVClient, NOT_FOUND, RATE_LIMITED
 from cvproxy.db import Database, is_past_cutoff
 from cvproxy.image_cache import ImageCache
 from cvproxy.stats import StatsTracker
@@ -47,7 +52,10 @@ async def _refresh_volumes_if_stale(
     Returns True if a refresh was performed, False otherwise.
     """
     try:
-        probe = await client.get("volumes/", {"filter": filter_str, "limit": 1, "offset": 0})
+        probe = await _guarded_get(
+            client, "volumes/",
+            partial(client.get, "volumes/", {"filter": filter_str, "limit": 1, "offset": 0}),
+        )
         if probe is RATE_LIMITED or not probe:
             return False
         upstream_total: int = probe.get("number_of_total_results", 0)
@@ -60,8 +68,12 @@ async def _refresh_volumes_if_stale(
         page_limit = 100
         fetched = 0
         while fetched < upstream_total:
-            page_data = await client.get(
-                "volumes/", {"filter": filter_str, "limit": page_limit, "offset": fetched}
+            page_data = await _guarded_get(
+                client, "volumes/",
+                partial(
+                    client.get, "volumes/",
+                    {"filter": filter_str, "limit": page_limit, "offset": fetched},
+                ),
             )
             if page_data is RATE_LIMITED or not page_data:
                 break
@@ -97,22 +109,38 @@ router = APIRouter(prefix="/api")
 _RATE_LIMIT_UPSTREAM_THRESHOLD = 190
 
 
-def _cv_rate_limit_error() -> dict[str, Any]:
-    """Return a CV-compatible rate limit error envelope (status_code 107)."""
-    return {
-        "status_code": 107,
-        "error": "Rate Limit Exceeded",
-        "number_of_total_results": 0,
-        "number_of_page_results": 0,
-        "limit": 0,
-        "offset": 0,
-        "results": [],
-    }
+def _cv_rate_limit_error(client: CVClient, endpoint: str) -> JSONResponse:
+    """CV rate limit envelope (status_code 107) sent as HTTP 420 with Retry-After.
+
+    ComicVine itself answers 420, so clients written for it detect rate
+    limiting by HTTP status rather than by parsing the body.
+    """
+    retry_after = max(1, math.ceil(_upstream_retry_after(client, endpoint)))
+    return JSONResponse(
+        status_code=420,
+        headers={"Retry-After": str(retry_after)},
+        content={
+            "status_code": 107,
+            "error": "Rate Limit Exceeded",
+            "number_of_total_results": 0,
+            "number_of_page_results": 0,
+            "limit": 0,
+            "offset": 0,
+            "results": [],
+        },
+    )
 
 
 def _is_rate_limit_busy(client: CVClient) -> bool:
     """True when the total hourly upstream call count is at or above the threshold."""
     return client.total_hourly_calls() >= _RATE_LIMIT_UPSTREAM_THRESHOLD
+
+
+def _upstream_retry_after(client: CVClient, endpoint: str) -> float:
+    """Seconds until a live request to *endpoint* may go upstream (0 = now)."""
+    if _is_rate_limit_busy(client):
+        return max(1.0, client.seconds_until_total_below(_RATE_LIMIT_UPSTREAM_THRESHOLD))
+    return client.retry_after(endpoint)
 
 
 # ---------------------------------------------------------------------------
@@ -301,16 +329,18 @@ def _touch_if_evicting(db: Database, table: str, entity_id: int) -> None:
         db.touch_last_accessed(table, entity_id)
 
 
-async def _guarded_get(client: CVClient, coro: Any) -> Any:
-    """Pre-flight busy-check before awaiting a CVClient coroutine.
+async def _guarded_get(
+    client: CVClient, endpoint: str, call: Callable[[], Awaitable[Any]]
+) -> Any:
+    """Pre-flight budget check before calling upstream.
 
-    Closes the coroutine without running it when the hourly threshold is
-    exceeded, returning RATE_LIMITED so callers have a single branch to handle.
+    Returns RATE_LIMITED without calling *call* while CV is cooling down, the
+    endpoint's hourly window is full, or the overall threshold is reached, so
+    live requests answer 420 instead of sleeping until quota frees up.
     """
-    if _is_rate_limit_busy(client):
-        coro.close()
+    if _upstream_retry_after(client, endpoint) > 0:
         return RATE_LIMITED
-    return await coro
+    return await call()
 
 
 _LEADING_ARTICLE_RE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
@@ -544,7 +574,8 @@ async def _fetch_search_pages(
     results: list[dict[str, Any]] = []
     for page_num in range(first_page, last_page + 1):
         page_data = await _guarded_get(
-            client, client.search(query, resources, limit=_SEARCH_PAGE_SIZE, page=page_num)
+            client, "search/",
+            partial(client.search, query, resources, limit=_SEARCH_PAGE_SIZE, page=page_num),
         )
         if page_data is RATE_LIMITED:
             return results, cv_total, True
@@ -614,7 +645,7 @@ async def _fill_search_cache(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/search/")
+@router.get("/search/", response_model=None)
 async def search(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -626,7 +657,7 @@ async def search(
     api_key: str = Query(default="", alias="api_key"),
     format: str = Query(default="json", alias="format"),
     field_list: str = Query(default="", alias="field_list"),
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """CV-compatible search endpoint.
 
     Cache strategy:
@@ -738,7 +769,7 @@ async def search(
         )
         if rate_limited and not all_results:
             _record(request, endpoint="search", source="miss", start=t0)
-            return _cv_rate_limit_error()
+            return _cv_rate_limit_error(client, "search/")
 
         if not all_results:
             _record(request, endpoint="search", source="miss", start=t0)
@@ -806,14 +837,14 @@ async def search(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/volume/{volume_id}/")
+@router.get("/volume/{volume_id}/", response_model=None)
 async def get_volume(
     request: Request,
     volume_id: str,
     api_key: str = Query(default="", alias="api_key"),
     format: str = Query(default="json", alias="format"),
     field_list: str = Query(default="", alias="field_list"),
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """Get volume detail by ID (accepts ``4050-123`` or ``123``)."""
     t0 = time.monotonic()
     vid = _parse_cv_id(volume_id)
@@ -838,10 +869,12 @@ async def get_volume(
         return _cv_error("Volume not in cache", status_code=101)
 
     client = _get_client(request)
-    data = await _guarded_get(client, client.get_volume(vid))
+    data = await _guarded_get(
+        client, "volume/", partial(client.get_volume, vid)
+    )
     if data is RATE_LIMITED:
         _record(request, endpoint="volume", source="miss", start=t0)
-        return _cv_rate_limit_error()
+        return _cv_rate_limit_error(client, "volume/")
     if data and data.get("results"):
         try:
             db.upsert_volume(data["results"])
@@ -856,7 +889,7 @@ async def get_volume(
     return _cv_error("Volume not found", status_code=101)
 
 
-@router.get("/volumes/")
+@router.get("/volumes/", response_model=None)
 async def list_volumes(
     request: Request,
     filter: str = Query(default="", alias="filter"),
@@ -867,7 +900,7 @@ async def list_volumes(
     format: str = Query(default="json", alias="format"),
     field_list: str = Query(default="", alias="field_list"),
     sort: str = Query(default="", alias="sort"),
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """CV-compatible volumes list with filter support."""
     t0 = time.monotonic()
     effective_offset = _effective_offset(offset, page, limit)
@@ -911,10 +944,12 @@ async def list_volumes(
     if sort:
         upstream_params["sort"] = sort
     client = _get_client(request)
-    data = await _guarded_get(client, client.get("volumes/", upstream_params))
+    data = await _guarded_get(
+        client, "volumes/", partial(client.get, "volumes/", upstream_params)
+    )
     if data is RATE_LIMITED:
         _record(request, endpoint="volumes", source="miss", start=t0)
-        return _cv_rate_limit_error()
+        return _cv_rate_limit_error(client, "volumes/")
     if data:
         if isinstance(data.get("results"), list):
             for vol in data["results"]:
@@ -936,14 +971,14 @@ async def list_volumes(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/issue/{issue_id}/")
+@router.get("/issue/{issue_id}/", response_model=None)
 async def get_issue(
     request: Request,
     issue_id: str,
     api_key: str = Query(default="", alias="api_key"),
     format: str = Query(default="json", alias="format"),
     field_list: str = Query(default="", alias="field_list"),
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """Get issue detail by ID (accepts ``4000-123`` or ``123``)."""
     t0 = time.monotonic()
     iid = _parse_cv_id(issue_id)
@@ -964,10 +999,12 @@ async def get_issue(
         return _cv_error("Issue not in cache", status_code=101)
 
     client = _get_client(request)
-    data = await _guarded_get(client, client.get_issue(iid))
+    data = await _guarded_get(
+        client, "issue/", partial(client.get_issue, iid)
+    )
     if data is RATE_LIMITED:
         _record(request, endpoint="issue", source="miss", start=t0)
-        return _cv_rate_limit_error()
+        return _cv_rate_limit_error(client, "issue/")
     if data and data.get("results"):
         try:
             db.upsert_issue(data["results"])
@@ -982,7 +1019,76 @@ async def get_issue(
     return _cv_error("Issue not found", status_code=101)
 
 
-@router.get("/issues/")
+#: How long a fetched volume issue list counts as complete.
+_VOLUME_SYNC_TTL_HOURS = 24.0
+#: How long an empty upstream answer to an issues filter is reused.
+_NEGATIVE_CACHE_TTL_HOURS = 24.0
+#: Larger volumes are not refreshed in full; the exact filter is forwarded instead.
+_VOLUME_REFRESH_MAX_ISSUES = 300
+_ISSUES_PAGE_SIZE = 100
+
+#: One refresh per volume at a time; concurrent requests wait and reuse its result.
+_volume_refresh_locks: dict[int, asyncio.Lock] = {}
+
+
+def _issue_filter_key(filters: dict[str, str]) -> str:
+    """Negative-cache key for an issues filter, with issue numbers normalised ('001' == '1')."""
+    canonical = ",".join(
+        f"{k}:{_normalize_issue_number(v) if k == 'issue_number' else v}"
+        for k, v in sorted(filters.items())
+    )
+    return _params_hash({"filter": canonical})
+
+
+def _local_volume_issues(
+    db: Database, volume_ids: list[int], issue_number: str | None
+) -> list[dict[str, Any]]:
+    """Local issues of *volume_ids*, optionally only those matching *issue_number*."""
+    issues = [i for vid in volume_ids for i in db.get_volume_issues(vid, limit=10_000)]
+    if issue_number is None:
+        return list(issues)
+    wanted = _normalize_issue_number(issue_number)
+    return [i for i in issues if _normalize_issue_number(i.get("issue_number")) == wanted]
+
+
+async def _refresh_volume_issues(
+    client: CVClient, db: Database, volume_id: int
+) -> Literal["complete", "skipped", "rate_limited"]:
+    """Fetch a volume's whole issue list so later lookups are answered locally.
+
+    Only issues not stored yet are inserted, so detailed rows keep their
+    fields.  The volume is marked synced only when every page arrived.
+    """
+    async with _volume_refresh_locks.setdefault(volume_id, asyncio.Lock()):
+        if db.volume_issues_complete(volume_id, sync_ttl_hours=_VOLUME_SYNC_TTL_HOURS):
+            return "complete"
+        volume = db.get_volume(volume_id)
+        if volume and (volume.get("count_of_issues") or 0) > _VOLUME_REFRESH_MAX_ISSUES:
+            return "skipped"
+        offset = 0
+        while True:
+            params = {"filter": f"volume:{volume_id}", "limit": _ISSUES_PAGE_SIZE, "offset": offset}
+            data = await _guarded_get(client, "issues/", partial(client.get, "issues/", params))
+            if data is RATE_LIMITED:
+                return "rate_limited"
+            if data is NOT_FOUND:
+                break
+            if not data:
+                return "skipped"
+            results: list[dict[str, Any]] = data.get("results") or []
+            total = data.get("number_of_total_results", 0)
+            db.insert_new_issues(results)
+            if total > _VOLUME_REFRESH_MAX_ISSUES:
+                return "skipped"
+            offset += len(results)
+            if not results or offset >= total:
+                break
+        db.mark_volume_issues_synced(volume_id)
+        logger.info("Volume %d issue list refreshed: %d issues", volume_id, offset)
+        return "complete"
+
+
+@router.get("/issues/", response_model=None)
 async def list_issues(
     request: Request,
     filter: str = Query(default="", alias="filter"),
@@ -993,7 +1099,7 @@ async def list_issues(
     format: str = Query(default="json", alias="format"),
     field_list: str = Query(default="", alias="field_list"),
     sort: str = Query(default="", alias="sort"),
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """CV-compatible issues list with filter support."""
     t0 = time.monotonic()
     effective_offset = _effective_offset(offset, page, limit)
@@ -1009,6 +1115,19 @@ async def list_issues(
     store_date_start = store_date_range[0] if store_date_range else None
     store_date_end = store_date_range[1] if store_date_range else None
 
+    # volume[:number] lookups are answered from the local issue list once it is
+    # complete — including "no such issue" — so they never reach upstream.
+    volume_lookup = bool(vol_ids) and set(filters) <= {"volume", "issue_number"}
+    results: list[Any] = []
+    total = 0
+
+    def _local_page(issues: list[Any], issues_total: int) -> dict[str, Any]:
+        if sort:
+            issues = _apply_sort(issues, sort)
+        shaped = [_apply_list_defaults(r, _ISSUE_LIST_FIELDS, field_list) for r in issues]
+        _record(request, endpoint="issues", source="cache", start=t0)
+        return _cv_envelope(shaped, total=issues_total, limit=limit, offset=effective_offset)
+
     if cache_mode != "no-cache":
         results, total = db.search_issues(
             volume_ids=vol_ids,
@@ -1018,13 +1137,49 @@ async def list_issues(
             limit=limit,
             offset=effective_offset,
         )
+        # A whole-volume listing may be partial; it is served below once complete.
+        if results and not (volume_lookup and issue_number is None):
+            return _local_page(results, total)
 
-        if results:
-            if sort:
-                results = _apply_sort(results, sort)
-            results = [_apply_list_defaults(r, _ISSUE_LIST_FIELDS, field_list) for r in results]
+    client = _get_client(request)
+    negative_key = _issue_filter_key(filters)
+
+    if cache_mode != "no-cache":
+        if volume_lookup and vol_ids:
+            incomplete = [
+                v for v in vol_ids
+                if not db.volume_issues_complete(v, sync_ttl_hours=_VOLUME_SYNC_TTL_HOURS)
+            ]
+            can_refresh = (
+                len(incomplete) == 1
+                and cache_mode != "only-if-cached"
+                # Issues older than the cutoff are never stored, so the list can't be complete
+                and not get_settings().cache_cutoff_year
+                and not db.negative_cache_hit(
+                    "issues", negative_key, ttl_hours=_NEGATIVE_CACHE_TTL_HOURS
+                )
+            )
+            if can_refresh:
+                outcome = await _refresh_volume_issues(client, db, incomplete[0])
+                if outcome == "rate_limited" and not results:
+                    _record(request, endpoint="issues", source="miss", start=t0)
+                    return _cv_rate_limit_error(client, "issues/")
+                if outcome == "complete":
+                    incomplete = []
+            if not incomplete:
+                matches = _local_volume_issues(db, vol_ids, issue_number)
+                if sort:
+                    matches = _apply_sort(matches, sort)
+                return _local_page(
+                    matches[effective_offset: effective_offset + limit], len(matches)
+                )
+            if results:
+                # Refresh not possible right now: serve the partial list as before
+                return _local_page(results, total)
+
+        if db.negative_cache_hit("issues", negative_key, ttl_hours=_NEGATIVE_CACHE_TTL_HOURS):
             _record(request, endpoint="issues", source="cache", start=t0)
-            return _cv_envelope(results, total=total, limit=limit, offset=effective_offset)
+            return _cv_envelope([], total=0, limit=limit, offset=effective_offset)
 
     if cache_mode == "only-if-cached":
         _record(request, endpoint="issues", source="miss", start=t0)
@@ -1033,18 +1188,23 @@ async def list_issues(
     upstream_params2: dict[str, Any] = {"filter": filter, "limit": limit, "offset": effective_offset}
     if sort:
         upstream_params2["sort"] = sort
-    client = _get_client(request)
-    data = await _guarded_get(client, client.get("issues/", upstream_params2))
+    data = await _guarded_get(client, "issues/", partial(client.get, "issues/", upstream_params2))
     if data is RATE_LIMITED:
         _record(request, endpoint="issues", source="miss", start=t0)
-        return _cv_rate_limit_error()
+        return _cv_rate_limit_error(client, "issues/")
+    # Only an explicit "nothing matches" from CV is remembered — never a failure —
+    # and only for volume lookups: date windows fill in as CV adds releases.
+    if volume_lookup and (
+        data is NOT_FOUND
+        or (data and not data.get("results") and not data.get("number_of_total_results"))
+    ):
+        db.negative_cache_put("issues", negative_key)
     if data:
         if isinstance(data.get("results"), list):
-            for issue in data["results"]:
-                try:
-                    db.upsert_issue(issue)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to upsert issue %s: %s", issue.get("id"), exc)
+            try:
+                db.insert_new_issues(data["results"])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to store issues for filter %r: %s", filter, exc)
             if field_list:
                 data = {**data, "results": [_apply_field_list(r, field_list) for r in data["results"]]}
         _record(request, endpoint="issues", source="upstream", start=t0)
@@ -1059,14 +1219,14 @@ async def list_issues(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/publisher/{publisher_id}/")
+@router.get("/publisher/{publisher_id}/", response_model=None)
 async def get_publisher(
     request: Request,
     publisher_id: str,
     api_key: str = Query(default="", alias="api_key"),
     format: str = Query(default="json", alias="format"),
     field_list: str = Query(default="", alias="field_list"),
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """Get publisher by ID (accepts ``4010-1`` or ``1``)."""
     t0 = time.monotonic()
     pid = _parse_cv_id(publisher_id)
@@ -1084,10 +1244,12 @@ async def get_publisher(
         return _cv_error("Publisher not in cache", status_code=101)
 
     client = _get_client(request)
-    data = await _guarded_get(client, client.get_publisher(pid))
+    data = await _guarded_get(
+        client, "publisher/", partial(client.get_publisher, pid)
+    )
     if data is RATE_LIMITED:
         _record(request, endpoint="publisher", source="miss", start=t0)
-        return _cv_rate_limit_error()
+        return _cv_rate_limit_error(client, "publisher/")
     if data and data.get("results"):
         try:
             db.upsert_publisher(data["results"])
@@ -1102,7 +1264,7 @@ async def get_publisher(
     return _cv_error("Publisher not found", status_code=101)
 
 
-@router.get("/publishers/")
+@router.get("/publishers/", response_model=None)
 async def list_publishers(
     request: Request,
     filter: str = Query(default="", alias="filter"),
@@ -1113,7 +1275,7 @@ async def list_publishers(
     format: str = Query(default="json", alias="format"),
     field_list: str = Query(default="", alias="field_list"),
     sort: str = Query(default="", alias="sort"),
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """CV-compatible publishers list."""
     t0 = time.monotonic()
     effective_offset = _effective_offset(offset, page, limit)
@@ -1139,10 +1301,12 @@ async def list_publishers(
     if sort:
         upstream_params["sort"] = sort
     client = _get_client(request)
-    data = await _guarded_get(client, client.get("publishers/", upstream_params))
+    data = await _guarded_get(
+        client, "publishers/", partial(client.get, "publishers/", upstream_params)
+    )
     if data is RATE_LIMITED:
         _record(request, endpoint="publishers", source="miss", start=t0)
-        return _cv_rate_limit_error()
+        return _cv_rate_limit_error(client, "publishers/")
     if data:
         if isinstance(data.get("results"), list):
             for pub in data["results"]:
@@ -1253,7 +1417,7 @@ def _parse_id_list(value: str) -> list[int] | None:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/{resource}/{resource_id}/")
+@router.get("/{resource}/{resource_id}/", response_model=None)
 async def generic_single(
     request: Request,
     resource: str,
@@ -1261,7 +1425,7 @@ async def generic_single(
     api_key: str = Query(default="", alias="api_key"),
     format: str = Query(default="json", alias="format"),
     field_list: str = Query(default="", alias="field_list"),
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """Generic single-resource handler for any CV API resource type.
 
     Handles characters (4005-X), teams (4060-X), story_arcs (4045-X),
@@ -1287,10 +1451,12 @@ async def generic_single(
         return _cv_error(f"{resource.capitalize()} not in cache", status_code=101)
 
     client = _get_client(request)
-    data = await _guarded_get(client, client.get(f"{resource}/{resource_id}/", None))
+    data = await _guarded_get(
+        client, f"{resource}/", partial(client.get, f"{resource}/{resource_id}/", None)
+    )
     if data is RATE_LIMITED:
         _record(request, endpoint=resource, source="miss", start=t0)
-        return _cv_rate_limit_error()
+        return _cv_rate_limit_error(client, f"{resource}/")
 
     if data and data.get("results"):
         result = data["results"]
@@ -1313,7 +1479,7 @@ async def generic_single(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/{resources}/")
+@router.get("/{resources}/", response_model=None)
 async def generic_list(
     request: Request,
     resources: str,
@@ -1324,7 +1490,7 @@ async def generic_list(
     format: str = Query(default="json", alias="format"),
     field_list: str = Query(default="", alias="field_list"),
     sort: str = Query(default="", alias="sort"),
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """Generic list handler for any CV API resource type not explicitly wired up.
 
     Cache key excludes limit, offset, and field_list so that:
@@ -1359,10 +1525,12 @@ async def generic_list(
     upstream_params: dict[str, Any] = {"filter": filter, "limit": limit, "offset": offset}
     if sort:
         upstream_params["sort"] = sort
-    data = await _guarded_get(client, client.get(f"{resources}/", upstream_params))
+    data = await _guarded_get(
+        client, f"{resources}/", partial(client.get, f"{resources}/", upstream_params)
+    )
     if data is RATE_LIMITED:
         _record(request, endpoint=resources, source="miss", start=t0)
-        return _cv_rate_limit_error()
+        return _cv_rate_limit_error(client, f"{resources}/")
 
     if data and isinstance(data.get("results"), list):
         results: list[dict[str, Any]] = data["results"]

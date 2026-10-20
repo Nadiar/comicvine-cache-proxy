@@ -14,7 +14,8 @@ class Settings(BaseSettings):
     # ComicVine API
     cv_api_key: str
     cv_api_base_url: str = "https://comicvine.gamespot.com/api"
-    rate_limit_per_minute: int = 100
+    # CV asks for roughly one request per second; faster bursts trigger HTTP 420.
+    rate_limit_per_minute: int = 60
 
     # Database
     db_path: Path = Path("/data/localcv.db")
@@ -45,6 +46,9 @@ class Settings(BaseSettings):
     # ComicVine enforces a hard limit of 200 requests/hour per endpoint path.
     # Default 180 leaves a 10% safety buffer for organic proxy traffic.
     rate_limit_per_hour_per_endpoint: int = 180
+    # After CV answers 420/429/107, stop calling upstream for this long
+    # (or for the upstream Retry-After, when CV sends one).
+    rate_limit_cooldown_seconds: float = 600.0
 
     # Server
     host: str = "0.0.0.0"

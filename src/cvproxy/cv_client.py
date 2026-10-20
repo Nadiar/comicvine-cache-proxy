@@ -35,7 +35,8 @@ class _RateLimited:
 
 
 #: Returned instead of ``None`` when the upstream CV API explicitly refuses
-#: the request due to rate limiting (HTTP 429 or JSON status_code 107).
+#: the request due to rate limiting (HTTP 420/429 or JSON status_code 107),
+#: or when the client is still cooling down from such a refusal.
 RATE_LIMITED: Final[_RateLimited] = _RateLimited()
 
 
@@ -68,6 +69,7 @@ class CVClient:
         base_url: str = "https://comicvine.gamespot.com/api",
         rate_limit_per_minute: int = 100,
         rate_limit_per_hour_per_endpoint: int = 180,
+        rate_limit_cooldown_seconds: float = 600.0,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -78,6 +80,11 @@ class CVClient:
         self._hourly_limit = rate_limit_per_hour_per_endpoint
         self._hourly_windows: dict[str, deque[float]] = {}
         self._hourly_lock = asyncio.Lock()
+        # After CV refuses a request, every endpoint pauses until this wall-clock
+        # time.  CV doesn't document how long its 420 block lasts; the default
+        # cooldown is a guess, overridden by an upstream Retry-After header.
+        self._cooldown_seconds = rate_limit_cooldown_seconds
+        self._cooldown_until: float = 0.0
         self._client = httpx.AsyncClient(
             timeout=30.0,
             headers={
@@ -163,6 +170,38 @@ class CVClient:
             )
             await asyncio.sleep(max(wait, 0.0))
 
+    def _start_cooldown(self, retry_after_header: str | None = None) -> None:
+        seconds = self._cooldown_seconds
+        if retry_after_header and retry_after_header.strip().isdigit():
+            seconds = float(retry_after_header.strip())
+        self._cooldown_until = max(self._cooldown_until, time.time() + seconds)
+
+    def retry_after(self, endpoint: str) -> float:
+        """Seconds until a request to *endpoint* may go upstream (0 = now).
+
+        Accounts for the post-refusal cooldown and the per-endpoint hourly
+        window, so live requests can answer "rate limited" instead of sleeping
+        in :meth:`_wait_for_hourly_limit`.
+        """
+        now = time.time()
+        waits = [self._cooldown_until - now]
+        window = self._hourly_windows.get(self._endpoint_key(endpoint))
+        if window:
+            active = [ts for ts in window if ts > now - 3600.0]
+            if len(active) >= self._hourly_limit:
+                waits.append(active[len(active) - self._hourly_limit] + 3600.0 - now)
+        return max(0.0, *waits)
+
+    def seconds_until_total_below(self, threshold: int) -> float:
+        """Seconds until the all-endpoint hourly call count drops below *threshold*."""
+        now = time.time()
+        active = sorted(
+            ts for window in self._hourly_windows.values() for ts in window if ts > now - 3600.0
+        )
+        if len(active) < threshold:
+            return 0.0
+        return max(0.0, active[len(active) - threshold] + 3600.0 - now)
+
     # -- public API ----------------------------------------------------------
 
     async def get(
@@ -176,9 +215,14 @@ class CVClient:
         upstream explicitly refuses the request due to rate limiting, or
         ``None`` on any other error.
         """
+        if self._cooldown_until > time.time():
+            return RATE_LIMITED
         endpoint_key = self._endpoint_key(endpoint)
         await self._wait_for_hourly_limit(endpoint_key)
         await self._wait_for_rate_limit()
+        # A refusal may have landed while this request was queued behind the pacer
+        if self._cooldown_until > time.time():
+            return RATE_LIMITED
 
         url = f"{self._base_url}/{endpoint.lstrip('/')}"
         req_params: dict[str, Any] = {
@@ -195,6 +239,7 @@ class CVClient:
             status = data.get("status_code", 0)
             if status == 107:
                 logger.warning("CV API rate limit (status 107): %s", endpoint)
+                self._start_cooldown()
                 return RATE_LIMITED
             if status == 101:
                 logger.debug("CV API not found (status 101): %s", endpoint)
@@ -206,8 +251,11 @@ class CVClient:
 
             return data
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 429:
-                logger.warning("CV API rate limit (HTTP 429): %s", endpoint)
+            if exc.response.status_code in (420, 429):
+                logger.warning(
+                    "CV API rate limit (HTTP %d): %s", exc.response.status_code, endpoint
+                )
+                self._start_cooldown(exc.response.headers.get("Retry-After"))
                 return RATE_LIMITED
             logger.error("CV API HTTP %d: %s", exc.response.status_code, endpoint)
             return None
