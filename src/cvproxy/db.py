@@ -1844,6 +1844,28 @@ class Database:
         old = [r[0] for r in rows if r[0] not in seen][:old_limit]
         return calendar, old
 
+    # -- WAL maintenance -----------------------------------------------------
+
+    def checkpoint_wal(self) -> dict[str, int]:
+        """Run a PASSIVE checkpoint through a separate connection (worker thread).
+
+        PASSIVE never takes the write lock, so the app keeps writing while WAL
+        pages are copied into the database.  It cannot finish while a reader
+        holds an older snapshot; ``busy`` and frames left behind report that.
+        """
+        conn = sqlite3.connect(str(self._path), timeout=5)
+        try:
+            busy, log_frames, done = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        finally:
+            conn.close()
+        wal = self._path.with_name(self._path.name + "-wal")
+        return {
+            "busy": busy,
+            "log_frames": log_frames,
+            "checkpointed": done,
+            "wal_bytes": wal.stat().st_size if wal.exists() else 0,
+        }
+
     # -- sync watermarks -----------------------------------------------------
 
     def get_sync_watermark(self, endpoint: str) -> str | None:

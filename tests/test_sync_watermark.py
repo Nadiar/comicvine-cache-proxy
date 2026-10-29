@@ -187,3 +187,15 @@ def test_volume_ids_needing_backfill(tmp_db: Database, missing: int | None) -> N
 
 def test_count_rows_snapshot_matches_get_counts(tmp_db: Database) -> None:
     assert tmp_db.count_rows_snapshot() == tmp_db.get_counts()
+
+
+def test_checkpoint_wal_reports_frames(tmp_db: Database) -> None:
+    tmp_db.upsert_publisher({"id": 99, "name": "Checkpoint Press"})
+    result = tmp_db.checkpoint_wal()
+    assert result["busy"] == 0
+    assert result["checkpointed"] == result["log_frames"]
+
+
+def test_wal_checkpoint_job_registered(settings: Any) -> None:
+    scheduler = create_scheduler(settings, MagicMock(), MagicMock(), MagicMock())
+    assert scheduler.get_job("wal_checkpoint") is not None

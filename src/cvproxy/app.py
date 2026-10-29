@@ -514,7 +514,7 @@ def create_app() -> FastAPI:
 
         async def _run() -> dict[str, Any]:
             fetch_fn = db.get_calendar_volume_ids if calendar_only else db.get_all_volume_ids
-            volume_ids = await asyncio.to_thread(fetch_fn)
+            volume_ids = fetch_fn()  # shared connection: stay on the loop thread
             total = len(volume_ids)
             logger.info(
                 "Publisher repair: %d volumes queued (batch_size=%d, calendar_only=%s)",

@@ -129,6 +129,7 @@ def create_scheduler(
       - latest.mcl refresh: daily, when mcl_export_path is set
       - MCL gap backfill: daily, fetches volumes/issues the MCL has and we don't
       - Cover hash backfill: hourly, when cover_hash_per_hour > 0
+      - WAL checkpoint: hourly, PASSIVE, on a worker thread
     """
     # A job held up past its start time (event loop busy, container restart)
     # still runs within the grace period instead of being dropped; APScheduler's
@@ -217,6 +218,18 @@ def create_scheduler(
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+    )
+
+    # WAL checkpoint — hourly, off the event loop (see Database.checkpoint_wal)
+    scheduler.add_job(
+        _make_tracked("WAL checkpoint", _checkpoint_wal),
+        "cron",
+        minute=40,
+        args=[db],
+        id="wal_checkpoint",
+        name="WAL checkpoint",
+        replace_existing=True,
+        max_instances=1,
     )
 
     # Incremental issue sync — hourly from the stored watermark.  A run usually
@@ -408,7 +421,7 @@ async def _prefetch_releases(client: CVClient, db: Database) -> dict[str, Any]:
 
         results = data.get("results") or []
         if results:
-            await asyncio.to_thread(_store_issue_page, db, results)
+            _store_issue_page(db, results)
         total_upserted += len(results)
 
         total_available = data.get("number_of_total_results", 0)
@@ -447,8 +460,8 @@ async def _backfill_volumes(client: CVClient, db: Database) -> dict[str, Any]:
     All upserts are deferred to a single commit at the end so the asyncio
     event loop is never blocked by repeated fsync calls during the run.
     """
-    calendar_ids, old_ids = await asyncio.to_thread(
-        db.volume_ids_needing_backfill, _VOLUME_CALENDAR_BATCH, _VOLUME_OLD_BATCH
+    calendar_ids, old_ids = db.volume_ids_needing_backfill(
+        _VOLUME_CALENDAR_BATCH, _VOLUME_OLD_BATCH
     )
     volume_ids = calendar_ids + old_ids
 
@@ -483,7 +496,7 @@ async def _backfill_volumes(client: CVClient, db: Database) -> dict[str, Any]:
             db.upsert_volume(data["results"], commit=False)
             updated += 1
         await asyncio.sleep(sleep_secs)
-    await asyncio.to_thread(db.conn.commit)
+    db.conn.commit()
     logger.info("Volume backfill: updated %d/%d volumes", updated, len(volume_ids))
     return {"updated": updated, "queued": len(volume_ids)}
 
@@ -532,7 +545,7 @@ async def _backfill_issues(client: CVClient, db: Database) -> dict[str, Any]:
     All upserts are deferred to a single commit at the end so the asyncio
     event loop is never blocked by repeated fsync calls during the run.
     """
-    issue_ids = await asyncio.to_thread(_issue_backfill_ids, db)
+    issue_ids = _issue_backfill_ids(db)
 
     if not issue_ids:
         logger.debug("Issue backfill: nothing to do")
@@ -560,7 +573,7 @@ async def _backfill_issues(client: CVClient, db: Database) -> dict[str, Any]:
             db.upsert_issue(data["results"], commit=False)
             updated += 1
         await asyncio.sleep(sleep_secs)
-    await asyncio.to_thread(db.conn.commit)
+    db.conn.commit()
     logger.info("Issue backfill: updated %d/%d issues", updated, len(issue_ids))
     return {"updated": updated, "queued": len(issue_ids)}
 
@@ -573,7 +586,7 @@ async def _backfill_issue_details(client: CVClient, db: Database) -> dict[str, A
     about those most.  Shares the backfill hourly budget with the other jobs
     and stops early when CV rate limits.
     """
-    issue_ids = await asyncio.to_thread(db.issue_ids_needing_detail, _ISSUE_DETAIL_BATCH)
+    issue_ids = db.issue_ids_needing_detail(limit=_ISSUE_DETAIL_BATCH)
     if not issue_ids:
         logger.debug("Issue detail backfill: nothing to do")
         return {"updated": 0, "queued": 0}
@@ -603,7 +616,7 @@ async def _backfill_issue_details(client: CVClient, db: Database) -> dict[str, A
             db.upsert_issue(data["results"], commit=False)
             updated += 1
         await asyncio.sleep(sleep_secs)
-    await asyncio.to_thread(db.conn.commit)
+    db.conn.commit()
     logger.info("Issue detail backfill: updated %d/%d issues", updated, len(issue_ids))
     return {"updated": updated, "queued": len(issue_ids)}
 
@@ -648,7 +661,7 @@ async def _backfill_publishers(client: CVClient, db: Database) -> dict[str, Any]
             db.upsert_publisher(data["results"], commit=False)
             updated += 1
         await asyncio.sleep(sleep_secs)
-    await asyncio.to_thread(db.conn.commit)
+    db.conn.commit()
     logger.info("Publisher backfill: updated %d/%d publishers", updated, len(publisher_ids))
     return {"updated": updated, "queued": len(publisher_ids)}
 
@@ -676,8 +689,36 @@ _SYNC_INITIAL_LOOKBACK = timedelta(hours=72)
 _SYNC_MAX_CHUNKS = 45
 
 
+#: Warn when a checkpoint leaves the WAL bigger than this (a reader is stuck).
+_WAL_WARN_BYTES = 256 * 1024 * 1024
+
+
+async def _checkpoint_wal(db: Database) -> dict[str, Any]:
+    """Checkpoint the WAL on a worker thread so the event loop never does the copy."""
+    result = await asyncio.to_thread(db.checkpoint_wal)
+    incomplete = result["log_frames"] > result["checkpointed"]
+    if incomplete and result["wal_bytes"] > _WAL_WARN_BYTES:
+        logger.warning(
+            "WAL checkpoint incomplete (%d/%d frames, WAL %.0f MB): a long-running "
+            "reader is holding an old snapshot",
+            result["checkpointed"], result["log_frames"], result["wal_bytes"] / 1_048_576,
+        )
+    else:
+        logger.info(
+            "WAL checkpoint: %d/%d frames, WAL %.0f MB",
+            result["checkpointed"], result["log_frames"], result["wal_bytes"] / 1_048_576,
+        )
+    return result
+
+
 def _store_issue_page(db: Database, results: list[dict[str, Any]]) -> None:
-    """Upsert one page of list-endpoint issues and commit (runs on a worker thread)."""
+    """Upsert one page of list-endpoint issues and commit.
+
+    Runs on the event loop thread: db.conn is shared, and Python's sqlite3
+    connection objects must not be used from two threads at once.  Only work
+    that opens its own connection (backup, export, health counts) goes to a
+    worker thread.
+    """
     for issue in results:
         db.upsert_issue(issue, commit=False)
     db.conn.commit()
@@ -732,7 +773,7 @@ async def _sync_issue_window(
                 return upserted, latest, False
             results = data.get("results") or []
             if results:
-                await asyncio.to_thread(_store_issue_page, db, results)
+                _store_issue_page(db, results)
                 upserted += len(results)
                 page_latest = max(str(r.get("date_last_updated") or "") for r in results)
                 if page_latest and (latest is None or page_latest > latest):
@@ -754,7 +795,7 @@ async def _sync_issues_incremental(client: CVClient, db: Database) -> dict[str, 
     next run resumes where the last good one stopped instead of leaving a gap.
     """
     now = datetime.now(UTC).replace(tzinfo=None)
-    mark = await asyncio.to_thread(db.get_sync_watermark, ISSUE_SYNC_WATERMARK)
+    mark = db.get_sync_watermark(ISSUE_SYNC_WATERMARK)
     if mark:
         start = datetime.strptime(mark, _CV_TS) - _SYNC_OVERLAP
     else:
@@ -769,7 +810,7 @@ async def _sync_issues_incremental(client: CVClient, db: Database) -> dict[str, 
         client, db, start, end, max_chunks=_SYNC_MAX_CHUNKS
     )
     if latest and (mark is None or latest > mark):
-        await asyncio.to_thread(db.set_sync_watermark, ISSUE_SYNC_WATERMARK, latest)
+        db.set_sync_watermark(ISSUE_SYNC_WATERMARK, latest)
         mark = latest
     logger.info(
         "Incremental sync: upserted %d issues, watermark %s%s",
@@ -1018,9 +1059,7 @@ async def _backfill_search_cache_volumes(client: CVClient, db: Database) -> dict
     cv_volume table yet, this job fetches and upserts those volumes so that
     future search requests can enrich results from local data.
     """
-    missing_ids = await asyncio.to_thread(
-        db.get_search_cache_missing_volume_ids, _SEARCH_BACKFILL_BATCH
-    )
+    missing_ids = db.get_search_cache_missing_volume_ids(limit=_SEARCH_BACKFILL_BATCH)
 
     if not missing_ids:
         logger.debug("Search cache volume backfill: nothing to do")
@@ -1050,7 +1089,7 @@ async def _backfill_search_cache_volumes(client: CVClient, db: Database) -> dict
             db.upsert_volume(data["results"], commit=False)
             updated += 1
         await asyncio.sleep(sleep_secs)
-    await asyncio.to_thread(db.conn.commit)
+    db.conn.commit()
     logger.info(
         "Search cache volume backfill: upserted %d/%d volumes", updated, len(missing_ids)
     )
