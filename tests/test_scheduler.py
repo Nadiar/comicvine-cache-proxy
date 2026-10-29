@@ -161,7 +161,8 @@ async def test_issue_detail_backfill_fills_list_only_rows(tmp_db: Database) -> N
     with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
         result = await _backfill_issue_details(client, tmp_db)
 
-    assert result == {"updated": 1, "queued": 2}
+    assert result["updated"] == 1 and result["queued"] == 2
+    assert "stop_reason" not in result
     assert tmp_db.issue_needs_detail(8002) is False
     issue = tmp_db.get_issue(8002)
     assert issue is not None
@@ -252,7 +253,7 @@ async def test_backup_job_disabled_when_keep_is_zero(tmp_db: Database, tmp_path:
 
     result = await _backup_database(tmp_db, settings)
 
-    assert result == {"backup": None, "removed": 0}
+    assert result == {"backup": None, "removed": 0, "stop_reason": "disabled"}
     assert not (tmp_path / "backups").exists()
 
 
@@ -337,7 +338,7 @@ async def test_export_job_disabled_without_path(tmp_db: Database) -> None:
 
     result = await _export_comicvine_db(tmp_db, Settings(cv_api_key="k"))
 
-    assert result == {"path": None}
+    assert result == {"path": None, "stop_reason": "disabled"}
 
 
 def test_export_job_registered_only_when_configured(tmp_path: Path) -> None:
@@ -498,7 +499,7 @@ async def test_mcl_gap_backfill_without_file_does_nothing(tmp_db: Database) -> N
     result = await _backfill_from_mcl(client, tmp_db, Settings(cv_api_key="k"))
 
     assert result == {"volumes_missing": 0, "volumes_added": 0,
-                      "issues_missing": 0, "issues_added": 0}
+                      "issues_missing": 0, "issues_added": 0, "stop_reason": "disabled"}
     client.get.assert_not_called()
 
 

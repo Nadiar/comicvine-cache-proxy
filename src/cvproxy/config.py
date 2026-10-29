@@ -25,6 +25,8 @@ class Settings(BaseSettings):
 
     # Stats
     stats_db_path: Path = Path("/data/stats.db")
+    # Job run history (default: jobs.db next to stats.db)
+    jobs_db_path: Path | None = None
 
     # Nightly database snapshots; backup_keep = 0 disables them
     backup_dir: Path = Path("/data/backups")

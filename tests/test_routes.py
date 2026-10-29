@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Generator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1747,7 +1748,7 @@ def _poll_job(client: TestClient, job_id: str, max_polls: int = 10) -> dict:
         r = client.get(f"/admin/jobs/{job_id}")
         assert r.status_code == 200
         job = r.json()
-        if job["status"] in ("done", "error", "cancelled"):
+        if job["status"] not in ("running",):
             return job
         time.sleep(0.05)
     return job  # type: ignore[return-value]
@@ -2442,3 +2443,45 @@ def test_admin_export_comicvine_db_requires_path(app_client: TestClient) -> None
     resp = app_client.post("/admin/export/comicvine-db")
 
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Admin: job catalog and generic run endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_admin_jobs_catalog_lists_every_job(app_client: TestClient) -> None:
+    resp = app_client.get("/admin/jobs/catalog")
+    assert resp.status_code == 200
+    jobs = {j["id"]: j for j in resp.json()}
+    assert {"incremental_issue_sync", "issue_refetch", "response_cache_audit",
+            "queue_snapshot", "integrity_check"} <= set(jobs)
+    assert all(j["description"] for j in jobs.values())
+    assert jobs["issue_refetch"]["params"][0]["name"] == "ids"
+
+
+def test_admin_job_run_records_history(
+    app_client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    resp = app_client.post("/admin/jobs/image_cache_cleanup/run", json={})
+    assert resp.status_code == 200
+    run = _poll_job(app_client, resp.json()["run_id"], max_polls=50)
+    assert run["status"] == "idle"
+    assert run["trigger"] == "manual"
+    assert any("Job start: Image cache cleanup" in line for line in run["log"])
+    listed = app_client.get("/admin/jobs", params={"job": "image_cache_cleanup"}).json()
+    assert listed[0]["run_id"] == run["run_id"]
+
+
+def test_admin_job_run_rejects_unknown_job_and_bad_params(app_client: TestClient) -> None:
+    assert app_client.post("/admin/jobs/nope/run", json={}).status_code == 404
+    bad = app_client.post("/admin/jobs/issue_resync/run", json={"days": 9999})
+    assert bad.status_code == 400
+
+
+def test_admin_integrity_check_runs(app_client: TestClient) -> None:
+    resp = app_client.post("/admin/jobs/integrity_check/run")
+    run = _poll_job(app_client, resp.json()["run_id"], max_polls=100)
+    assert run["status"] == "done"
+    assert run["result"]["ok"] is True

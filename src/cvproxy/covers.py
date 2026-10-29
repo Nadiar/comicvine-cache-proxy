@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import time
 from urllib.parse import urlsplit
 
 import httpx
@@ -21,6 +22,7 @@ import imagehash
 from PIL import Image
 
 from cvproxy.db import Database
+from cvproxy.jobs import report_progress
 
 logger = logging.getLogger(__name__)
 
@@ -87,16 +89,33 @@ async def hash_covers(
     limit: int,
     delay: float = 1.0,
     transport: httpx.AsyncBaseTransport | None = None,
-) -> dict[str, int]:
+) -> dict[str, int | float | str]:
     """Hash the covers of issues that have none in comic_covers, newest first.
 
     Downloads at most *limit* images, *delay* seconds apart; an issue whose
     covers would exceed the limit waits for the next run, so issues are never
     left half-hashed.  A missing, refused or unreadable image is stored with
     NULL hashes (ComicManager skips those) so it isn't retried every run; a
-    429, 5xx or network error stops the run and the issue is retried next time.
+    429, 5xx or network error stops the run (stop_reason "cdn_error") and the
+    issue is retried next time.  ``scan_s`` is how long finding candidates took.
     """
     hashed = failed = issues = 0
+    t0 = time.monotonic()
+    candidates = await asyncio.to_thread(db.cover_hash_candidates, limit)
+    scan_s = round(time.monotonic() - t0, 1)
+    if not candidates:
+        logger.info("Cover hash backfill: no issues without cover hashes (scan %.1fs)", scan_s)
+        return {"hashed": 0, "failed": 0, "issues": 0, "scan_s": scan_s,
+                "stop_reason": "nothing_to_do"}
+
+    def _result(stop: str | None = None) -> dict[str, int | float | str]:
+        out: dict[str, int | float | str] = {
+            "hashed": hashed, "failed": failed, "issues": issues, "scan_s": scan_s,
+        }
+        if stop:
+            out["stop_reason"] = stop
+        return out
+
     async with httpx.AsyncClient(
         transport=transport,
         timeout=30.0,
@@ -104,7 +123,7 @@ async def hash_covers(
         headers={"User-Agent": "CVProxy/0.1"},
         event_hooks={"request": [_check_request]},
     ) as http:
-        for cvid, urls in await asyncio.to_thread(db.cover_hash_candidates, limit):
+        for cvid, urls in candidates:
             done = hashed + failed
             if done and done + len(urls) > limit:
                 break
@@ -124,13 +143,13 @@ async def hash_covers(
                         logger.warning(
                             "Cover hash backfill: CDN answered %d; stopping this run", code
                         )
-                        return {"hashed": hashed, "failed": failed, "issues": issues}
+                        return _result("cdn_error")
                     logger.info("Cover hash backfill: no image at %s (HTTP %d)", url, code)
                     rows.append((cvid, None, None, url))
                     failed += 1
                 except httpx.RequestError as exc:
                     logger.warning("Cover hash backfill: %s (%s); stopping this run", exc, url)
-                    return {"hashed": hashed, "failed": failed, "issues": issues}
+                    return _result("cdn_error")
                 except Exception as exc:  # noqa: BLE001 - bad URL, oversized or undecodable image
                     logger.info("Cover hash backfill: no hash for %s: %r", url, exc)
                     rows.append((cvid, None, None, url))
@@ -142,8 +161,9 @@ async def hash_covers(
                     await asyncio.sleep(delay)
             db.insert_cover_hashes(rows)
             issues += 1
-    if hashed or failed:
-        logger.info(
-            "Cover hash backfill: %d hashed, %d without image, %d issues", hashed, failed, issues
-        )
-    return {"hashed": hashed, "failed": failed, "issues": issues}
+            report_progress(hashed + failed, limit, f"{issues} issues")
+    logger.info(
+        "Cover hash backfill: %d hashed, %d without image, %d issues (scan %.1fs)",
+        hashed, failed, issues, scan_s,
+    )
+    return _result()

@@ -89,7 +89,10 @@ async def test_hash_covers_stores_main_and_variant_covers(tmp_db: Database) -> N
 
     result = await hash_covers(tmp_db, limit=10, delay=0, transport=transport)
 
-    assert result == {"hashed": 2, "failed": 0, "issues": 1}
+    assert {k: result[k] for k in ("hashed", "failed", "issues")} == {
+        "hashed": 2, "failed": 0, "issues": 1,
+    }
+    assert "stop_reason" not in result
     rows = [r for r in _covers(tmp_db) if r[0] == 9001]
     assert [r[3] for r in rows] == [ORIGINAL.format("main"), ORIGINAL.format("variant")]
     assert all(r[1] and r[2] for r in rows)

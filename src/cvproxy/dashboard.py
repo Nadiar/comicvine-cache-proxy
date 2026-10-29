@@ -27,8 +27,8 @@ DASHBOARD_HTML = """\
     .source-badge { font-size: .75rem; }
     .footer-note { color: var(--bs-secondary-color); }
     #clientsTable tbody tr:hover { background: rgba(var(--bs-primary-rgb), .08); }
-    .job-ref-card { border-left: 3px solid var(--bs-primary); }
-    .job-ref-card .param-tag { font-size: .75rem; background: rgba(var(--bs-primary-rgb),.12); border-radius: .25rem; padding: .1rem .35rem; }
+    .job-desc { max-width: 46rem; }
+    .job-log { max-height: 320px; overflow: auto; }
   </style>
 </head>
 <body>
@@ -200,240 +200,107 @@ DASHBOARD_HTML = """\
        JOBS TAB PANE
        ===================================================================== -->
   <main class="container my-4" id="jobsPane" style="display:none">
-    <div class="d-flex justify-content-between align-items-center mb-3">
+    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
       <h5 class="mb-0"><i class="bi bi-list-task me-2"></i>Background Jobs</h5>
-      <button class="btn btn-sm btn-outline-secondary" id="refreshJobsBtn">
-        <i class="bi bi-arrow-clockwise"></i> Refresh
-      </button>
-    </div>
-
-    <!-- Run a job -->
-    <div class="card mb-3">
-      <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
-        <span><i class="bi bi-play-circle me-2"></i>Run a Job</span>
-        <button class="btn btn-sm btn-outline-info" data-bs-toggle="modal" data-bs-target="#jobInfoModal" title="Job reference — what each job does and when to use it">
-          <i class="bi bi-info-circle me-1"></i>Job Reference
+      <div class="d-flex align-items-center gap-3">
+        <span class="small" id="jobsHealth"></span>
+        <button class="btn btn-sm btn-outline-secondary" id="refreshJobsBtn">
+          <i class="bi bi-arrow-clockwise"></i> Refresh
         </button>
       </div>
-      <div class="card-body">
-        <div class="row g-2 align-items-end">
-          <div class="col-12 col-md-4">
-            <label class="form-label small mb-1">Job type</label>
-            <select class="form-select form-select-sm" id="jobType">
-              <option value="sync-issues">Issue sync &mdash; re-fetch recently updated issues</option>
-              <option value="repair-publishers">Publisher repair &mdash; correct publisher IDs from CV</option>
-              <option value="rebuild-fts">FTS rebuild &mdash; resync search index from database</option>
-              <optgroup label="Maintenance">
-                <option value="evict">Cache eviction &mdash; remove stale issues, volumes &amp; response cache</option>
-                <option value="cleanup-images">Image cache cleanup &mdash; remove expired image files</option>
-              </optgroup>
-            </select>
-          </div>
-          <div class="col-6 col-md-2" id="daysFieldWrap">
-            <label class="form-label small mb-1">Look-back (days)</label>
-            <input type="number" class="form-control form-control-sm" id="syncDays"
-                   value="14" min="1" max="365" step="1">
-          </div>
-          <div class="col-6 col-md-2" id="batchFieldWrap" style="display:none">
-            <label class="form-label small mb-1">Batch size</label>
-            <input type="number" class="form-control form-control-sm" id="repairBatch"
-                   value="100" min="10" max="100" step="10">
-          </div>
-          <div class="col-auto align-self-end" id="calendarOnlyWrap" style="display:none">
-            <div class="form-check mb-1">
-              <input class="form-check-input" type="checkbox" id="calendarOnly" checked>
-              <label class="form-check-label small" for="calendarOnly"
-                     title="Only repair volumes that appear in new-release calendar queries (much faster)">
-                Calendar volumes only
-              </label>
-            </div>
-          </div>
-          <div class="col-auto align-self-end" id="dryRunWrap" style="display:none">
-            <div class="form-check mb-1">
-              <input class="form-check-input" type="checkbox" id="evictDryRun" checked>
-              <label class="form-check-label small text-warning fw-semibold" for="evictDryRun"
-                     title="Preview what would be deleted without actually deleting anything">
-                <i class="bi bi-eye me-1"></i>Dry run (preview only)
-              </label>
-            </div>
-          </div>
-          <div class="col-12" id="evictInfoWrap" style="display:none">
-            <div class="alert alert-secondary py-1 px-2 mb-0 small" id="evictInfoText">
-              Loading eviction settings&hellip;
-            </div>
-          </div>
-          <div class="col-auto">
-            <button class="btn btn-sm btn-primary" id="runJobBtn">
-              <i class="bi bi-play-fill me-1"></i>Start
-            </button>
-          </div>
-          <div class="col-12" id="runJobFeedback" style="display:none"></div>
+    </div>
+
+    <!-- Backlog (latest Backlog snapshot run) -->
+    <div class="card mb-3">
+      <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-hourglass-split me-2"></i>Backlog</span>
+        <span class="small text-secondary fw-normal" id="backlogAsOf"></span>
+      </div>
+      <div class="card-body py-2" id="backlogBody">
+        <span class="text-secondary small">No snapshot yet.</span>
+      </div>
+    </div>
+
+    <!-- Job catalog -->
+    <div class="card mb-3">
+      <div class="card-header fw-semibold"><i class="bi bi-gear-wide-connected me-2"></i>Jobs</div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-sm table-hover mb-0 align-middle" id="catalogTable">
+            <thead class="table-dark">
+              <tr><th>Job</th><th>Schedule</th><th>Next run</th><th>Last run</th><th></th></tr>
+            </thead>
+            <tbody id="catalogBody">
+              <tr><td colspan="5" class="text-center text-secondary py-3">Loading&hellip;</td></tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
 
-    <!-- Admin-triggered jobs table -->
-    <div class="card mb-3">
-      <div class="card-header fw-semibold small text-secondary">Triggered Jobs</div>
-      <div class="card-body p-0">
-        <table class="table table-sm table-hover mb-0" id="jobsTable">
-          <thead class="table-dark">
-            <tr>
-              <th style="width:1.5rem"></th>
-              <th>Job</th>
-              <th>Status</th>
-              <th>Started</th>
-              <th>Finished</th>
-              <th class="text-end">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="jobsBody">
-            <tr><td colspan="6" class="text-center text-secondary py-3">No jobs yet</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Scheduler history table -->
+    <!-- Run history -->
     <div class="card">
-      <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
-        <span><i class="bi bi-clock-history me-2"></i>Scheduler History</span>
-        <span class="badge text-bg-secondary" id="schedulerHistoryCount" style="display:none"></span>
+      <div class="card-header fw-semibold d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span><i class="bi bi-clock-history me-2"></i>Run history</span>
+        <div class="d-flex gap-2">
+          <select class="form-select form-select-sm" id="histJob"><option value="">All jobs</option></select>
+          <select class="form-select form-select-sm" id="histStatus">
+            <option value="">Any status</option>
+            <option value="running">running</option><option value="done">done</option>
+            <option value="partial">partial</option><option value="idle">idle</option>
+            <option value="skipped">skipped</option><option value="error">error</option>
+            <option value="cancelled">cancelled</option>
+          </select>
+          <select class="form-select form-select-sm" id="histTrigger">
+            <option value="">Any trigger</option><option value="schedule">Scheduled</option>
+            <option value="manual">Manual</option>
+          </select>
+        </div>
       </div>
       <div class="card-body p-0">
-        <table class="table table-sm table-hover mb-0">
-          <thead class="table-dark">
-            <tr>
-              <th>Job</th>
-              <th>Status</th>
-              <th>Started</th>
-              <th>Duration</th>
-              <th>Result</th>
-            </tr>
-          </thead>
-          <tbody id="schedulerHistoryBody">
-            <tr><td colspan="5" class="text-center text-secondary py-3">No scheduler runs recorded yet — runs appear here after the first scheduled job fires.</td></tr>
-          </tbody>
-        </table>
+        <div class="table-responsive">
+          <table class="table table-sm table-hover mb-0 align-middle">
+            <thead class="table-dark">
+              <tr><th style="width:1.5rem"></th><th>Job</th><th>Status</th><th>Started</th>
+                  <th>Duration</th><th>Summary</th><th></th></tr>
+            </thead>
+            <tbody id="historyBody">
+              <tr><td colspan="7" class="text-center text-secondary py-3">Loading&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="text-center py-2">
+          <button class="btn btn-sm btn-outline-secondary" id="histMore" style="display:none">Load more</button>
+        </div>
       </div>
     </div>
   </main>
 
   <!-- =====================================================================
-       JOB REFERENCE MODAL
+       RUN JOB MODAL
        ===================================================================== -->
-  <div class="modal fade" id="jobInfoModal" tabindex="-1" aria-labelledby="jobInfoModalLabel" aria-hidden="true">
-    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+  <div class="modal fade" id="runModal" tabindex="-1" aria-labelledby="runModalTitle" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
       <div class="modal-content">
         <div class="modal-header">
-          <h5 class="modal-title" id="jobInfoModalLabel">
-            <i class="bi bi-info-circle me-2"></i>Job Reference
-          </h5>
+          <h5 class="modal-title" id="runModalTitle">Run job</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body">
-
-          <!-- Issue Sync -->
-          <div class="card job-ref-card mb-3">
-            <div class="card-body">
-              <h6 class="card-title mb-1">
-                <i class="bi bi-arrow-repeat me-2 text-primary"></i>Issue Sync
-              </h6>
-              <p class="small text-secondary mb-2">
-                Re-fetches issues from ComicVine whose <code>date_last_updated</code> falls within the
-                look-back window. Use this to pick up corrections made on CV — store dates fixed,
-                descriptions updated, credits added — that occurred more than 48 hours ago (older than the
-                nightly scheduler's default window).
-              </p>
-              <div class="mb-1"><span class="param-tag">look-back days</span> <span class="small ms-1">How far back to search. The daily scheduler uses 48 h; set to 30+ days to catch older corrections. Wider windows consume more of the hourly CV API quota.</span></div>
-              <div class="mt-2 small text-secondary"><i class="bi bi-lightbulb me-1"></i>Tip: run with 7–14 days after a bulk data import to ensure nothing was missed.</div>
-            </div>
-          </div>
-
-          <!-- Publisher Repair -->
-          <div class="card job-ref-card mb-3">
-            <div class="card-body">
-              <h6 class="card-title mb-1">
-                <i class="bi bi-wrench me-2 text-warning"></i>Publisher Repair
-              </h6>
-              <p class="small text-secondary mb-2">
-                Re-fetches <code>id</code> and <code>publisher</code> from CV for every cached volume,
-                then writes the canonical CV publisher IDs back into the database. Needed when the DB was
-                seeded by an external tool (e.g. an older <code>sqlite_cv_updater.py</code>) that assigned
-                sequential auto-increment publisher IDs instead of CV's own IDs, causing publisher lookups
-                to return wrong names or fail.
-              </p>
-              <div class="mb-1"><span class="param-tag">batch size</span> <span class="small ms-1">Volumes fetched per API call (10–100). Smaller batches use less hourly quota per request and are more resumable if interrupted.</span></div>
-              <div class="mb-1"><span class="param-tag">calendar volumes only</span> <span class="small ms-1">Limits repair to volumes that have at least one issue with a <code>store_date</code> — the subset relevant to new-release calendar queries. Typically far less than 1 % of the full catalog. Uncheck only if publisher data for older volumes is also wrong.</span></div>
-              <div class="mt-2 small text-secondary"><i class="bi bi-lightbulb me-1"></i>Tip: run once with calendar&nbsp;only checked first. If publishers still look wrong, re-run with it unchecked (slow — uses most of the hourly quota).</div>
-            </div>
-          </div>
-
-          <!-- FTS Rebuild -->
-          <div class="card job-ref-card mb-3">
-            <div class="card-body">
-              <h6 class="card-title mb-1">
-                <i class="bi bi-search me-2 text-info"></i>FTS Rebuild
-              </h6>
-              <p class="small text-secondary mb-2">
-                Drops and rebuilds the FTS5 full-text search shadow tables for volumes, issues, and
-                publishers. Under normal operation, database triggers installed at startup keep the index
-                in sync with every upsert automatically — this job is only needed if the index becomes
-                inconsistent.
-              </p>
-              <div class="mb-1 small text-secondary">No configurable parameters.</div>
-              <div class="mt-2 small text-secondary"><i class="bi bi-lightbulb me-1"></i>Tip: use this after importing data directly into SQLite (bypassing CVProxy's upsert layer) or if searches return stale or missing results.</div>
-            </div>
-          </div>
-
-          <hr class="my-2">
-          <p class="small text-secondary mb-2 fw-semibold">Maintenance</p>
-
-          <!-- Cache Eviction -->
-          <div class="card job-ref-card mb-3">
-            <div class="card-body">
-              <h6 class="card-title mb-1">
-                <i class="bi bi-trash3 me-2 text-danger"></i>Cache Eviction
-              </h6>
-              <p class="small text-secondary mb-2">
-                Permanently removes stale entities from the local database and expired entries from the
-                response and search caches. Eviction behaviour is controlled entirely by environment
-                variables set at startup — this job applies whatever is currently configured:
-              </p>
-              <ul class="small text-secondary mb-2">
-                <li><code>EVICT_OLDER_THAN_YEARS</code> — issues whose <code>cover_date</code> predates the cutoff <em>and</em> haven't been accessed within <code>EVICT_UNACCESSED_DAYS</code> are deleted, then volumes with no remaining issues are cascade-removed.</li>
-                <li><code>RESPONSE_CACHE_TTL_DAYS</code> / <code>SEARCH_CACHE_TTL_DAYS</code> — response and search cache rows older than the TTL are removed.</li>
-              </ul>
-              <div class="mb-1"><span class="param-tag">Dry run</span> <span class="small ms-1">When checked (default), returns the count of rows that <em>would</em> be removed without deleting anything. Uncheck only when you are ready to permanently delete data.</span></div>
-              <div class="mt-2 small text-secondary"><i class="bi bi-lightbulb me-1"></i>Tip: always run with dry run first to review the candidate counts, then uncheck and run again to commit.</div>
-            </div>
-          </div>
-
-          <!-- Image Cache Cleanup -->
-          <div class="card job-ref-card mb-0">
-            <div class="card-body">
-              <h6 class="card-title mb-1">
-                <i class="bi bi-images me-2 text-secondary"></i>Image Cache Cleanup
-              </h6>
-              <p class="small text-secondary mb-2">
-                Scans the on-disk image cache and removes any entries whose <code>last_accessed</code>
-                timestamp is older than the configured TTL (<code>IMAGE_CACHE_TTL_DAYS</code>, default 14 days).
-                This is the same operation the daily scheduler runs automatically — trigger it manually to
-                free up disk space immediately.
-              </p>
-              <div class="mb-1 small text-secondary">No configurable parameters.</div>
-              <div class="mt-2 small text-secondary"><i class="bi bi-lightbulb me-1"></i>Tip: lower <code>IMAGE_CACHE_TTL_DAYS</code> in your environment and then run this job to reduce disk usage on space-constrained systems.</div>
-            </div>
-          </div>
-
+          <p class="small text-secondary mb-2" id="runModalDesc"></p>
+          <div class="mb-3" id="runModalMeta"></div>
+          <form id="runModalForm" class="row g-2" onsubmit="return false"></form>
+          <div id="runModalFeedback" class="mt-2"></div>
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+          <button type="button" class="btn btn-primary btn-sm" id="runModalStart">
+            <i class="bi bi-play-fill me-1"></i>Start
+          </button>
         </div>
       </div>
     </div>
   </div>
-
   <footer class="container my-4 small footer-note">
     <div class="d-flex justify-content-between">
       <span>CVProxy Dashboard</span>
@@ -712,252 +579,315 @@ DASHBOARD_HTML = """\
         statsPane.style.display = currentTab === 'stats' ? '' : 'none';
         jobsPane.style.display  = currentTab === 'jobs'  ? '' : 'none';
         timeFilterGroup.style.display = currentTab === 'stats' ? '' : 'none';
-        if (currentTab === 'jobs') { loadJobs(); loadSchedulerHistory(); }
+        if (currentTab === 'jobs') loadJobsTab();
       });
     });
 
     // -----------------------------------------------------------------------
-    // Shared job status badge
+    // Jobs tab
     // -----------------------------------------------------------------------
-    function jobStatusBadge(status) {
-      const map  = { running: 'text-bg-warning', done: 'text-bg-success', error: 'text-bg-danger', cancelled: 'text-bg-secondary' };
-      const icon = { running: 'bi-hourglass-split', done: 'bi-check-circle', error: 'bi-x-circle', cancelled: 'bi-slash-circle' };
-      return `<span class="badge ${map[status]||'text-bg-secondary'}">
-        <i class="bi ${icon[status]||'bi-question-circle'} me-1"></i>${status}
-      </span>`;
+    const STATUS_STYLE = {
+      running:   ['text-bg-primary',   'bi-arrow-repeat'],
+      done:      ['text-bg-success',   'bi-check-circle'],
+      partial:   ['text-bg-warning',   'bi-pause-circle'],
+      idle:      ['text-bg-secondary', 'bi-moon'],
+      skipped:   ['text-bg-secondary', 'bi-skip-forward'],
+      error:     ['text-bg-danger',    'bi-x-circle'],
+      cancelled: ['text-bg-dark',      'bi-slash-circle'],
+    };
+    const CATEGORIES = [['sync', 'Sync'], ['backfill', 'Backfill'], ['export', 'Export'],
+                        ['maintenance', 'Maintenance'], ['repair', 'Repair']];
+    const ESC = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
+    function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ESC[c]); }
+
+    function jobStatusBadge(status, title) {
+      const [cls, icon] = STATUS_STYLE[status] || ['text-bg-secondary', 'bi-question-circle'];
+      const tip = title ? ` title="${esc(title)}"` : '';
+      return `<span class="badge ${cls}"${tip}><i class="bi ${icon} me-1"></i>${esc(status)}</span>`;
+    }
+    function fmtSecs(s) {
+      if (s == null) return '-';
+      if (s < 1) return Math.round(s * 1000) + ' ms';
+      if (s < 60) return s.toFixed(1) + ' s';
+      const m = Math.floor(s / 60);
+      if (m < 60) return m + 'm ' + String(Math.floor(s % 60)).padStart(2, '0') + 's';
+      return Math.floor(m / 60) + 'h ' + String(m % 60).padStart(2, '0') + 'm';
+    }
+    function relTime(iso) {
+      if (!iso) return '-';
+      const d = new Date(iso), diff = (d - Date.now()) / 1000, a = Math.abs(diff);
+      const t = a < 60 ? Math.round(a) + 's' : a < 3600 ? Math.round(a / 60) + 'm'
+              : a < 86400 ? (a / 3600).toFixed(1) + 'h' : (a / 86400).toFixed(1) + 'd';
+      return `<span title="${esc(d.toLocaleString())}">${diff > 0 ? 'in ' + t : t + ' ago'}</span>`;
+    }
+    function progressBar(p) {
+      if (!p) return '';
+      const pct = p.total ? Math.min(100, Math.round(100 * p.done / p.total)) : 100;
+      const label = (p.total ? `${p.done}/${p.total}` : `${p.done}`) + (p.note ? ' · ' + p.note : '');
+      return `<div class="progress mt-1" style="height:5px"><div class="progress-bar progress-bar-striped progress-bar-animated" style="width:${pct}%"></div></div>
+              <div class="small text-secondary">${esc(label)}</div>`;
     }
 
-    // -----------------------------------------------------------------------
-    // Triggered (admin) jobs
-    // -----------------------------------------------------------------------
-    async function fetchJobs() {
-      const r = await fetch('/admin/jobs');
+    let catalog = [];
+    async function loadCatalog() {
+      const r = await fetch('/admin/jobs/catalog');
       if (!r.ok) throw new Error(r.status);
-      return r.json();
+      catalog = await r.json();
+      renderCatalog();
+      renderBacklog();
+      fillJobFilter();
     }
 
-    function renderJobs(jobs) {
-      const badge = document.getElementById('jobsBadge');
-      const running = jobs.filter(j => j.status === 'running').length;
-      if (running > 0) { badge.textContent = running; badge.style.display = ''; }
-      else badge.style.display = 'none';
+    function lastRunCell(j) {
+      if (j.running) {
+        return `${jobStatusBadge('running')} <span class="small">started ${relTime(j.running.started_at)}</span>${progressBar(j.running.progress)}`;
+      }
+      if (!j.last) return '<span class="text-secondary small">never</span>';
+      const l = j.last;
+      let html = `${jobStatusBadge(l.status, l.stop_text)} <span class="small">${relTime(l.finished_at || l.started_at)}</span>`
+               + `<div class="small text-secondary text-truncate" style="max-width:26rem" title="${esc(l.summary)}">${esc(l.summary)}</div>`;
+      if (!['done', 'idle'].includes(l.status)) {
+        html += `<div class="small text-secondary">last ok: ${j.last_ok ? relTime(j.last_ok.finished_at) : 'never'}</div>`;
+      }
+      return html;
+    }
 
-      const tbody = document.getElementById('jobsBody');
-      if (!jobs.length) {
-        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-secondary py-3">No jobs yet</td></tr>';
+    function renderCatalog() {
+      let html = '';
+      for (const [cat, label] of CATEGORIES) {
+        const jobs = catalog.filter(j => j.category === cat);
+        if (!jobs.length) continue;
+        html += `<tr class="table-active"><td colspan="5" class="small fw-semibold text-uppercase text-secondary">${label}</td></tr>`;
+        for (const j of jobs) {
+          const eps = j.endpoints.length
+            ? `<span class="small text-secondary ms-2">${j.endpoints.map(e => '/' + esc(e)).join(' ')}</span>` : '';
+          const off = j.disabled ? `<div class="small text-warning"><i class="bi bi-slash-circle me-1"></i>${esc(j.disabled)}</div>` : '';
+          const btn = j.manual && !j.disabled
+            ? `<button class="btn btn-sm btn-outline-primary run-btn text-nowrap" data-job="${esc(j.id)}" ${j.running ? 'disabled' : ''}><i class="bi bi-play-fill"></i> Run</button>` : '';
+          html += `<tr class="${j.disabled ? 'opacity-50' : ''}">
+              <td><span class="fw-semibold">${esc(j.name)}</span>${eps}
+                  <div class="small text-secondary job-desc">${esc(j.description)}</div>${off}</td>
+              <td class="small text-nowrap">${esc(j.schedule)}</td>
+              <td class="small text-nowrap">${j.next_run ? relTime(j.next_run) : '-'}</td>
+              <td style="min-width:15rem">${lastRunCell(j)}</td>
+              <td class="text-end">${btn}</td></tr>`;
+        }
+      }
+      const body = document.getElementById('catalogBody');
+      body.innerHTML = html || '<tr><td colspan="5" class="text-center text-secondary py-3">No jobs</td></tr>';
+      body.querySelectorAll('.run-btn').forEach(b => b.addEventListener('click', () => openRunModal(b.dataset.job)));
+
+      const running = catalog.filter(j => j.running).length;
+      const badge = document.getElementById('jobsBadge');
+      if (running) { badge.textContent = running; badge.style.display = ''; } else badge.style.display = 'none';
+      const failing = catalog.filter(j => j.last && j.last.status === 'error').map(j => j.name);
+      document.getElementById('jobsHealth').innerHTML = failing.length
+        ? `<span class="text-danger" title="${esc(failing.join(', '))}"><i class="bi bi-exclamation-octagon me-1"></i>${failing.length} job(s) failed on their last run</span>`
+        : '<span class="text-success"><i class="bi bi-check-circle me-1"></i>No job failed on its last run</span>';
+    }
+
+    function renderBacklog() {
+      const snap = catalog.find(j => j.id === 'queue_snapshot');
+      const run = snap && snap.last_ok;
+      const body = document.getElementById('backlogBody');
+      if (!run || !run.result) {
+        body.innerHTML = '<span class="text-secondary small">No snapshot yet. Run "Backlog snapshot" to take one (read-only, a few minutes).</span>';
         return;
       }
+      const r = run.result;
+      document.getElementById('backlogAsOf').innerHTML = 'snapshot ' + relTime(run.finished_at);
+      const pending = Object.entries(r.pending_fetch || {}).map(([k, v]) => `${k} ${v}`).join(', ') || 'empty';
+      const cache = Object.values(r.response_cache || {}).reduce((a, b) => a + b, 0);
+      const items = [
+        ['Issues without details', r.issues_missing_details, 'Issue detail backfill'],
+        ['Issues missing fields', r.issues_missing_fields, 'Issue backfill'],
+        ['Volumes missing fields', r.volumes_missing_fields, 'Volume backfill'],
+        ['Publishers missing fields', r.publishers_missing_fields, 'Publisher backfill'],
+        ['Newest issue / newest hashed', `${r.newest_issue_id} / ${r.newest_hashed_issue_id}`, 'Cover hash backfill'],
+        ['Pending fetch queue', pending, 'Pending fetch'],
+        ['Response cache rows', cache, 'Cache eviction'],
+        ['Sync watermark', r.sync_watermark, 'Incremental issue sync'],
+        ['Database / WAL', `${(r.db_bytes / 1073741824).toFixed(2)} GB / ${(r.wal_bytes / 1048576).toFixed(0)} MB`, 'WAL checkpoint'],
+      ];
+      body.innerHTML = '<div class="row g-2">' + items.map(([k, v, job]) =>
+        `<div class="col-6 col-md-4 col-xl-3"><div class="small text-secondary" title="Worked off by: ${esc(job)}">${k}</div>`
+        + `<div class="fw-semibold">${typeof v === 'number' ? v.toLocaleString() : esc(v ?? '-')}</div></div>`).join('') + '</div>';
+    }
 
-      tbody.innerHTML = jobs.map(j => {
-        const detailId = `detail-${j.job_id}`;
-        const params = Object.entries(j.params || {}).map(([k,v]) => `${k}: ${v}`).join(', ') || '\\u2014';
-        const resultJson = j.result ? JSON.stringify(j.result, null, 2) : null;
-        const canCancel = j.status === 'running';
+    function fillJobFilter() {
+      const sel = document.getElementById('histJob');
+      if (sel.options.length > 1) return;
+      [...catalog].sort((a, b) => a.name.localeCompare(b.name)).forEach(j => sel.add(new Option(j.name, j.id)));
+    }
+    // Run history
+    const HIST_PAGE = 50;
+    let histRows = [], histOffset = 0;
+    const openDetails = new Set();
 
-        return `
-          <tr data-job-id="${j.job_id}">
-            <td class="align-middle">
-              <i class="bi bi-chevron-right expand-btn" data-target="${detailId}" title="Expand"></i>
-            </td>
-            <td class="align-middle">
-              <span class="fw-semibold">${j.name || '\\u2014'}</span>
-              <span class="text-secondary small ms-2">${params}</span>
-            </td>
-            <td class="align-middle">${jobStatusBadge(j.status)}</td>
-            <td class="align-middle small">${j.started_at ? new Date(j.started_at).toLocaleString() : '\\u2014'}</td>
-            <td class="align-middle small">${j.finished_at ? new Date(j.finished_at).toLocaleString() : '\\u2014'}</td>
-            <td class="align-middle text-end">
-              ${canCancel
-                ? `<button class="btn btn-sm btn-outline-danger cancel-btn" data-job-id="${j.job_id}" title="Cancel job">
-                     <i class="bi bi-x-lg"></i> Cancel
-                   </button>`
-                : ''}
-            </td>
-          </tr>
-          <tr class="job-detail" id="${detailId}" style="display:none">
-            <td colspan="6" class="px-4 py-2">
-              <div class="mb-1 text-secondary small"><strong>Job ID:</strong> <code>${j.job_id}</code></div>
-              ${resultJson
-                ? `<div class="mb-1 text-secondary small"><strong>Result:</strong></div><pre>${resultJson}</pre>`
-                : '<span class="text-secondary small">No result yet.</span>'}
-            </td>
-          </tr>`;
+    async function loadHistory(append = false) {
+      if (!append) histOffset = 0;
+      const q = new URLSearchParams({limit: HIST_PAGE, offset: histOffset});
+      for (const [id, key] of [['histJob', 'job'], ['histStatus', 'status'], ['histTrigger', 'trigger']]) {
+        const v = document.getElementById(id).value;
+        if (v) q.set(key, v);
+      }
+      const r = await fetch('/admin/jobs?' + q);
+      if (!r.ok) throw new Error(r.status);
+      const rows = await r.json();
+      histRows = append ? histRows.concat(rows) : rows;
+      histOffset += rows.length;
+      document.getElementById('histMore').style.display = rows.length >= HIST_PAGE ? '' : 'none';
+      renderHistory();
+    }
+
+    function renderHistory() {
+      const body = document.getElementById('historyBody');
+      if (!histRows.length) {
+        body.innerHTML = '<tr><td colspan="7" class="text-center text-secondary py-3">No runs recorded yet.</td></tr>';
+        return;
+      }
+      body.innerHTML = histRows.map(j => {
+        const params = Object.entries(j.params || {}).filter(([, v]) => v !== '' && v != null)
+          .map(([k, v]) => `${k}=${String(v).length > 40 ? String(v).slice(0, 40) + '...' : v}`).join(' ');
+        const trig = j.trigger === 'manual' ? '<span class="badge text-bg-info ms-1">manual</span>' : '';
+        const cancel = j.status === 'running'
+          ? `<button class="btn btn-sm btn-outline-danger cancel-btn" data-run="${j.run_id}" title="Cancel"><i class="bi bi-x-lg"></i></button>` : '';
+        const open = openDetails.has(j.run_id);
+        const err = j.status === 'error' && j.error && j.error !== j.summary ? `<div class="text-danger">${esc(j.error)}</div>` : '';
+        return `<tr>
+            <td><i class="bi bi-chevron-right expand-btn ${open ? 'open' : ''}" data-run="${j.run_id}" title="Details"></i></td>
+            <td class="text-nowrap"><span class="fw-semibold">${esc(j.name)}</span>${trig}${params ? `<div class="small text-secondary">${esc(params)}</div>` : ''}</td>
+            <td>${jobStatusBadge(j.status, j.stop_text)}</td>
+            <td class="small text-nowrap">${relTime(j.started_at)}</td>
+            <td class="small text-nowrap">${fmtSecs(j.duration_s)}</td>
+            <td class="small">${esc(j.summary || '')}${j.status === 'running' ? progressBar(j.progress) : ''}${err}</td>
+            <td class="text-end">${cancel}</td></tr>
+          <tr class="job-detail" id="detail-${j.run_id}" style="${open ? '' : 'display:none'}">
+            <td colspan="7" class="px-4 py-2"><div class="detail-body small text-secondary">Loading&hellip;</div></td></tr>`;
       }).join('');
-
-      tbody.querySelectorAll('.expand-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const row = document.getElementById(btn.dataset.target);
-          const hidden = row.style.display === 'none';
-          row.style.display = hidden ? '' : 'none';
-          btn.classList.toggle('open', hidden);
-        });
-      });
-
-      tbody.querySelectorAll('.cancel-btn').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          btn.disabled = true;
-          try {
-            await fetch(`/admin/jobs/${btn.dataset.jobId}`, { method: 'DELETE' });
-            await loadJobs();
-          } catch(e) { console.error('Cancel failed:', e); btn.disabled = false; }
-        });
-      });
+      body.querySelectorAll('.expand-btn').forEach(btn => btn.addEventListener('click', () => {
+        const id = btn.dataset.run, row = document.getElementById('detail-' + id);
+        const show = row.style.display === 'none';
+        row.style.display = show ? '' : 'none';
+        btn.classList.toggle('open', show);
+        if (show) { openDetails.add(id); loadDetail(id); } else openDetails.delete(id);
+      }));
+      body.querySelectorAll('.cancel-btn').forEach(btn => btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        const r = await fetch('/admin/jobs/' + btn.dataset.run, {method: 'DELETE'});
+        if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.detail || 'Cancel failed'); }
+        loadJobsTab();
+      }));
+      for (const id of openDetails) loadDetail(id);
     }
 
-    async function loadJobs() {
-      try { renderJobs(await fetchJobs()); }
-      catch(e) { console.error('Jobs load failed:', e); }
+    async function loadDetail(runId) {
+      const row = document.getElementById('detail-' + runId);
+      if (!row) return;
+      const r = await fetch('/admin/jobs/' + runId);
+      if (!r.ok) return;
+      const j = await r.json();
+      const meta = [
+        `run ${j.run_id.slice(0, 8)}`, `trigger: ${j.trigger}`,
+        j.started_at && `started ${new Date(j.started_at).toLocaleString()}`,
+        j.finished_at && `finished ${new Date(j.finished_at).toLocaleString()}`,
+        j.stop_text && `stopped: ${j.stop_text}`,
+      ].filter(Boolean).join(' | ');
+      const log = (j.log || []).join('\\n');
+      const dropped = j.log_dropped ? ` (newest ${j.log.length} lines; ${j.log_dropped} earlier lines dropped)` : '';
+      row.querySelector('.detail-body').innerHTML = `<div class="mb-1">${esc(meta)}</div>`
+        + (j.error ? `<div class="text-danger mb-1">${esc(j.error)}</div>` : '')
+        + (j.result ? `<div class="fw-semibold mt-2">Result</div><pre>${esc(JSON.stringify(j.result, null, 2))}</pre>` : '')
+        + `<div class="fw-semibold mt-2">Log${dropped}</div><pre class="job-log">${esc(log) || 'no log lines'}</pre>`;
     }
 
+    // Run modal
+    let runModal = null, modalJob = null;
+    function paramField(p) {
+      const id = 'param-' + p.name, help = p.help ? `<div class="form-text">${esc(p.help)}</div>` : '';
+      if (p.kind === 'bool') {
+        return `<div class="col-12"><div class="form-check"><input class="form-check-input" type="checkbox" id="${id}" ${p.default ? 'checked' : ''}>
+                <label class="form-check-label" for="${id}">${esc(p.label)}</label>${help}</div></div>`;
+      }
+      if (p.kind === 'text') {
+        return `<div class="col-12"><label class="form-label small mb-1" for="${id}">${esc(p.label)}</label>
+                <textarea class="form-control form-control-sm font-monospace" rows="3" id="${id}">${esc(p.default)}</textarea>${help}</div>`;
+      }
+      const num = p.kind === 'int' || p.kind === 'float';
+      return `<div class="col-6 col-md-4"><label class="form-label small mb-1" for="${id}">${esc(p.label)}</label>
+              <input class="form-control form-control-sm" type="${num ? 'number' : 'text'}" step="${p.kind === 'float' ? 'any' : '1'}" id="${id}"
+                value="${esc(p.default)}" ${p.min != null ? `min="${p.min}"` : ''} ${p.max != null ? `max="${p.max}"` : ''}>${help}</div>`;
+    }
+    function openRunModal(id) {
+      modalJob = catalog.find(j => j.id === id);
+      if (!modalJob) return;
+      document.getElementById('runModalTitle').textContent = 'Run: ' + modalJob.name;
+      document.getElementById('runModalDesc').textContent = modalJob.description;
+      const meta = [
+        modalJob.schedule,
+        modalJob.endpoints.length ? 'ComicVine: ' + modalJob.endpoints.map(e => '/' + e).join(', ') : 'No ComicVine API calls',
+        modalJob.cancellable ? null : 'Cannot be cancelled once started',
+      ].filter(Boolean);
+      document.getElementById('runModalMeta').innerHTML = meta.map(t => `<span class="badge text-bg-secondary me-1">${esc(t)}</span>`).join('');
+      document.getElementById('runModalForm').innerHTML = modalJob.params.map(paramField).join('')
+        || '<div class="col-12 small text-secondary">No parameters.</div>';
+      document.getElementById('runModalFeedback').innerHTML = modalJob.destructive
+        ? '<div class="alert alert-warning py-1 small mb-0"><i class="bi bi-exclamation-triangle me-1"></i>This job can delete data. Check the options before starting.</div>' : '';
+      document.getElementById('runModalStart').disabled = false;
+      runModal = runModal || new bootstrap.Modal(document.getElementById('runModal'));
+      runModal.show();
+    }
+    document.getElementById('runModalStart').addEventListener('click', async () => {
+      const btn = document.getElementById('runModalStart');
+      const params = {};
+      for (const p of modalJob.params) {
+        const el = document.getElementById('param-' + p.name);
+        params[p.name] = p.kind === 'bool' ? el.checked : el.value;
+      }
+      const deletes = modalJob.destructive && (params.dry_run === false || params.purge === true);
+      if (deletes && !confirm(`${modalJob.name} will delete data. Continue?`)) return;
+      btn.disabled = true;
+      try {
+        const r = await fetch(`/admin/jobs/${modalJob.id}/run`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(params),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || r.status);
+        runModal.hide();
+        openDetails.add(d.run_id);
+        await loadJobsTab();
+      } catch (e) {
+        document.getElementById('runModalFeedback').innerHTML =
+          `<div class="alert alert-danger py-1 small mb-0"><i class="bi bi-x-circle me-1"></i>${esc(e.message)}</div>`;
+        btn.disabled = false;
+      }
+    });
+
+    async function loadJobsTab() {
+      try { await Promise.all([loadCatalog(), loadHistory()]); }
+      catch (e) { console.error('Jobs load failed:', e); }
+    }
+    ['histJob', 'histStatus', 'histTrigger'].forEach(id =>
+      document.getElementById(id).addEventListener('change', () => loadHistory()));
+    document.getElementById('histMore').addEventListener('click', () => loadHistory(true));
     document.getElementById('refreshJobsBtn').addEventListener('click', () => {
       const icon = document.querySelector('#refreshJobsBtn .bi');
       icon.classList.add('spin');
-      Promise.all([loadJobs(), loadSchedulerHistory()]).finally(() => setTimeout(() => icon.classList.remove('spin'), 400));
+      loadJobsTab().finally(() => setTimeout(() => icon.classList.remove('spin'), 400));
     });
 
-    // -----------------------------------------------------------------------
-    // Scheduler history
-    // -----------------------------------------------------------------------
-    async function loadSchedulerHistory() {
-      try {
-        const r = await fetch('/admin/scheduler/history');
-        if (!r.ok) return;
-        renderSchedulerHistory(await r.json());
-      } catch(e) { console.error('Scheduler history load failed:', e); }
-    }
-
-    function fmtDuration(entry) {
-      if (entry.status === 'running') return '<span class="text-warning">running\\u2026</span>';
-      if (!entry.started_at || !entry.finished_at) return '\\u2014';
-      const secs = (new Date(entry.finished_at) - new Date(entry.started_at)) / 1000;
-      return secs >= 60 ? (secs / 60).toFixed(1) + ' m' : secs.toFixed(1) + ' s';
-    }
-
-    function fmtResult(result) {
-      if (!result) return '<span class="text-secondary">\\u2014</span>';
-      if (result.error) return `<span class="text-danger small">${result.error}</span>`;
-      return Object.entries(result)
-        .map(([k, v]) => `<span class="text-secondary small">${k.replace(/_/g,' ')}:</span> <strong>${v}</strong>`)
-        .join(' &nbsp; ');
-    }
-
-    function renderSchedulerHistory(entries) {
-      const badge = document.getElementById('schedulerHistoryCount');
-      if (entries.length) { badge.textContent = entries.length; badge.style.display = ''; }
-      else badge.style.display = 'none';
-
-      const tbody = document.getElementById('schedulerHistoryBody');
-      if (!entries.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="text-center text-secondary py-3">No scheduler runs recorded yet — runs appear here after the first scheduled job fires.</td></tr>';
+    // Live updates: the whole tab while it is open, otherwise just the running-jobs badge
+    function refreshJobsBadge() {
+      if (currentTab === 'jobs') {
+        if (!document.querySelector('.modal.show')) loadJobsTab();
         return;
       }
-      tbody.innerHTML = entries.map(e => `
-        <tr>
-          <td class="fw-semibold">${e.name}</td>
-          <td>${jobStatusBadge(e.status)}</td>
-          <td class="small">${e.started_at ? new Date(e.started_at).toLocaleString() : '\\u2014'}</td>
-          <td class="small">${fmtDuration(e)}</td>
-          <td class="small">${fmtResult(e.result)}</td>
-        </tr>
-      `).join('');
-    }
-
-    // -----------------------------------------------------------------------
-    // Run job form
-    // -----------------------------------------------------------------------
-    const jobTypeEl        = document.getElementById('jobType');
-    const daysWrap         = document.getElementById('daysFieldWrap');
-    const batchWrap        = document.getElementById('batchFieldWrap');
-    const calendarOnlyWrap = document.getElementById('calendarOnlyWrap');
-    const dryRunWrap       = document.getElementById('dryRunWrap');
-    const evictInfoWrap    = document.getElementById('evictInfoWrap');
-    const runJobBtn        = document.getElementById('runJobBtn');
-    const jobFeedback      = document.getElementById('runJobFeedback');
-
-    let _evictSettings = null;
-
-    function updateEvictInfo(settings) {
-      _evictSettings = settings;
-      const el = document.getElementById('evictInfoText');
-      if (!settings) { el.textContent = 'Eviction settings unavailable.'; return; }
-      const parts = [];
-      if (settings.evict_older_than_years > 0)
-        parts.push(`issues/volumes older than <strong>${settings.evict_older_than_years} years</strong> (unaccessed for ${settings.evict_unaccessed_days}d)`);
-      if (settings.response_cache_ttl_days > 0)
-        parts.push(`response cache entries older than <strong>${settings.response_cache_ttl_days} days</strong>`);
-      if (settings.search_cache_ttl_days > 0)
-        parts.push(`search cache entries older than <strong>${settings.search_cache_ttl_days} days</strong>`);
-      if (settings.cache_cutoff_year > 0)
-        parts.push(`ingest filter: skipping content before <strong>${settings.cache_cutoff_year}</strong> (already applied on write)`);
-      el.innerHTML = parts.length
-        ? '<i class="bi bi-gear me-1"></i>Will evict: ' + parts.join(' &bull; ')
-        : '<i class="bi bi-exclamation-triangle me-1 text-warning"></i>No eviction configured — set <code>EVICT_OLDER_THAN_YEARS</code> or <code>RESPONSE_CACHE_TTL_DAYS</code> to enable.';
-    }
-
-    jobTypeEl.addEventListener('change', () => {
-      const v = jobTypeEl.value;
-      daysWrap.style.display         = v === 'sync-issues'       ? '' : 'none';
-      batchWrap.style.display        = v === 'repair-publishers' ? '' : 'none';
-      calendarOnlyWrap.style.display = v === 'repair-publishers' ? '' : 'none';
-      dryRunWrap.style.display       = v === 'evict'             ? '' : 'none';
-      evictInfoWrap.style.display    = v === 'evict'             ? '' : 'none';
-      if (v === 'evict' && !_evictSettings) {
-        fetch('/dashboard/data').then(r => r.json()).then(d => updateEvictInfo(d.eviction_settings || null)).catch(() => {});
-      }
-    });
-
-    runJobBtn.addEventListener('click', async () => {
-      runJobBtn.disabled = true;
-      jobFeedback.style.display = 'none';
-      try {
-        let url, resp;
-        if (jobTypeEl.value === 'sync-issues') {
-          const days = parseFloat(document.getElementById('syncDays').value) || 14;
-          url = `/admin/sync/issues?days=${days}`;
-        } else if (jobTypeEl.value === 'repair-publishers') {
-          const batch   = parseInt(document.getElementById('repairBatch').value) || 100;
-          const calOnly = document.getElementById('calendarOnly').checked;
-          url = `/admin/repair/publishers?batch_size=${batch}&calendar_only=${calOnly}`;
-        } else if (jobTypeEl.value === 'evict') {
-          const dryRun = document.getElementById('evictDryRun').checked;
-          url = `/admin/evict?dry_run=${dryRun}`;
-        } else if (jobTypeEl.value === 'cleanup-images') {
-          url = '/admin/cleanup/images';
-        } else {
-          url = '/admin/rebuild/fts';
-        }
-        resp = await fetch(url, { method: 'POST' });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.detail || resp.status);
-        jobFeedback.innerHTML =
-          `<div class="alert alert-success py-1 mb-0 small">
-             <i class="bi bi-check-circle me-1"></i>
-             Job started &mdash; ID: <code>${data.job_id}</code>
-           </div>`;
-        jobFeedback.style.display = '';
-        await loadJobs();
-      } catch(e) {
-        jobFeedback.innerHTML =
-          `<div class="alert alert-danger py-1 mb-0 small">
-             <i class="bi bi-x-circle me-1"></i> ${e.message}
-           </div>`;
-        jobFeedback.style.display = '';
-      } finally {
-        runJobBtn.disabled = false;
-      }
-    });
-
-    // Keep jobs badge updated even when on stats tab
-    function refreshJobsBadge() {
-      fetchJobs().then(jobs => {
+      fetch('/admin/jobs?status=running&limit=50').then(r => r.json()).then(runs => {
         const badge = document.getElementById('jobsBadge');
-        const running = jobs.filter(j => j.status === 'running').length;
-        if (running > 0) { badge.textContent = running; badge.style.display = ''; }
+        if (runs.length) { badge.textContent = runs.length; badge.style.display = ''; }
         else badge.style.display = 'none';
-        if (currentTab === 'jobs') renderJobs(jobs);
       }).catch(() => {});
     }
-
     // Boot
     load();
     startAutoRefresh();

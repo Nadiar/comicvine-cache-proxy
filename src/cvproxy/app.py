@@ -6,14 +6,12 @@ import asyncio
 import json
 import logging
 import time
-import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import parse_qs
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -22,16 +20,9 @@ from cvproxy.cv_client import CVClient
 from cvproxy.dashboard import DASHBOARD_HTML
 from cvproxy.db import Database
 from cvproxy.image_cache import ImageCache
+from cvproxy.jobs import STATUSES, JobError, JobHistory, JobRunner
 from cvproxy.routes.api import router as api_router
-from cvproxy.scheduler import (
-    _backfill_from_mcl,
-    _export_comicvine_db,
-    _refresh_mcl,
-    create_scheduler,
-    evict_stale_data,
-    get_scheduler_log,
-    sync_recent_issues,
-)
+from cvproxy.scheduler import build_job_specs, create_scheduler
 from cvproxy.stats import StatsTracker
 from cvproxy.watchdog import LoopWatchdog
 
@@ -252,12 +243,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     watchdog = LoopWatchdog(asyncio.get_running_loop())
     watchdog.start()
 
-    # Background scheduler
+    # Background jobs: one runner records scheduled and manual runs alike
+    jobs_db = settings.jobs_db_path or settings.stats_db_path.with_name("jobs.db")
+    runner = JobRunner(JobHistory(jobs_db))
+    runner.register(build_job_specs(settings, cache, db, client))
+    runner.startup()
+    app.state.jobs = runner
+    logger.info("Job runner ready: %d jobs, history in %s", len(runner.specs), jobs_db)
+
     scheduler = None
     if settings.sync_enabled:
-        scheduler = create_scheduler(settings, cache, db, client)
+        scheduler = create_scheduler(settings, cache, db, client, runner)
         scheduler.start()
-        logger.info("Scheduler started")
+        logger.info("Scheduler started: %d scheduled jobs", len(scheduler.get_jobs()))
 
     yield
 
@@ -265,6 +263,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     watchdog.stop()
     if scheduler:
         scheduler.shutdown(wait=False)
+    runner.shutdown()
     await client.close()
     cache.close()
     stats.close()
@@ -360,97 +359,65 @@ def create_app() -> FastAPI:
             )
         return JSONResponse(content={"detail": "Not Found"}, status_code=404)
 
-    # Background job registry — keyed by job_id (uuid hex).
-    # Each entry: {"status": "running"|"done"|"error", "result": {...}, "started_at": str}
-    jobs: dict[str, dict[str, Any]] = {}
-    app.state.jobs = jobs
+    # -- background jobs -----------------------------------------------------
 
-    _MAX_JOBS = 200
+    def _runner() -> JobRunner:
+        runner: JobRunner = app.state.jobs
+        return runner
 
-    def _trim_jobs() -> None:
-        """Keep only the most recent _MAX_JOBS entries; drop the oldest finished ones."""
-        jobs = app.state.jobs
-        if len(jobs) <= _MAX_JOBS:
-            return
-        finished = sorted(
-            ((jid, job) for jid, job in jobs.items() if job["status"] != "running"),
-            key=lambda x: x[1]["started_at"],
-        )
-        for jid, _ in finished[: len(jobs) - _MAX_JOBS]:
-            del jobs[jid]
-
-    def _start_job(name: str, params: dict[str, Any], coro: Any) -> str:
-        """Register a job, start it as a background asyncio task, return its ID."""
-        _trim_jobs()
-        job_id = uuid.uuid4().hex
-        task_holder: dict[str, Any] = {}
-        app.state.jobs[job_id] = {
-            "name": name,
-            "params": params,
-            "status": "running",
-            "started_at": datetime.now(UTC).isoformat(),
-            "finished_at": None,
-            "result": None,
-            "_task": task_holder,  # holds the asyncio.Task for cancellation
+    def _start(job: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        try:
+            run = _runner().start(job, params)
+        except JobError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return {
+            "status": "started", "job_id": run.run_id, "run_id": run.run_id,
+            "job": job, "params": run.params,
         }
 
-        async def _wrap() -> None:
-            try:
-                result = await coro
-                app.state.jobs[job_id]["status"] = "done"
-                app.state.jobs[job_id]["result"] = result
-            except asyncio.CancelledError:
-                app.state.jobs[job_id]["status"] = "cancelled"
-                app.state.jobs[job_id]["result"] = None
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Background job %s failed", job_id)
-                app.state.jobs[job_id]["status"] = "error"
-                app.state.jobs[job_id]["result"] = {"error": str(exc)}
-            finally:
-                app.state.jobs[job_id]["finished_at"] = datetime.now(UTC).isoformat()
-
-        task = asyncio.create_task(_wrap())
-        task_holder["task"] = task
-        return job_id
-
-    def _public_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
-        """Return a job dict safe to serialise (strip internal _task ref)."""
-        return {k: v for k, v in {**job, "job_id": job_id}.items() if not k.startswith("_")}
-
-    # Admin — list all jobs
     @app.get("/admin/jobs")
-    def admin_jobs_list() -> list[dict[str, Any]]:
-        """Return all background jobs, most recent first."""
-        jobs = app.state.jobs
-        return [
-            _public_job(jid, job)
-            for jid, job in sorted(jobs.items(), key=lambda x: x[1]["started_at"], reverse=True)
-        ]
+    def admin_jobs_list(
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        job: str | None = Query(default=None, description="Only runs of this job id"),
+        status: str | None = Query(default=None, description="|".join(STATUSES)),
+        trigger: str | None = Query(default=None, description="schedule | manual"),
+    ) -> list[dict[str, Any]]:
+        """Job runs (scheduled and manual), newest first; live runs show progress."""
+        return _runner().list_runs(
+            limit=limit, offset=offset, job_id=job, status=status, trigger=trigger
+        )
 
-    # Admin — poll single job status
-    @app.get("/admin/jobs/{job_id}")
-    def admin_job_status(job_id: str) -> dict[str, Any]:
-        """Return the current status of a background admin job."""
-        job = app.state.jobs.get(job_id)
-        if job is None:
+    @app.get("/admin/jobs/catalog")
+    def admin_jobs_catalog() -> list[dict[str, Any]]:
+        """Every job: description, schedule, next run, parameters, latest runs."""
+        return _runner().catalog()
+
+    @app.get("/admin/jobs/{run_id}")
+    def admin_job_status(run_id: str) -> dict[str, Any]:
+        """One run, including the log lines it wrote."""
+        run = _runner().get(run_id)
+        if run is None:
             raise HTTPException(status_code=404, detail="Job not found")
-        return _public_job(job_id, job)
+        return run
 
-    # Admin — cancel a running job
-    @app.delete("/admin/jobs/{job_id}")
-    def admin_job_cancel(job_id: str) -> dict[str, Any]:
-        """Cancel a running background job."""
-        job = app.state.jobs.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="Job not found")
-        if job["status"] != "running":
-            return _public_job(job_id, job)
-        task = job.get("_task", {}).get("task")
-        if task and not task.done():
-            task.cancel()
-        return _public_job(job_id, job)
+    @app.delete("/admin/jobs/{run_id}")
+    def admin_job_cancel(run_id: str) -> dict[str, Any]:
+        """Cancel a running job run."""
+        try:
+            return _runner().cancel(run_id)
+        except JobError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
-    # Admin — one-off sync trigger
+    @app.post("/admin/jobs/{job}/run")
+    async def admin_job_run(
+        job: str, params: Annotated[dict[str, Any] | None, Body()] = None
+    ) -> dict[str, Any]:
+        """Start any job by id now; the body holds its parameters (see the catalog)."""
+        return _start(job, params)
+
+    # Older per-job endpoints, kept for scripts; they start the same jobs.
+
     @app.post("/admin/sync/issues")
     async def admin_sync_issues(
         days: float = Query(
@@ -460,289 +427,57 @@ def create_app() -> FastAPI:
             le=365,
         ),
     ) -> dict[str, Any]:
-        """Trigger an on-demand incremental issue sync for a wider time window.
+        """Issue re-sync over a time window (does not move the watermark)."""
+        return {**_start("issue_resync", {"days": days}), "window_hours": int(days * 24)}
 
-        Returns immediately with a job_id; poll GET /admin/jobs/{job_id} for status.
-        Useful for refreshing stale cached records corrected on ComicVine before
-        the scheduled sync's watermark.  Does not move the watermark.
-        """
-        hours = int(days * 24)
-        client = app.state.cv_client
-        db: Database = app.state.db
-        logger.info("Admin sync triggered: last %.1f days (%d hours)", days, hours)
-
-        async def _run() -> dict[str, Any]:
-            await sync_recent_issues(client, db, hours)
-            return {"window_hours": hours}
-
-        job_id = _start_job("Issue sync", {"days": days, "window_hours": hours}, _run())
-        return {"status": "started", "job_id": job_id, "window_hours": hours}
-
-    # Admin — publisher ID repair
     @app.post("/admin/repair/publishers")
     async def admin_repair_publishers(
-        batch_size: int = Query(
-            default=100,
-            description="Number of volumes to fetch per upstream API call.",
-            ge=10,
-            le=100,
-        ),
-        calendar_only: bool = Query(
-            default=True,
-            description=(
-                "Only repair volumes referenced by calendar issues (store_date IS NOT NULL). "
-                "Much faster than repairing all 150k+ volumes."
-            ),
-        ),
+        batch_size: int = Query(default=100, ge=10, le=100),
+        calendar_only: bool = Query(default=True),
     ) -> dict[str, Any]:
-        """Re-sync publisher IDs for locally cached volumes.
-
-        Returns immediately with a job_id; poll GET /admin/jobs/{job_id} for status.
-
-        When localcv.db was originally created by an external tool (e.g. an
-        older sqlite_cv_updater.py) it may use sequential auto-increment
-        publisher IDs instead of ComicVine's canonical IDs.  This endpoint
-        batch-fetches ``id,publisher`` from the CV API for the selected volumes
-        and writes the correct CV publisher IDs back into
-        ``cv_volume.publisher_id`` and ``cv_publisher``.
-
-        Set ``calendar_only=false`` to repair all 150k+ volumes (slow, burns
-        most of the hourly CV API quota).
-        """
-        db: Database = app.state.db
-        cv_client = app.state.cv_client
-
-        async def _run() -> dict[str, Any]:
-            fetch_fn = db.get_calendar_volume_ids if calendar_only else db.get_all_volume_ids
-            volume_ids = fetch_fn()  # shared connection: stay on the loop thread
-            total = len(volume_ids)
-            logger.info(
-                "Publisher repair: %d volumes queued (batch_size=%d, calendar_only=%s)",
-                total, batch_size, calendar_only,
-            )
-            volumes_updated = 0
-            publishers_seen: set[int] = set()
-            errors = 0
-
-            for i in range(0, total, batch_size):
-                chunk = volume_ids[i : i + batch_size]
-                id_filter = "|".join(str(v) for v in chunk)
-
-                data = await cv_client.get(
-                    "volumes/",
-                    {
-                        "filter": f"id:{id_filter}",
-                        "field_list": "id,publisher",
-                        "limit": batch_size,
-                        "offset": 0,
-                    },
-                )
-                if not data:
-                    logger.warning(
-                        "Publisher repair: upstream failed for batch %d-%d", i, i + len(chunk)
-                    )
-                    errors += len(chunk)
-                    continue
-
-                for vol in data.get("results") or []:
-                    vid = vol.get("id")
-                    pub = vol.get("publisher") or {}
-                    pid = pub.get("id")
-                    if not vid or not pid:
-                        continue
-                    try:
-                        db.upsert_publisher(pub)
-                        db.update_volume_publisher(vid, pid)
-                        volumes_updated += 1
-                        publishers_seen.add(pid)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("Publisher repair: volume %s: %s", vid, exc)
-                        errors += 1
-
-                logger.info(
-                    "Publisher repair: %d/%d volumes processed",
-                    min(i + batch_size, total),
-                    total,
-                )
-
-            logger.info(
-                "Publisher repair done: %d updated, %d publishers, %d errors",
-                volumes_updated, len(publishers_seen), errors,
-            )
-            return {
-                "volumes_total": total,
-                "volumes_updated": volumes_updated,
-                "publishers_updated": len(publishers_seen),
-                "errors": errors,
-            }
-
-        job_id = _start_job(
-            "Publisher repair",
-            {"batch_size": batch_size, "calendar_only": calendar_only},
-            _run(),
+        """Re-sync publisher IDs for cached volumes."""
+        started = _start(
+            "publisher_repair", {"batch_size": batch_size, "calendar_only": calendar_only}
         )
-        return {"status": "started", "job_id": job_id, "calendar_only": calendar_only}
+        return {**started, "calendar_only": calendar_only}
 
-    # Admin — cache eviction trigger
     @app.post("/admin/evict")
     async def admin_evict(
-        dry_run: bool = Query(
-            default=True,
-            description=(
-                "Preview candidate counts without deleting (safe default). Set false to evict."
-            ),
-        ),
+        dry_run: bool = Query(default=True, description="Count only (safe default)."),
     ) -> dict[str, Any]:
-        """Trigger cache eviction based on current eviction settings.
+        """Cache eviction with the configured settings."""
+        return {**_start("evict_stale_data", {"dry_run": dry_run}), "dry_run": dry_run}
 
-        Returns immediately with job_id; poll GET /admin/jobs/{job_id} for result.
-        dry_run=true (default) returns counts of what would be removed without deleting.
-        Eviction has no effect when evict_older_than_years=0 and response_cache_ttl_days=0.
-        """
-        db: Database = app.state.db
-        settings = get_settings()
-
-        async def _run() -> dict[str, Any]:
-            if settings.evict_older_than_years <= 0 and settings.response_cache_ttl_days <= 0:
-                return {
-                    "dry_run": dry_run,
-                    "issues": 0,
-                    "volumes": 0,
-                    "response_cache": 0,
-                    "note": (
-                        "Eviction disabled — set EVICT_OLDER_THAN_YEARS or RESPONSE_CACHE_TTL_DAYS"
-                    ),
-                }
-
-            access_expiry = (
-                datetime.now(UTC) - timedelta(days=settings.evict_unaccessed_days)
-            ).strftime("%Y-%m-%d %H:%M:%S")
-
-            if dry_run:
-                counts: dict[str, Any] = {"dry_run": True}
-                if settings.evict_older_than_years > 0:
-                    cutoff = (
-                        date.today() - timedelta(days=settings.evict_older_than_years * 365)
-                    ).isoformat()
-                    counts.update(db.count_eviction_candidates(cutoff, access_expiry))
-                else:
-                    counts.update({"issues": 0, "volumes": 0})
-                if settings.response_cache_ttl_days > 0:
-                    cache_cutoff = (
-                        datetime.now(UTC) - timedelta(days=settings.response_cache_ttl_days)
-                    ).strftime("%Y-%m-%d %H:%M:%S")
-                    counts["response_cache"] = db.count_response_cache_before(cache_cutoff)
-                else:
-                    counts["response_cache"] = 0
-                return counts
-
-            result = await evict_stale_data(db, settings)
-            return {"dry_run": False, **(result or {})}
-
-        job_id = _start_job("Cache eviction", {"dry_run": dry_run}, _run())
-        return {"status": "started", "job_id": job_id, "dry_run": dry_run}
-
-    # Admin — comicvine.db export
     @app.post("/admin/export/comicvine-db")
     async def admin_export_comicvine_db() -> dict[str, Any]:
-        """Write the ComicManager-compatible comicvine.db now (CV_DB_EXPORT_PATH).
+        """Write the ComicManager-compatible comicvine.db now (CV_DB_EXPORT_PATH)."""
+        started = _start("comicvine_db_export")
+        return {**started, "path": str(get_settings().cv_db_export_path)}
 
-        Returns immediately with a job_id; poll GET /admin/jobs/{job_id} for status.
-        """
-        settings = get_settings()
-        if settings.cv_db_export_path is None:
-            raise HTTPException(status_code=400, detail="CV_DB_EXPORT_PATH is not set")
-        db: Database = app.state.db
-        job_id = _start_job(
-            "comicvine.db export",
-            {"path": str(settings.cv_db_export_path)},
-            _export_comicvine_db(db, settings),
-        )
-        return {"status": "started", "job_id": job_id, "path": str(settings.cv_db_export_path)}
-
-    # Admin — latest.mcl refresh and gap backfill
     @app.post("/admin/mcl/refresh")
     async def admin_refresh_mcl() -> dict[str, Any]:
         """Download the newest community latest.mcl now (MCL_EXPORT_PATH)."""
-        settings = get_settings()
-        if settings.mcl_export_path is None:
-            raise HTTPException(status_code=400, detail="MCL_EXPORT_PATH is not set")
-        job_id = _start_job("latest.mcl refresh", {}, _refresh_mcl(settings))
-        return {"status": "started", "job_id": job_id}
+        return _start("mcl_refresh")
 
     @app.post("/admin/mcl/backfill")
     async def admin_backfill_from_mcl() -> dict[str, Any]:
         """Fetch the volumes and issues latest.mcl lists but cvproxy doesn't have."""
-        settings = get_settings()
-        if settings.mcl_export_path is None:
-            raise HTTPException(status_code=400, detail="MCL_EXPORT_PATH is not set")
-        job_id = _start_job(
-            "MCL gap backfill", {},
-            _backfill_from_mcl(app.state.cv_client, app.state.db, settings),
-        )
-        return {"status": "started", "job_id": job_id}
+        return _start("mcl_gap_backfill")
 
-    # Admin — FTS index rebuild
     @app.post("/admin/rebuild/fts")
     async def admin_rebuild_fts() -> dict[str, Any]:
-        """Rebuild all FTS indexes (volume_fts, issue_fts, publisher_fts).
+        """Rebuild all FTS indexes."""
+        return _start("fts_rebuild")
 
-        Returns immediately with a job_id; poll GET /admin/jobs/{job_id} for status.
-        Only needed if an index becomes out of sync (e.g. after a manual DB import).
-        Under normal operation the triggers installed at startup keep all indexes current.
-        """
-        db: Database = app.state.db
-
-        async def _run() -> dict[str, Any]:
-            def _rebuild() -> dict[str, Any]:
-                exists = db.conn.execute(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='volume_fts'"
-                ).fetchone()[0]
-                if not exists:
-                    raise RuntimeError(
-                        "FTS tables do not exist — FTS5 is unavailable in this SQLite build"
-                    )
-                counts_before = {
-                    t: db.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-                    for t in ("volume_fts", "issue_fts", "publisher_fts")
-                }
-                for t in ("volume_fts", "issue_fts", "publisher_fts"):
-                    db.conn.execute(f"INSERT INTO {t}({t}) VALUES ('rebuild')")
-                db.conn.commit()
-                counts_after = {
-                    t: db.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-                    for t in ("volume_fts", "issue_fts", "publisher_fts")
-                }
-                return {"before": counts_before, "after": counts_after}
-
-            result = await asyncio.to_thread(_rebuild)
-            logger.info("FTS rebuild complete: %s", result)
-            return result
-
-        job_id = _start_job("FTS rebuild", {}, _run())
-        return {"status": "started", "job_id": job_id}
-
-    # Admin — image cache cleanup
     @app.post("/admin/cleanup/images")
     async def admin_cleanup_images() -> dict[str, Any]:
-        """Trigger immediate image cache cleanup (remove entries past TTL).
+        """Remove image cache entries past their TTL now."""
+        return _start("image_cache_cleanup")
 
-        Returns immediately with a job_id; poll GET /admin/jobs/{job_id} for status.
-        """
-        image_cache: ImageCache = app.state.image_cache
-
-        async def _run() -> dict[str, Any]:
-            removed = await asyncio.to_thread(image_cache.cleanup_expired)
-            return {"removed": removed}
-
-        job_id = _start_job("Image cache cleanup", {}, _run())
-        return {"status": "started", "job_id": job_id}
-
-    # Admin — scheduler job history
     @app.get("/admin/scheduler/history")
     def admin_scheduler_history() -> list[dict[str, Any]]:
-        """Return the last 100 scheduled background job runs, newest first."""
-        return get_scheduler_log()
+        """The last 100 scheduled runs, newest first."""
+        return _runner().list_runs(trigger="schedule", limit=100)
 
     app.include_router(api_router)
 

@@ -110,10 +110,18 @@ _FETCHERS: dict[str, _Fetcher] = {
 
 async def process_pending(
     client: CVClient, db: Database, limit: int = _BATCH
-) -> dict[str, int]:
-    """Fetch queued requests, oldest first, while their endpoint has budget."""
+) -> dict[str, int | str]:
+    """Fetch queued requests, oldest first, while their endpoint has budget.
+
+    The result's ``waiting`` is how many requests are still queued after the
+    run (``skipped`` of them were looked at but couldn't be asked yet).
+    """
     fetched = skipped = failed = 0
-    for item in db.pending_list(limit=limit):
+    items = db.pending_list(limit=limit)
+    if not items:
+        return {"fetched": 0, "skipped": 0, "failed": 0, "stop_reason": "nothing_to_do"}
+    refused = False
+    for item in items:
         kind, key = item["kind"], item["key"]
         endpoint = item["endpoint"]
         if (
@@ -125,6 +133,7 @@ async def process_pending(
         outcome = await _FETCHERS[kind](client, db, item["payload"])
         if outcome == "rate_limited":
             skipped += 1  # stays queued; a refusal isn't the item's fault
+            refused = True
         elif outcome == "failed":
             db.pending_failed(kind, key, max_attempts=MAX_ATTEMPTS)
             failed += 1
@@ -135,4 +144,8 @@ async def process_pending(
         logger.info(
             "Pending fetch: %d fetched, %d waiting, %d failed", fetched, skipped, failed
         )
-    return {"fetched": fetched, "skipped": skipped, "failed": failed}
+    result: dict[str, int | str] = {"fetched": fetched, "skipped": skipped, "failed": failed}
+    if not fetched and not failed:
+        # Everything queued is waiting for its endpoint's window or cooldown
+        result["stop_reason"] = "rate_limited" if refused else "waiting"
+    return result

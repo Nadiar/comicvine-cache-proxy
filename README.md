@@ -12,7 +12,7 @@ Drop-in replacement for the ComicVine API URL — point your tools (ComicTagger,
 - **Smart search cache** — full result pages cached; superset lookup (a cached "batman" query serves "absolute batman" without a new upstream call)
 - **On-demand image cache** — images fetched on first request, cached with sliding TTL
 - **Rate-limited upstream** — global per-minute limiter + per-endpoint hourly sliding window, matches CV's 200 req/hr limit
-- **Background scheduler** — nightly release prefetch, hourly entity backfill, daily incremental sync, periodic cache eviction
+- **Background jobs** — hourly incremental sync and backfills, daily prefetch/exports/maintenance, with a persistent run history
 - **XML format support** — responds with CV-compatible XML when `format=xml` is requested
 - **Stats dashboard** — live cache hit rate, per-client and per-endpoint breakdowns
 - **Admin API** — on-demand sync, publisher repair, cache eviction, FTS rebuild
@@ -59,7 +59,8 @@ All settings via environment variables:
 | `RATE_STATE_PATH` | `/data/rate_state.json` | Recent upstream call times and cooldown, kept across restarts |
 | `RATE_LIMIT_COOLDOWN_SECONDS` | `600` | Pause on all upstream calls after CV answers 420/429/107 (an upstream `Retry-After` wins) |
 | `SYNC_ENABLED` | `true` | Enable background scheduler |
-| `SYNC_CRON_HOUR` | `3` | UTC hour for daily sync jobs |
+| `SYNC_CRON_HOUR` | `3` | Hour (container time zone) for the daily jobs |
+| `JOBS_DB_PATH` | next to `STATS_DB_PATH` | Job run history |
 | `SEARCH_MAX_PAGES` | `5` | Max upstream pages fetched per search query (100 results/page). A cold search returns after the pages covering the request; the rest are fetched in the background. |
 | `RESPONSE_CACHE_TTL_DAYS` | `30` | TTL for generic resource cache; `0` = keep forever |
 | `SEARCH_CACHE_TTL_DAYS` | `60` | TTL for search result cache; `0` = keep forever |
@@ -109,21 +110,29 @@ http://your-server:8585/api/
 
 ### Admin
 
-All admin endpoints return immediately with a `job_id`. Poll `GET /admin/jobs/{job_id}` for status.
+Every background job, scheduled or manual, runs through one job runner and is
+recorded in `jobs.db` (next to `stats.db`, kept 30 days) with its trigger,
+parameters, status, stop reason, summary, duration, result and the log lines
+it wrote. The dashboard's Jobs tab shows the catalog, a backlog snapshot and
+the run history.
+
+Statuses: `done`, `partial` (stopped early: budget, rate limit, upstream
+error...; the next run continues), `idle` (nothing to do), `skipped`
+(disabled, previous run still going, missed start), `error`, `cancelled`.
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /admin/sync/issues` | Re-sync issues updated in the last N days (`?days=14`) |
-| `POST /admin/repair/publishers` | Re-fetch publisher IDs for cached volumes |
-| `POST /admin/evict` | Evict stale data (`?dry_run=true` previews without deleting) |
-| `POST /admin/cleanup/images` | Remove expired image cache entries immediately |
-| `POST /admin/rebuild/fts` | Rebuild FTS5 search indexes |
-| `POST /admin/export/comicvine-db` | Write the `comicvine.db` export now (needs `CV_DB_EXPORT_PATH`) |
-| `POST /admin/mcl/refresh` | Download the newest `latest.mcl` now (needs `MCL_EXPORT_PATH`) |
-| `POST /admin/mcl/backfill` | Fetch volumes/issues listed in `latest.mcl` but missing locally |
-| `GET /admin/jobs` | List all background jobs |
-| `GET /admin/jobs/{id}` | Poll job status |
-| `DELETE /admin/jobs/{id}` | Cancel a running job |
+| `GET /admin/jobs/catalog` | Every job: description, schedule, next run, parameters, last run, last good run |
+| `POST /admin/jobs/{job}/run` | Start a job now; JSON body holds its parameters (see the catalog) |
+| `GET /admin/jobs` | Runs, newest first (`?job=`, `?status=`, `?trigger=schedule\|manual`, `?limit=`, `?offset=`) |
+| `GET /admin/jobs/{run_id}` | One run, including its log lines |
+| `DELETE /admin/jobs/{run_id}` | Cancel a running run (not for jobs that work on a worker thread) |
+| `GET /admin/scheduler/history` | The last 100 scheduled runs |
+
+Older per-job endpoints still work and start the same jobs:
+`POST /admin/sync/issues?days=`, `/admin/repair/publishers`, `/admin/evict?dry_run=`,
+`/admin/cleanup/images`, `/admin/rebuild/fts`, `/admin/export/comicvine-db`,
+`/admin/mcl/refresh`, `/admin/mcl/backfill`.
 
 ## Cache Control
 
@@ -166,27 +175,40 @@ Use `POST /admin/evict?dry_run=true` (or the dashboard Jobs tab) to preview cand
 
 ## Background Scheduler
 
-When `SYNC_ENABLED=true`, the following jobs run automatically:
+When `SYNC_ENABLED=true`, these jobs run on a schedule (times are in the
+container's time zone; `H` = `SYNC_CRON_HOUR`). Manual-only jobs are listed
+after them. Every job can be started from the Jobs tab.
 
 | Job | Schedule | Description |
 | --- | --- | --- |
-| Releases prefetch | Daily at `SYNC_CRON_HOUR` | Fetches issues with `store_date` in a ±2 week window |
-| Incremental issue sync | Daily, 1h after prefetch | Re-fetches issues updated in the last 48h |
-| Volume backfill | Hourly at :30 | Re-fetches volumes missing new fields |
-| Issue backfill | Hourly at :45 | Re-fetches issues missing new fields |
-| Issue detail backfill | Hourly at :05 | Fetches credits for issues stored from list responses, newest first |
-| Publisher backfill | Every 6h at :15 | Re-fetches publishers missing new fields |
-| Search cache backfill | Every 2h at :50 | Fetches volumes seen in search results but not yet in DB |
-| Pending fetch | Every 2 min | Fetches requests that missed the cache while ComicVine was rate limiting, oldest first; backfill on that endpoint waits until they're done |
-| comicvine.db export | Daily at `SYNC_CRON_HOUR`+5 | Only when `CV_DB_EXPORT_PATH` is set; see below |
-| latest.mcl refresh | Daily at `SYNC_CRON_HOUR`+5:30 | Only when `MCL_EXPORT_PATH` is set; replaces the file only when it changed |
-| Cover hash backfill | Hourly at :20 | Only when `COVER_HASH_PER_HOUR` > 0; hashes covers of issues missing from `comic_covers`, newest first |
-| MCL gap backfill | Daily at `SYNC_CRON_HOUR`+6 | Fetches volumes and issues listed in `latest.mcl` but missing locally, 100 IDs per request |
-| Database backup | Daily at `SYNC_CRON_HOUR`+4 | Compacted snapshot (`VACUUM INTO`) in `BACKUP_DIR`, keeps `BACKUP_KEEP` |
-| Stale data eviction | Daily, 3h after prefetch | Removes expired entities (when eviction is configured) |
-| Image cache cleanup | Daily, 2h after prefetch | Removes expired image cache entries |
+| Incremental issue sync | Hourly at :10 | Issues changed since the stored watermark, in 24h slices; the watermark only moves over stored data |
+| Releases prefetch | Daily at H:00 | Issues with a store date from 2 weeks ago to 1 week ahead |
+| Pending fetch | Every 2 min | Cache misses queued while ComicVine couldn't be asked; idle runs aren't kept in history |
+| Issue detail backfill | Hourly at :05 | /issue/ details (credits) for issues stored from list responses, newest first |
+| Issue backfill | Hourly at :45 | Issues cached by older versions without the newer fields |
+| Volume backfill | Hourly at :30 | Volumes missing detail fields (calendar-relevant first) |
+| Publisher backfill | Every 6h at :15 | Publishers missing detail fields |
+| Search cache volume backfill | Every 2h at :50 | Volumes seen in cached searches but not stored |
+| MCL gap backfill | Daily at H+6 | Volumes and issues in `latest.mcl` but missing locally, 100 IDs per request |
+| Cover hash backfill | Hourly at :20 | Only when `COVER_HASH_PER_HOUR` > 0 |
+| comicvine.db export | Daily at H+5 | Only when `CV_DB_EXPORT_PATH` is set; see below |
+| latest.mcl refresh | Daily at H+5:30 | Only when `MCL_EXPORT_PATH` is set |
+| WAL checkpoint | Hourly at :40 | PASSIVE checkpoint on its own connection |
+| Cache eviction | Daily at H+3 | When eviction is configured; manual runs default to a dry run |
+| Image cache cleanup | Daily at H+2 | Images not accessed within `IMAGE_CACHE_TTL_DAYS` |
+| Database backup | Daily at H+4 | Only when `BACKUP_KEEP` > 0 |
+| Backlog snapshot | Daily at H+2:30 | Read-only counts of every backfill's remaining work (Backlog card) |
+| Response cache audit | Weekly, Sat H+1:30 | Reports cached error envelopes, unparseable rows and empty results |
+| Issue re-sync (time window) | Manual | Issues changed in the last N days; doesn't move the watermark |
+| Re-fetch issues | Manual | Specific issue IDs and/or a volume's issues, optional /issue/ details |
+| Response cache audit (purge) | Manual | Deletes error envelopes and unparseable rows |
+| Integrity check | Manual | `PRAGMA quick_check` (reads the whole file) |
+| Publisher repair | Manual | Canonical publisher IDs for cached volumes |
+| FTS rebuild | Manual | Rebuilds the full-text indexes |
 
-Backfill jobs are rate-paced to stay within the hourly CV API budget, leaving headroom for live proxy traffic.
+Backfill jobs share a per-endpoint budget (120 calls/h), pace their calls across
+the hour, yield to queued client requests and stop at the first ComicVine
+refusal, leaving headroom for live proxy traffic.
 
 ## comicvine.db Export (ComicManager)
 

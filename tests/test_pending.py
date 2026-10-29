@@ -149,7 +149,7 @@ async def test_pending_leaves_live_reserve_on_each_endpoint(tmp_db: Database) ->
 
     result = await process_pending(client, tmp_db)
 
-    assert result == {"fetched": 0, "skipped": 1, "failed": 0}
+    assert result == {"fetched": 0, "skipped": 1, "failed": 0, "stop_reason": "waiting"}
     client.get_issue.assert_not_called()
 
 

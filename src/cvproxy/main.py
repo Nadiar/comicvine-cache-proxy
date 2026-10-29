@@ -10,6 +10,7 @@ import uvicorn
 
 from cvproxy.app import create_app
 from cvproxy.config import get_settings
+from cvproxy.jobs import JobTagFilter, install_run_log_capture
 
 _API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+")
 
@@ -55,14 +56,29 @@ def install_api_key_redaction() -> None:
     logging.setLogRecordFactory(factory)
 
 
+def install_job_logging() -> None:
+    """Tag log lines written inside a job with "[job_id#run]" and keep its log.
+
+    APScheduler's own "Running job"/"executed successfully" lines are dropped:
+    the job runner logs a start and an end line with status and summary, and
+    the 2-minute pending fetch alone produced 1,400 of them a day.
+    """
+    tag = JobTagFilter()
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(tag)
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+    install_run_log_capture()
+
+
 def main() -> None:
     """Run the CVProxy server."""
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+        format="%(asctime)s %(levelname)-8s %(name)s  %(jobtag)s%(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     install_api_key_redaction()
+    install_job_logging()
 
     settings = get_settings()
     app = create_app()

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -580,6 +581,30 @@ def _parse_json_col(row: sqlite3.Row, col: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Database connection manager
 # ---------------------------------------------------------------------------
+
+
+#: Response-cache audit findings that are deleted when purging.
+_PURGEABLE_REASONS = frozenset({"error_envelope", "unparseable"})
+
+
+def _classify_cached_response(resource_type: str, data_json: str | None) -> str | None:
+    """Why a cached response looks bad, or None when it looks fine."""
+    if resource_type.startswith("negative:"):
+        return None  # intentionally empty
+    try:
+        data = json.loads(data_json or "")
+    except (TypeError, ValueError):
+        return "unparseable"
+    if isinstance(data, dict):
+        status = data.get("status_code", 1)
+        error = data.get("error", "OK")
+        if status not in (1, None) or error not in ("OK", None, ""):
+            return "error_envelope"
+        if "results" in data and data["results"] in (None, [], {}):
+            return "empty_results"
+    elif isinstance(data, list) and not data:
+        return "empty_list"
+    return None
 
 
 class Database:
@@ -1483,7 +1508,17 @@ class Database:
         Used by the backfill scheduler to ensure volumes found via search are
         eventually fully indexed.
         """
-        cur = self.conn.execute(
+        # Own read-only connection: this reads every cached search, which took
+        # minutes on the event loop once the cache grew (see the loop watchdog).
+        conn = self._ro_connect()
+        try:
+            return self._search_cache_missing_volume_ids(conn, limit)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _search_cache_missing_volume_ids(conn: sqlite3.Connection, limit: int) -> list[int]:
+        cur = conn.execute(
             "SELECT data_json FROM cv_response_cache WHERE resource_type='search'"
         )
         seen: set[int] = set()
@@ -1503,8 +1538,8 @@ class Database:
 
         # Filter to IDs not yet in cv_volume
         placeholders = ",".join("?" * len(seen))
-        cur2 = self.conn.execute(
-            f"SELECT id FROM cv_volume WHERE id IN ({placeholders})",
+        cur2 = conn.execute(
+            f"SELECT id FROM cv_volume WHERE id IN ({placeholders})",  # noqa: S608
             list(seen),
         )
         present = {row[0] for row in cur2}
@@ -1946,6 +1981,174 @@ class Database:
             }
         finally:
             conn.close()
+
+    # -- work on separate connections (worker threads) -----------------------
+
+    def _ro_connect(self, timeout: float = 10) -> sqlite3.Connection:
+        """A read-only connection of its own, safe to use on a worker thread."""
+        return sqlite3.connect(
+            f"{self._path.resolve().as_uri()}?mode=ro", uri=True, timeout=timeout
+        )
+
+    def existing_ids_snapshot(self, table: str) -> set[int]:
+        """existing_ids() through its own read-only connection (worker thread)."""
+        if table not in ("cv_volume", "cv_issue"):
+            raise ValueError(f"Unsupported table: {table!r}")
+        conn = self._ro_connect()
+        try:
+            return {row[0] for row in conn.execute(f"SELECT id FROM {table}")}  # noqa: S608
+        finally:
+            conn.close()
+
+    def rebuild_fts(self) -> dict[str, dict[str, int]]:
+        """Rebuild volume_fts, issue_fts and publisher_fts on a connection of its own."""
+        tables = ("volume_fts", "issue_fts", "publisher_fts")
+        conn = sqlite3.connect(str(self._path), timeout=60)
+        try:
+            exists = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='volume_fts'"
+            ).fetchone()[0]
+            if not exists:
+                raise RuntimeError(
+                    "FTS tables do not exist; FTS5 is unavailable in this SQLite build"
+                )
+
+            def counts() -> dict[str, int]:
+                return {
+                    t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]  # noqa: S608
+                    for t in tables
+                }
+
+            before = counts()
+            for t in tables:
+                conn.execute(f"INSERT INTO {t}({t}) VALUES ('rebuild')")
+                conn.commit()
+            return {"before": before, "after": counts()}
+        finally:
+            conn.close()
+
+    def quick_check(self, max_errors: int = 20) -> dict[str, Any]:
+        """PRAGMA quick_check on a read-only connection; reads the whole file."""
+        conn = self._ro_connect(timeout=30)
+        try:
+            rows = [r[0] for r in conn.execute(f"PRAGMA quick_check({int(max_errors)})")]
+        finally:
+            conn.close()
+        ok = rows == ["ok"]
+        return {"ok": ok, "problems": [] if ok else rows}
+
+    def queue_snapshot(self) -> dict[str, Any]:
+        """How much work each backfill and queue still has (read-only connection).
+
+        The issue count scans cv_issue (no index covers it), which takes a few
+        minutes on slow storage, so this runs on a worker thread.
+        """
+        conn = self._ro_connect(timeout=30)
+        timings: dict[str, float] = {}
+        out: dict[str, Any] = {}
+
+        def one(key: str, sql: str) -> None:
+            t0 = time.monotonic()
+            out[key] = conn.execute(sql).fetchone()[0]
+            timings[key] = round(time.monotonic() - t0, 1)
+
+        not_missing = "(backfill_missing IS NULL OR backfill_missing = 0)"
+        try:
+            one("volumes_missing_fields",
+                "SELECT COUNT(*) FROM cv_volume INDEXED BY idx_volume_needs_backfill"
+                f" WHERE date_last_updated IS NULL AND {not_missing}")
+            one("publishers_missing_fields",
+                "SELECT COUNT(*) FROM cv_publisher"
+                f" WHERE date_last_updated IS NULL AND {not_missing}")
+            one("issues_missing_details",
+                "SELECT COUNT(*) FROM cv_issue INDEXED BY idx_issue_needs_detail"
+                f" WHERE detail_fetched_at IS NULL AND {not_missing}")
+            one("issues_missing_fields",
+                f"SELECT COUNT(*) FROM cv_issue WHERE date_last_updated IS NULL AND {not_missing}")
+            one("newest_issue_id", "SELECT COALESCE(MAX(id), 0) FROM cv_issue")
+            one("newest_hashed_issue_id", "SELECT COALESCE(MAX(cvid), 0) FROM comic_covers")
+            out["pending_fetch"] = dict(
+                conn.execute("SELECT kind, COUNT(*) FROM cv_pending_fetch GROUP BY kind")
+            )
+            t0 = time.monotonic()
+            out["response_cache"] = dict(conn.execute(
+                "SELECT resource_type, COUNT(*) FROM cv_response_cache GROUP BY resource_type"
+            ))
+            timings["response_cache"] = round(time.monotonic() - t0, 1)
+            row = conn.execute(
+                "SELECT last_sync_timestamp FROM cv_sync_metadata WHERE endpoint = ?",
+                ["issues_incremental"],
+            ).fetchone()
+            out["sync_watermark"] = row[0] if row else None
+        finally:
+            conn.close()
+        wal = self._path.with_name(self._path.name + "-wal")
+        out["db_bytes"] = self._path.stat().st_size if self._path.exists() else 0
+        out["wal_bytes"] = wal.stat().st_size if wal.exists() else 0
+        out["timings_s"] = timings
+        return out
+
+    def audit_response_cache(self, *, purge: bool, chunk: int = 2000) -> dict[str, Any]:
+        """Find cached responses that look like failures; optionally delete them.
+
+        Reads in rowid order, one short transaction per chunk, so no long read
+        snapshot holds up WAL checkpoints.  Only error envelopes and
+        unparseable rows are purged; empty results are reported but kept
+        (empty searches and negative entries are cached on purpose).
+        """
+        ro = self._ro_connect(timeout=30)
+        counts: dict[str, int] = {}
+        samples: dict[str, list[str]] = {}
+        purgeable: list[int] = []
+        scanned = 0
+        last = 0
+        try:
+            while True:
+                rows = ro.execute(
+                    "SELECT rowid, resource_type, resource_id, params_hash, query, cached_at,"
+                    " data_json FROM cv_response_cache WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    [last, chunk],
+                ).fetchall()
+                if not rows:
+                    break
+                for rowid, rtype, rid, phash, query, cached_at, data in rows:
+                    last = rowid
+                    scanned += 1
+                    reason = _classify_cached_response(rtype, data)
+                    if reason is None:
+                        continue
+                    key = f"{rtype}/{reason}"
+                    counts[key] = counts.get(key, 0) + 1
+                    if len(samples.setdefault(key, [])) < 5:
+                        what = rid if rid is not None else (query or phash)
+                        samples[key].append(f"{cached_at} {what}")
+                    if reason in _PURGEABLE_REASONS:
+                        purgeable.append(rowid)
+        finally:
+            ro.close()
+        deleted = 0
+        if purge and purgeable:
+            rw = sqlite3.connect(str(self._path), timeout=30)
+            try:
+                for start in range(0, len(purgeable), 500):
+                    batch = purgeable[start:start + 500]
+                    cur = rw.execute(
+                        "DELETE FROM cv_response_cache WHERE rowid IN"  # noqa: S608
+                        f" ({','.join('?' * len(batch))})",
+                        batch,
+                    )
+                    rw.commit()
+                    deleted += cur.rowcount
+            finally:
+                rw.close()
+        return {
+            "scanned": scanned,
+            "problems": sum(counts.values()),
+            "purgeable": len(purgeable),
+            "deleted": deleted,
+            "by_type": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+            "samples": samples,
+        }
 
     def get_counts(self) -> dict[str, int]:
         """Return row counts for health/stats endpoint."""
