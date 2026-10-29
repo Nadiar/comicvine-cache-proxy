@@ -669,7 +669,12 @@ class JobRunner:
     async def _execute(self, spec: JobSpec, run: JobRun) -> None:
         token = _current.set(run)
         params = f", params {json.dumps(run.params, default=str)}" if run.params else ""
-        logger.info("Job start: %s (trigger %s%s)", spec.name, run.trigger, params)
+        # Jobs that don't keep idle runs (pending fetch, every 2 min) log at DEBUG
+        # unless they actually do something; see _finish.
+        logger.log(
+            logging.INFO if spec.persist_idle else logging.DEBUG,
+            "Job start: %s (trigger %s%s)", spec.name, run.trigger, params,
+        )
         try:
             result = await spec.run(run.params)
         except asyncio.CancelledError:
@@ -715,7 +720,12 @@ class JobRunner:
             run.summary = summary
             if run.status == ERROR:
                 run.error = str(result.get("error") or STOP_REASONS.get(reason or "", ("", ""))[1])
-        level = logging.WARNING if run.status == ERROR else logging.INFO
+        if run.status == ERROR:
+            level = logging.WARNING
+        elif run.status == IDLE and not spec.persist_idle:
+            level = logging.DEBUG
+        else:
+            level = logging.INFO
         logger.log(
             level, "Job %s: %s in %s: %s",
             run.status, spec.name, fmt_duration(run.duration_s), run.summary or "-",
