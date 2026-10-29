@@ -260,6 +260,13 @@ CREATE TABLE IF NOT EXISTS cv_response_cache (
     cached_at     TEXT NOT NULL DEFAULT (datetime('now')),
     query         TEXT
 );
+
+CREATE TABLE IF NOT EXISTS cv_sync_metadata (
+    endpoint TEXT PRIMARY KEY,
+    last_sync_date TEXT NOT NULL,
+    last_sync_timestamp TEXT NOT NULL,
+    resume_state TEXT
+);
 """
 
 # Indexes are created AFTER column migrations run so that new columns (e.g.
@@ -281,6 +288,8 @@ CREATE INDEX IF NOT EXISTS idx_issue_volume_id ON cv_issue(volume_id);
 CREATE INDEX IF NOT EXISTS idx_comic_covers_cvid ON comic_covers(cvid);
 CREATE INDEX IF NOT EXISTS idx_issue_needs_detail ON cv_issue(id)
     WHERE detail_fetched_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_volume_needs_backfill ON cv_volume(id)
+    WHERE date_last_updated IS NULL;
 """
 
 _FTS_DDL = """
@@ -1810,6 +1819,53 @@ class Database:
         )
         return [row[0] for row in cur.fetchall()]
 
+    def volume_ids_needing_backfill(
+        self, calendar_limit: int, old_limit: int, *, scan_limit: int = 5000
+    ) -> tuple[list[int], list[int]]:
+        """Volumes missing detail fields: (calendar-relevant, older), newest first.
+
+        Driven by idx_volume_needs_backfill, so the cost scales with the number
+        of volumes that need work rather than with cv_issue.  Calendar volumes
+        (those with a dated issue) are ordered by their latest store_date.
+        """
+        rows = self.conn.execute(
+            "SELECT v.id,"
+            " (SELECT MAX(i.store_date) FROM cv_issue i"
+            "   WHERE i.volume_id = v.id AND i.store_date IS NOT NULL) AS latest"
+            " FROM cv_volume v INDEXED BY idx_volume_needs_backfill"
+            " WHERE v.date_last_updated IS NULL"
+            " AND (v.backfill_missing IS NULL OR v.backfill_missing = 0)"
+            " ORDER BY v.id DESC LIMIT ?",
+            [scan_limit],
+        ).fetchall()
+        dated = sorted((r for r in rows if r[1]), key=lambda r: r[1], reverse=True)
+        calendar = [r[0] for r in dated[:calendar_limit]]
+        seen = set(calendar)
+        old = [r[0] for r in rows if r[0] not in seen][:old_limit]
+        return calendar, old
+
+    # -- sync watermarks -----------------------------------------------------
+
+    def get_sync_watermark(self, endpoint: str) -> str | None:
+        """Last CV date_last_updated fully processed by the sync for *endpoint*."""
+        row = self.conn.execute(
+            "SELECT last_sync_timestamp FROM cv_sync_metadata WHERE endpoint = ?",
+            [endpoint],
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_sync_watermark(self, endpoint: str, timestamp: str) -> None:
+        """Record *timestamp* (CV's own date_last_updated clock) for *endpoint*."""
+        self.conn.execute(
+            "INSERT INTO cv_sync_metadata (endpoint, last_sync_date, last_sync_timestamp)"
+            " VALUES (?, ?, ?)"
+            " ON CONFLICT(endpoint) DO UPDATE SET"
+            " last_sync_date = excluded.last_sync_date,"
+            " last_sync_timestamp = excluded.last_sync_timestamp",
+            [endpoint, timestamp[:10], timestamp],
+        )
+        self.conn.commit()
+
     # -- repair helpers ------------------------------------------------------
 
     def get_all_volume_ids(self) -> list[int]:
@@ -1851,6 +1907,23 @@ class Database:
             [cutoff],
         )
         return int(cur.fetchone()[0])
+
+    def count_rows_snapshot(self) -> dict[str, int]:
+        """Row counts read through a separate read-only connection.
+
+        Meant for a worker thread: COUNT(*) over cv_issue can take seconds on
+        slow storage and must not hold up the shared connection or event loop.
+        """
+        conn = sqlite3.connect(f"file:{self._path}?mode=ro", uri=True, timeout=5)
+        try:
+            return {
+                table.removeprefix("cv_"): conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"  # noqa: S608
+                ).fetchone()[0]
+                for table in ("cv_volume", "cv_issue", "cv_publisher")
+            }
+        finally:
+            conn.close()
 
     def get_counts(self) -> dict[str, int]:
         """Return row counts for health/stats endpoint."""

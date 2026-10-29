@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -32,8 +33,12 @@ from cvproxy.scheduler import (
     sync_recent_issues,
 )
 from cvproxy.stats import StatsTracker
+from cvproxy.watchdog import LoopWatchdog
 
 logger = logging.getLogger(__name__)
+
+#: Seconds /health reuses its row counts before refreshing them in the background.
+_HEALTH_COUNTS_TTL = 300.0
 
 
 class TrailingSlashMiddleware:
@@ -238,6 +243,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.stats = stats
     logger.info("Stats tracker ready: %s", settings.stats_db_path)
 
+    # Row counts for /health, refreshed off the event loop (see health())
+    app.state.health_counts = counts
+    app.state.health_counts_at = time.monotonic()
+    app.state.health_refresh = None
+
+    # Logs the blocking stack whenever the event loop stalls
+    watchdog = LoopWatchdog(asyncio.get_running_loop())
+    watchdog.start()
+
     # Background scheduler
     scheduler = None
     if settings.sync_enabled:
@@ -248,6 +262,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     yield
 
     # Shutdown
+    watchdog.stop()
     if scheduler:
         scheduler.shutdown(wait=False)
     await client.close()
@@ -276,11 +291,30 @@ def create_app() -> FastAPI:
     # Health check at root level (not under /api)
     @app.get("/health")
     async def health() -> dict[str, Any]:
+        """Liveness plus row counts that are at most a few minutes old.
+
+        COUNT(*) over cv_issue is a full index walk; on slow storage it outlasted
+        the container healthcheck timeout, Traefik dropped the route and every
+        request 404'd.  Counts are refreshed on a worker thread instead.
+        """
         db: Database = app.state.db
         cache: ImageCache = app.state.image_cache
+        state = app.state
+        refresh = getattr(state, "health_refresh", None)
+        stale = time.monotonic() - getattr(state, "health_counts_at", 0.0) > _HEALTH_COUNTS_TTL
+        if stale and (refresh is None or refresh.done()):
+
+            async def _refresh() -> None:
+                try:
+                    state.health_counts = await asyncio.to_thread(db.count_rows_snapshot)
+                    state.health_counts_at = time.monotonic()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Health row-count refresh failed: %s", exc)
+
+            state.health_refresh = asyncio.create_task(_refresh())
         return {
             "status": "ok",
-            "database": db.get_counts(),
+            "database": getattr(state, "health_counts", {}),
             "image_cache": cache.stats(),
         }
 
@@ -429,8 +463,8 @@ def create_app() -> FastAPI:
         """Trigger an on-demand incremental issue sync for a wider time window.
 
         Returns immediately with a job_id; poll GET /admin/jobs/{job_id} for status.
-        Useful for refreshing stale cached records corrected on ComicVine more than
-        48 hours ago (outside the daily scheduler window).
+        Useful for refreshing stale cached records corrected on ComicVine before
+        the scheduled sync's watermark.  Does not move the watermark.
         """
         hours = int(days * 24)
         client = app.state.cv_client
