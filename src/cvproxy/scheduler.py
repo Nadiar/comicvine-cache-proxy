@@ -741,8 +741,22 @@ async def _backfill_volumes(client: CVClient, db: Database) -> dict[str, Any]:
 
 
 def _issue_backfill_ids(db: Database) -> list[int]:
-    """Issue IDs missing detail fields: dated issues newest first, then newest IDs."""
-    cur = db.conn.execute(
+    """Issue IDs missing detail fields: dated issues newest first, then newest IDs.
+
+    Uses a read-only connection of its own so it can run on a worker thread:
+    with ~900k rows still missing fields, the dated-issues walk took from 15 s
+    to 7 minutes on this disk and stalled every request while it ran on the
+    event loop (see the loop watchdog).
+    """
+    conn = db._ro_connect(timeout=30)
+    try:
+        return _issue_backfill_ids_on(conn)
+    finally:
+        conn.close()
+
+
+def _issue_backfill_ids_on(conn: Any) -> list[int]:
+    cur = conn.execute(
         """
         SELECT id FROM cv_issue
         WHERE date_last_updated IS NULL
@@ -757,7 +771,7 @@ def _issue_backfill_ids(db: Database) -> list[int]:
 
     if len(issue_ids) < _ISSUE_BATCH:
         seen = set(issue_ids)
-        cur2 = db.conn.execute(
+        cur2 = conn.execute(
             """
             SELECT id FROM cv_issue
             WHERE date_last_updated IS NULL
@@ -783,7 +797,7 @@ async def _backfill_issues(client: CVClient, db: Database) -> dict[str, Any]:
     """
     return await _backfill_ids(
         client, db, label="Issue backfill", endpoint="issue/", table="cv_issue",
-        ids=_issue_backfill_ids(db), fetch=client.get_issue,
+        ids=await asyncio.to_thread(_issue_backfill_ids, db), fetch=client.get_issue,
         store=lambda r: db.upsert_issue(r, commit=False),
     )
 

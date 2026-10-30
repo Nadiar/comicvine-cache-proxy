@@ -366,3 +366,13 @@ def test_rebuild_fts_and_snapshot_reads_use_own_connections(tmp_db: Database) ->
     result = tmp_db.rebuild_fts()
     assert result["after"]["volume_fts"] >= 2
     assert 160294 in tmp_db.existing_ids_snapshot("cv_volume")
+
+
+def test_issue_backfill_ids_read_on_own_connection(tmp_db: Database) -> None:
+    from cvproxy.scheduler import _issue_backfill_ids
+
+    tmp_db.conn.execute(
+        "UPDATE cv_issue SET date_last_updated = '2026-01-01 00:00:00' WHERE id = 1073108"
+    )
+    tmp_db.conn.commit()
+    assert _issue_backfill_ids(tmp_db) == [1073109]
