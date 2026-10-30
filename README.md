@@ -61,6 +61,7 @@ All settings via environment variables:
 | `SYNC_ENABLED` | `true` | Enable background scheduler |
 | `SYNC_CRON_HOUR` | `3` | Hour (container time zone) for the daily jobs |
 | `JOBS_DB_PATH` | next to `STATS_DB_PATH` | Job run history |
+| `BACKFILL_MIN_YEAR` | `2010` | Issue, issue-detail and cover backfills only go after issues dated this year or later (store date, else cover date) and undated issues; older ones are fetched when a client asks. `0` = no floor |
 | `SEARCH_MAX_PAGES` | `5` | Max upstream pages fetched per search query (100 results/page). A cold search returns after the pages covering the request; the rest are fetched in the background. |
 | `RESPONSE_CACHE_TTL_DAYS` | `30` | TTL for generic resource cache; `0` = keep forever |
 | `SEARCH_CACHE_TTL_DAYS` | `60` | TTL for search result cache; `0` = keep forever |

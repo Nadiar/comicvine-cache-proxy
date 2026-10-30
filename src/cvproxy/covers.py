@@ -87,6 +87,7 @@ async def hash_covers(
     db: Database,
     *,
     limit: int,
+    min_year: int = 0,
     delay: float = 1.0,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, int | float | str]:
@@ -101,7 +102,7 @@ async def hash_covers(
     """
     hashed = failed = issues = 0
     t0 = time.monotonic()
-    candidates = await asyncio.to_thread(db.cover_hash_candidates, limit)
+    candidates = await asyncio.to_thread(db.cover_hash_candidates, limit, min_year)
     scan_s = round(time.monotonic() - t0, 1)
     if not candidates:
         logger.info("Cover hash backfill: no issues without cover hashes (scan %.1fs)", scan_s)

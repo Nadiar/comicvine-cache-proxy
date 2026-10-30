@@ -22,6 +22,7 @@ from cvproxy.config import get_settings
 from cvproxy.covers import hash_covers
 from cvproxy.cv_client import NOT_FOUND as _CV_NOT_FOUND
 from cvproxy.cv_client import RATE_LIMITED as _CV_RATE_LIMITED
+from cvproxy.db import backfill_window_sql
 from cvproxy.jobs import JobRunner, JobSpec, Param, report_progress
 from cvproxy.mcl import read_mcl, refresh_mcl
 from cvproxy.pending import process_pending
@@ -178,9 +179,10 @@ def _sum_refetch(r: dict[str, Any]) -> str:
 
 def _sum_queue(r: dict[str, Any]) -> str:
     pending = sum((r.get("pending_fetch") or {}).values())
+    since = f" ({r['backfill_min_year']}+ or undated)" if r.get("backfill_min_year") else ""
     return (
-        f"issues: {r.get('issues_missing_details', 0)} need details, "
-        f"{r.get('issues_missing_fields', 0)} need fields; "
+        f"issues{since}: {r.get('issues_missing_details_in_window', 0)} need details, "
+        f"{r.get('issues_missing_fields_in_window', 0)} need fields; "
         f"volumes: {r.get('volumes_missing_fields', 0)}; "
         f"publishers: {r.get('publishers_missing_fields', 0)}; pending: {pending}"
     )
@@ -311,8 +313,9 @@ def build_job_specs(
             id="issue_detail_backfill", name="Issue detail backfill", category="backfill",
             description=(
                 "Fetches /issue/ details (credits, variant covers) for up to 100 issues that "
-                "were stored from list responses only, newest first. Shares the /issue/ "
-                "backfill budget (120 calls/h) and yields to queued client requests."
+                "were stored from list responses only, newest first, limited to issues dated "
+                "BACKFILL_MIN_YEAR or later (or undated). Shares the /issue/ backfill budget "
+                "(120 calls/h) and yields to queued client requests."
             ),
             run=job(lambda p: _backfill_issue_details(client, db)),
             trigger=_cron(minute=5), endpoints=("issue/",), summarize=_sum_backfill,
@@ -321,8 +324,10 @@ def build_job_specs(
             id="issue_backfill", name="Issue backfill", category="backfill",
             description=(
                 "Re-fetches up to 150 issues cached by an older cvproxy that lack the newer "
-                "fields (no date_last_updated), dated issues newest first, then newest IDs. "
-                "IDs ComicVine no longer has are marked and skipped from then on."
+                "fields (no date_last_updated): issues dated BACKFILL_MIN_YEAR or later by "
+                "store date, newest first, then undated ones and the rest of the window by "
+                "newest ID. Older issues are refreshed only when a client asks for them. IDs "
+                "ComicVine no longer has are marked and skipped from then on."
             ),
             run=job(lambda p: _backfill_issues(client, db)),
             trigger=_cron(minute=45), endpoints=("issue/",), summarize=_sum_backfill,
@@ -370,7 +375,8 @@ def build_job_specs(
             description=(
                 "Hashes the cover images (pHash and average hash) of issues missing from "
                 "comic_covers, for ComicManager's cover matching: up to COVER_HASH_PER_HOUR "
-                "images per run from ComicVine's image CDN (no API quota)."
+                "images per run from ComicVine's image CDN (no API quota), for issues dated "
+                "BACKFILL_MIN_YEAR or later (or undated)."
             ),
             run=job(lambda p: _backfill_cover_hashes(db, get_settings())),
             trigger=_cron(minute=20), disabled=_no_covers, summarize=_sum_covers,
@@ -740,7 +746,7 @@ async def _backfill_volumes(client: CVClient, db: Database) -> dict[str, Any]:
     )
 
 
-def _issue_backfill_ids(db: Database) -> list[int]:
+def _issue_backfill_ids(db: Database, min_year: int = 0) -> list[int]:
     """Issue IDs missing detail fields: dated issues newest first, then newest IDs.
 
     Uses a read-only connection of its own so it can run on a worker thread:
@@ -750,22 +756,23 @@ def _issue_backfill_ids(db: Database) -> list[int]:
     """
     conn = db._ro_connect(timeout=30)
     try:
-        return _issue_backfill_ids_on(conn)
+        return _issue_backfill_ids_on(conn, min_year)
     finally:
         conn.close()
 
 
-def _issue_backfill_ids_on(conn: Any) -> list[int]:
+def _issue_backfill_ids_on(conn: Any, min_year: int = 0) -> list[int]:
+    floor = f"{min_year:04d}" if min_year > 0 else ""
     cur = conn.execute(
         """
         SELECT id FROM cv_issue
         WHERE date_last_updated IS NULL
           AND (backfill_missing IS NULL OR backfill_missing = 0)
-          AND store_date IS NOT NULL
+          AND store_date IS NOT NULL AND store_date >= ?
         ORDER BY store_date DESC
         LIMIT ?
         """,
-        [_ISSUE_BATCH],
+        [floor, _ISSUE_BATCH],
     )
     issue_ids = [row[0] for row in cur.fetchall()]
 
@@ -776,6 +783,7 @@ def _issue_backfill_ids_on(conn: Any) -> list[int]:
             SELECT id FROM cv_issue
             WHERE date_last_updated IS NULL
               AND (backfill_missing IS NULL OR backfill_missing = 0)
+              AND """ + backfill_window_sql(min_year) + """
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -797,7 +805,8 @@ async def _backfill_issues(client: CVClient, db: Database) -> dict[str, Any]:
     """
     return await _backfill_ids(
         client, db, label="Issue backfill", endpoint="issue/", table="cv_issue",
-        ids=await asyncio.to_thread(_issue_backfill_ids, db), fetch=client.get_issue,
+        ids=await asyncio.to_thread(_issue_backfill_ids, db, get_settings().backfill_min_year),
+        fetch=client.get_issue,
         store=lambda r: db.upsert_issue(r, commit=False),
     )
 
@@ -812,7 +821,10 @@ async def _backfill_issue_details(client: CVClient, db: Database) -> dict[str, A
     """
     return await _backfill_ids(
         client, db, label="Issue detail backfill", endpoint="issue/", table="cv_issue",
-        ids=db.issue_ids_needing_detail(limit=_ISSUE_DETAIL_BATCH), fetch=client.get_issue,
+        ids=await asyncio.to_thread(
+            db.issue_ids_needing_detail, _ISSUE_DETAIL_BATCH, get_settings().backfill_min_year
+        ),
+        fetch=client.get_issue,
         store=lambda r: db.upsert_issue(r, commit=False),
     )
 
@@ -1308,7 +1320,9 @@ async def _backfill_cover_hashes(db: Database, settings: Settings) -> dict[str, 
     """Hash up to cover_hash_per_hour cover images of issues missing from comic_covers."""
     if settings.cover_hash_per_hour <= 0:
         return {"hashed": 0, "failed": 0, "issues": 0, "stop_reason": "disabled"}
-    return dict(await hash_covers(db, limit=settings.cover_hash_per_hour))
+    return dict(await hash_covers(
+        db, limit=settings.cover_hash_per_hour, min_year=settings.backfill_min_year
+    ))
 
 # ---------------------------------------------------------------------------
 # Repairs
@@ -1398,7 +1412,7 @@ async def _rebuild_fts(db: Database) -> dict[str, Any]:
 
 
 async def _queue_snapshot(db: Database) -> dict[str, Any]:
-    result = await asyncio.to_thread(db.queue_snapshot)
+    result = await asyncio.to_thread(db.queue_snapshot, get_settings().backfill_min_year)
     logger.info("Backlog snapshot: %s", {k: v for k, v in result.items() if k != "timings_s"})
     return result
 

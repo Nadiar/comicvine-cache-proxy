@@ -376,3 +376,27 @@ def test_issue_backfill_ids_read_on_own_connection(tmp_db: Database) -> None:
     )
     tmp_db.conn.commit()
     assert _issue_backfill_ids(tmp_db) == [1073109]
+
+
+def test_backfill_window_limits_issue_detail_and_cover_selection(tmp_db: Database) -> None:
+    from cvproxy.scheduler import _issue_backfill_ids
+
+    for iid, store, cover in [(9101, "2005-03-01", None), (9102, None, "2015-06-01"),
+                              (9103, None, None), (9104, "2024-01-10", "2023-12-01")]:
+        tmp_db.upsert_issue({"id": iid, "volume": {"id": 160294}, "name": f"I{iid}",
+                             "issue_number": "1", "store_date": store, "cover_date": cover,
+                             "image": {"original_url": f"https://x/{iid}.jpg"}})
+    tmp_db.conn.execute("UPDATE cv_issue SET date_last_updated = '2026-01-01 00:00:00'"
+                        " WHERE id < 9000000 AND id NOT BETWEEN 9101 AND 9104")
+    tmp_db.conn.commit()
+    picked = _issue_backfill_ids(tmp_db, 2010)
+    assert set(picked) == {9102, 9103, 9104}
+    assert picked[0] == 9104  # dated by store date, newest first
+    assert set(_issue_backfill_ids(tmp_db, 0)) >= {9101, 9102, 9103, 9104}
+    detail = tmp_db.issue_ids_needing_detail(100, 2010)
+    assert 9101 not in detail and {9102, 9103, 9104} <= set(detail)
+    covers = {cvid for cvid, _ in tmp_db.cover_hash_candidates(100, 2010)}
+    assert 9101 not in covers and {9102, 9103, 9104} <= covers
+    snap = tmp_db.queue_snapshot(2010)
+    assert snap["issues_missing_fields_in_window"] == 3
+    assert snap["issues_missing_fields"] >= 4

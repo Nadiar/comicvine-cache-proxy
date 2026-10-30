@@ -44,6 +44,11 @@ class Settings(BaseSettings):
         "ComicRack_Scripts/contents/Update%20Missing?ref=master"
     )
 
+    # Backfills only go after issues dated this year or later (store_date, else
+    # cover_date), plus issues with no date at all, which are missing data.
+    # Older issues are still fetched when a client asks for them.  0 = no floor.
+    backfill_min_year: int = 2010
+
     # Background sync
     sync_enabled: bool = True
     sync_cron_hour: int = 3  # UTC hour for daily sync

@@ -583,6 +583,19 @@ def _parse_json_col(row: sqlite3.Row, col: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def backfill_window_sql(min_year: int, alias: str = "") -> str:
+    """SQL condition: the issue is dated *min_year* or later, or has no date.
+
+    The issue's date is store_date, else cover_date ('YYYY-MM-DD', compared as
+    text).  Undated issues are missing data, so they always qualify.
+    """
+    if min_year <= 0:
+        return "1"
+    a = f"{alias}." if alias else ""
+    when = f"COALESCE(NULLIF({a}store_date, ''), NULLIF({a}cover_date, ''))"
+    return f"({when} IS NULL OR {when} >= '{int(min_year):04d}')"
+
+
 #: Response-cache audit findings that are deleted when purging.
 _PURGEABLE_REASONS = frozenset({"error_envelope", "unparseable"})
 
@@ -1255,7 +1268,9 @@ class Database:
             and row["local_count"] >= row["count_of_issues"]
         )
 
-    def cover_hash_candidates(self, limit: int) -> list[tuple[int, list[str]]]:
+    def cover_hash_candidates(
+        self, limit: int, min_year: int = 0
+    ) -> list[tuple[int, list[str]]]:
         """Issues with a cover image but no comic_covers row, newest first.
 
         Returns (issue_id, image URLs): the main cover, then variant covers from
@@ -1270,6 +1285,7 @@ class Database:
                 """SELECT i.id, i.image_url, i.associated_images FROM cv_issue i
                    WHERE i.image_url IS NOT NULL
                      AND NOT EXISTS (SELECT 1 FROM comic_covers c WHERE c.cvid = i.id)
+                     AND """ + backfill_window_sql(min_year, "i") + """
                    ORDER BY i.id DESC LIMIT ?""",
                 [limit],
             ).fetchall()
@@ -1844,15 +1860,25 @@ class Database:
         ).fetchone()
         return bool(row and row[0])
 
-    def issue_ids_needing_detail(self, limit: int) -> list[int]:
-        """IDs of stored issues lacking detail data, newest first, skipping ones CV lost."""
-        cur = self.conn.execute(
-            "SELECT id FROM cv_issue WHERE detail_fetched_at IS NULL"
-            " AND (backfill_missing IS NULL OR backfill_missing = 0)"
-            " ORDER BY id DESC LIMIT ?",
-            [limit],
-        )
-        return [row[0] for row in cur.fetchall()]
+    def issue_ids_needing_detail(self, limit: int, min_year: int = 0) -> list[int]:
+        """IDs of stored issues lacking detail data, newest first, skipping ones CV lost.
+
+        Uses its own read-only connection (worker thread); with *min_year*
+        only issues in the backfill window qualify (see backfill_window_sql).
+        """
+        conn = self._ro_connect(timeout=30)
+        try:
+            cur = conn.execute(
+                "SELECT id FROM cv_issue INDEXED BY idx_issue_needs_detail"
+                " WHERE detail_fetched_at IS NULL"
+                " AND (backfill_missing IS NULL OR backfill_missing = 0)"
+                f" AND {backfill_window_sql(min_year)}"
+                " ORDER BY id DESC LIMIT ?",
+                [limit],
+            )
+            return [row[0] for row in cur.fetchall()]
+        finally:
+            conn.close()
 
     def volume_ids_needing_backfill(
         self, calendar_limit: int, old_limit: int, *, scan_limit: int = 5000
@@ -2037,7 +2063,7 @@ class Database:
         ok = rows == ["ok"]
         return {"ok": ok, "problems": [] if ok else rows}
 
-    def queue_snapshot(self) -> dict[str, Any]:
+    def queue_snapshot(self, min_year: int = 0) -> dict[str, Any]:
         """How much work each backfill and queue still has (read-only connection).
 
         The issue count scans cv_issue (no index covers it), which takes a few
@@ -2060,11 +2086,21 @@ class Database:
             one("publishers_missing_fields",
                 "SELECT COUNT(*) FROM cv_publisher"
                 f" WHERE date_last_updated IS NULL AND {not_missing}")
-            one("issues_missing_details",
-                "SELECT COUNT(*) FROM cv_issue INDEXED BY idx_issue_needs_detail"
-                f" WHERE detail_fetched_at IS NULL AND {not_missing}")
-            one("issues_missing_fields",
-                f"SELECT COUNT(*) FROM cv_issue WHERE date_last_updated IS NULL AND {not_missing}")
+            window = backfill_window_sql(min_year)
+            t0 = time.monotonic()
+            out["issues_missing_details"], out["issues_missing_details_in_window"] = conn.execute(
+                f"SELECT COUNT(*), COALESCE(SUM({window}), 0) FROM cv_issue"
+                " INDEXED BY idx_issue_needs_detail"
+                f" WHERE detail_fetched_at IS NULL AND {not_missing}"
+            ).fetchone()
+            timings["issues_missing_details"] = round(time.monotonic() - t0, 1)
+            t0 = time.monotonic()
+            out["issues_missing_fields"], out["issues_missing_fields_in_window"] = conn.execute(
+                f"SELECT COUNT(*), COALESCE(SUM({window}), 0) FROM cv_issue"
+                f" WHERE date_last_updated IS NULL AND {not_missing}"
+            ).fetchone()
+            timings["issues_missing_fields"] = round(time.monotonic() - t0, 1)
+            out["backfill_min_year"] = min_year
             one("newest_issue_id", "SELECT COALESCE(MAX(id), 0) FROM cv_issue")
             one("newest_hashed_issue_id", "SELECT COALESCE(MAX(cvid), 0) FROM comic_covers")
             out["pending_fetch"] = dict(

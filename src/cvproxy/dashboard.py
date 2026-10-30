@@ -698,9 +698,11 @@ DASHBOARD_HTML = """\
       document.getElementById('backlogAsOf').innerHTML = 'snapshot ' + relTime(run.finished_at);
       const pending = Object.entries(r.pending_fetch || {}).map(([k, v]) => `${k} ${v}`).join(', ') || 'empty';
       const cache = Object.values(r.response_cache || {}).reduce((a, b) => a + b, 0);
+      const win = r.backfill_min_year ? ` (${r.backfill_min_year}+ or undated)` : '';
+      const inWin = (w, all) => w == null ? all : `${w.toLocaleString()} of ${(all ?? 0).toLocaleString()}`;
       const items = [
-        ['Issues without details', r.issues_missing_details, 'Issue detail backfill'],
-        ['Issues missing fields', r.issues_missing_fields, 'Issue backfill'],
+        [`Issues without details${win}`, inWin(r.issues_missing_details_in_window, r.issues_missing_details), 'Issue detail backfill'],
+        [`Issues missing fields${win}`, inWin(r.issues_missing_fields_in_window, r.issues_missing_fields), 'Issue backfill'],
         ['Volumes missing fields', r.volumes_missing_fields, 'Volume backfill'],
         ['Publishers missing fields', r.publishers_missing_fields, 'Publisher backfill'],
         ['Newest issue / newest hashed', `${r.newest_issue_id} / ${r.newest_hashed_issue_id}`, 'Cover hash backfill'],
