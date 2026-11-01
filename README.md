@@ -38,7 +38,9 @@ CV_API_KEY=your_key cvproxy
 
 ## Configuration
 
-All settings via environment variables:
+All settings via environment variables. The ones marked † can also be changed on the
+dashboard's Settings tab: those values are stored in `jobs.db`, take precedence over the
+environment, apply from the next job run or request, and stay until reset on that tab.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -49,10 +51,10 @@ All settings via environment variables:
 | `IMAGE_CACHE_TTL_DAYS` | `14` | Image cache sliding TTL (days) |
 | `STATS_DB_PATH` | `/data/stats.db` | Request stats database path |
 | `BACKUP_DIR` | `/data/backups` | Where nightly database snapshots are written |
-| `BACKUP_KEEP` | `3` | Snapshots to keep (`0` disables backups) |
+| `BACKUP_KEEP` † | `3` | Snapshots to keep (`0` disables backups) |
 | `CV_DB_EXPORT_PATH` | *(unset)* | Write a ComicManager-compatible `comicvine.db` here daily; unset disables the export |
 | `MCL_EXPORT_PATH` | *(unset)* | Keep a daily copy of the community `latest.mcl` here; unset disables it |
-| `COVER_HASH_PER_HOUR` | `0` | Cover images hashed per hour into `comic_covers` for ComicManager cover matching (CDN downloads, not API calls); `0` disables |
+| `COVER_HASH_PER_HOUR` † | `0` | Cover images hashed per hour into `comic_covers` for ComicManager cover matching (CDN downloads, not API calls); `0` disables |
 | `MCL_SOURCE_URL` | Gitea `Update Missing` folder (API listing) | Where to look for the newest `*_latest.mcl` |
 | `RATE_LIMIT_PER_MINUTE` | `100` | Global upstream calls per minute |
 | `RATE_LIMIT_PER_HOUR_PER_ENDPOINT` | `180` | Upstream calls per hour per CV endpoint path |
@@ -61,13 +63,13 @@ All settings via environment variables:
 | `SYNC_ENABLED` | `true` | Enable background scheduler |
 | `SYNC_CRON_HOUR` | `3` | Hour (container time zone) for the daily jobs |
 | `JOBS_DB_PATH` | next to `STATS_DB_PATH` | Job run history |
-| `BACKFILL_MIN_YEAR` | `2010` | Issue, issue-detail and cover backfills only go after issues dated this year or later (store date, else cover date) and undated issues; older ones are fetched when a client asks. `0` = no floor |
-| `SEARCH_MAX_PAGES` | `5` | Max upstream pages fetched per search query (100 results/page). A cold search returns after the pages covering the request; the rest are fetched in the background. |
-| `RESPONSE_CACHE_TTL_DAYS` | `30` | TTL for generic resource cache; `0` = keep forever |
-| `SEARCH_CACHE_TTL_DAYS` | `60` | TTL for search result cache; `0` = keep forever |
+| `BACKFILL_MIN_YEAR` † | `2010` | Issue, issue-detail and cover backfills only go after issues dated this year or later (store date, else cover date) and undated issues; older ones are fetched when a client asks. `0` = no floor |
+| `SEARCH_MAX_PAGES` † | `5` | Max upstream pages fetched per search query (100 results/page). A cold search returns after the pages covering the request; the rest are fetched in the background. |
+| `RESPONSE_CACHE_TTL_DAYS` † | `30` | TTL for generic resource cache; `0` = keep forever |
+| `SEARCH_CACHE_TTL_DAYS` † | `60` | TTL for search result cache; `0` = keep forever |
 | `CACHE_CUTOFF_YEAR` | `0` | Skip caching issues/volumes older than this publication year (e.g. `1995`). Issues checked against `store_date` then `cover_date`; volumes against `last_issue.cover_date`. `0` = disabled. |
-| `EVICT_OLDER_THAN_YEARS` | `0` | Evict issues older than N years (disabled when `0`) |
-| `EVICT_UNACCESSED_DAYS` | `180` | Grace period: skip eviction for recently-accessed entities |
+| `EVICT_OLDER_THAN_YEARS` † | `0` | Evict issues older than N years (disabled when `0`) |
+| `EVICT_UNACCESSED_DAYS` † | `180` | Grace period: skip eviction for recently-accessed entities |
 | `HOST` | `0.0.0.0` | Listen address |
 | `PORT` | `8585` | Listen port |
 
@@ -129,6 +131,8 @@ error...; the next run continues), `idle` (nothing to do), `skipped`
 | `GET /admin/jobs/{run_id}` | One run, including its log lines |
 | `DELETE /admin/jobs/{run_id}` | Cancel a running run (not for jobs that work on a worker thread) |
 | `GET /admin/scheduler/history` | The last 100 scheduled runs |
+| `GET /admin/settings` | Settings editable on the dashboard: value, env/default value, source |
+| `PUT /admin/settings` | Override settings (`{"backfill_min_year": 2015}`); `null` goes back to the env/default value |
 
 Older per-job endpoints still work and start the same jobs:
 `POST /admin/sync/issues?days=`, `/admin/repair/publishers`, `/admin/evict?dry_run=`,
