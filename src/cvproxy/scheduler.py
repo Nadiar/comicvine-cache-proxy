@@ -24,7 +24,7 @@ from cvproxy.covers import hash_covers
 from cvproxy.cv_client import NOT_FOUND as _CV_NOT_FOUND
 from cvproxy.cv_client import RATE_LIMITED as _CV_RATE_LIMITED
 from cvproxy.db import backfill_window_sql
-from cvproxy.jobs import JobRunner, JobSpec, Param, report_progress
+from cvproxy.jobs import Backlog, JobRunner, JobSpec, Param, report_progress
 from cvproxy.mcl import read_mcl, refresh_mcl
 from cvproxy.pending import process_pending
 
@@ -226,6 +226,26 @@ def _no_covers(s: Settings) -> str | None:
     return None if s.cover_hash_per_hour > 0 else "COVER_HASH_PER_HOUR=0"
 
 
+def _backfill_done(r: dict[str, Any]) -> int:
+    """Updated, plus IDs marked as gone from ComicVine: both leave the backlog."""
+    return int(r.get("updated", 0)) + int(r.get("missing", 0))
+
+
+def _counted(key: str) -> Callable[[dict[str, Any]], int | None]:
+    return lambda snapshot: snapshot.get(key)
+
+
+_BACKLOGS = {
+    "issue_detail_backfill": Backlog(_counted("issues_missing_details_in_window"), _backfill_done),
+    "issue_backfill": Backlog(_counted("issues_missing_fields_in_window"), _backfill_done),
+    "volume_backfill": Backlog(_counted("volumes_missing_fields"), _backfill_done),
+    "publisher_backfill": Backlog(_counted("publishers_missing_fields"), _backfill_done),
+    # Images that fail get a NULL-hash row too, so every issue handled leaves the backlog
+    "cover_hash_backfill": Backlog(_counted("issues_missing_covers_in_window"),
+                                   lambda r: int(r.get("issues", 0))),
+}
+
+
 def _min_year(s: Settings) -> str:
     year = s.backfill_min_year
     return f"{year} or later (BACKFILL_MIN_YEAR)" if year > 0 else "any year (BACKFILL_MIN_YEAR)"
@@ -340,6 +360,7 @@ def build_job_specs(
             ),
             run=job(lambda p: _backfill_issue_details(client, db)),
             trigger=_cron(minute=5), endpoints=("issue/",), summarize=_sum_backfill,
+            backlog=_BACKLOGS["issue_detail_backfill"],
         ),
         JobSpec(
             id="issue_backfill", name="Issue backfill", category="backfill",
@@ -350,6 +371,7 @@ def build_job_specs(
             ),
             run=job(lambda p: _backfill_issues(client, db)),
             trigger=_cron(minute=45), endpoints=("issue/",), summarize=_sum_backfill,
+            backlog=_BACKLOGS["issue_backfill"],
         ),
         JobSpec(
             id="volume_backfill", name="Volume backfill", category="backfill",
@@ -359,6 +381,7 @@ def build_job_specs(
             ),
             run=job(lambda p: _backfill_volumes(client, db)),
             trigger=_cron(minute=30), endpoints=("volume/",), summarize=_sum_backfill,
+            backlog=_BACKLOGS["volume_backfill"],
         ),
         JobSpec(
             id="publisher_backfill", name="Publisher backfill", category="backfill",
@@ -366,6 +389,7 @@ def build_job_specs(
             run=job(lambda p: _backfill_publishers(client, db)),
             trigger=_cron(hour="*/6", minute=15), endpoints=("publisher/",),
             summarize=_sum_backfill,
+            backlog=_BACKLOGS["publisher_backfill"],
         ),
         JobSpec(
             id="search_cache_volume_backfill", name="Search cache volume backfill",
@@ -397,6 +421,7 @@ def build_job_specs(
             ),
             run=job(lambda p: _backfill_cover_hashes(db, get_settings())),
             trigger=_cron(minute=20), disabled=_no_covers, summarize=_sum_covers,
+            backlog=_BACKLOGS["cover_hash_backfill"],
         ),
         # -- export ----------------------------------------------------------
         JobSpec(

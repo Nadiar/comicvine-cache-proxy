@@ -583,6 +583,15 @@ def _parse_json_col(row: sqlite3.Row, col: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _missing_cover_sql(min_year: int) -> str:
+    """Issues (alias i) the cover hash backfill still has to hash."""
+    return (
+        "i.image_url IS NOT NULL"
+        " AND NOT EXISTS (SELECT 1 FROM comic_covers c WHERE c.cvid = i.id)"
+        f" AND {backfill_window_sql(min_year, 'i')}"
+    )
+
+
 def backfill_window_sql(min_year: int, alias: str = "") -> str:
     """SQL condition: the issue is dated *min_year* or later, or has no date.
 
@@ -1282,11 +1291,8 @@ class Database:
         conn = sqlite3.connect(f"{self._path.resolve().as_uri()}?mode=ro", uri=True)
         try:
             rows = conn.execute(
-                """SELECT i.id, i.image_url, i.associated_images FROM cv_issue i
-                   WHERE i.image_url IS NOT NULL
-                     AND NOT EXISTS (SELECT 1 FROM comic_covers c WHERE c.cvid = i.id)
-                     AND """ + backfill_window_sql(min_year, "i") + """
-                   ORDER BY i.id DESC LIMIT ?""",
+                "SELECT i.id, i.image_url, i.associated_images FROM cv_issue i"
+                f" WHERE {_missing_cover_sql(min_year)} ORDER BY i.id DESC LIMIT ?",
                 [limit],
             ).fetchall()
         finally:
@@ -2100,6 +2106,8 @@ class Database:
                 f" WHERE date_last_updated IS NULL AND {not_missing}"
             ).fetchone()
             timings["issues_missing_fields"] = round(time.monotonic() - t0, 1)
+            one("issues_missing_covers_in_window",
+                f"SELECT COUNT(*) FROM cv_issue i WHERE {_missing_cover_sql(min_year)}")
             out["backfill_min_year"] = min_year
             one("newest_issue_id", "SELECT COALESCE(MAX(id), 0) FROM cv_issue")
             one("newest_hashed_issue_id", "SELECT COALESCE(MAX(cvid), 0) FROM comic_covers")

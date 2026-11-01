@@ -155,6 +155,15 @@ def test_cover_hash_candidates_skip_issues_with_covers_or_no_image(tmp_db: Datab
     assert 9022 not in candidates
 
 
+def test_queue_snapshot_counts_issues_still_missing_cover_hashes(tmp_db: Database) -> None:
+    _issue(tmp_db, 9020, ORIGINAL.format("a"))
+    _issue(tmp_db, 9021, None)
+    _issue(tmp_db, 9022, ORIGINAL.format("c"))
+    tmp_db.insert_cover_hashes([(9022, "1", "2", ORIGINAL.format("c"))])
+
+    assert tmp_db.queue_snapshot()["issues_missing_covers_in_window"] == 1
+
+
 def test_comic_covers_table_exists_on_fresh_database(tmp_path: Path) -> None:
     db = Database(tmp_path / "fresh.db")
     db.connect()

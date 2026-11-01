@@ -119,7 +119,8 @@ Every background job, scheduled or manual, runs through one job runner and is
 recorded in `jobs.db` (next to `stats.db`, kept 30 days) with its trigger,
 parameters, status, stop reason, summary, duration, result and the log lines
 it wrote. The dashboard's Jobs tab shows the catalog, a backlog snapshot and
-the run history.
+the run history. Backfill jobs show an estimate of their remaining work: the
+last Backlog snapshot's count minus what their runs have done since.
 
 Statuses: `done`, `partial` (stopped early: budget, rate limit, upstream
 error...; the next run continues), `idle` (nothing to do), `skipped`

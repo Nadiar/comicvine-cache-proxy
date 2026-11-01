@@ -14,8 +14,10 @@ import pytest
 from cvproxy.cv_client import NOT_FOUND, RATE_LIMITED
 from cvproxy.db import Database
 from cvproxy.jobs import (
+    Backlog,
     JobError,
     JobHistory,
+    JobRun,
     JobRunner,
     JobSpec,
     Param,
@@ -288,6 +290,73 @@ def test_job_descriptions_show_configured_values_and_their_setting(settings: Any
     assert "kept forever (SEARCH_CACHE_TTL_DAYS)" in desc["evict_stale_data"]
     desc = _descriptions(settings.model_copy(update={"backfill_min_year": 0}))
     assert "any year (BACKFILL_MIN_YEAR)" in desc["issue_backfill"]
+
+
+# -- backlog estimates -------------------------------------------------------
+
+
+def _stored(history: JobHistory, job_id: str, started: str, result: dict[str, Any]) -> None:
+    history.save(JobRun(run_id=f"{job_id}-{started}", job_id=job_id, name=job_id,
+                        trigger="schedule", params={}, started_at=started, status="done",
+                        finished_at=started, result=result))
+
+
+async def _noop(params: dict[str, Any]) -> dict[str, Any]:
+    return {}
+
+
+def _backlog_runner() -> tuple[JobRunner, JobHistory]:
+    history = JobHistory()
+    runner = JobRunner(history)
+    runner.register([
+        _spec("queue_snapshot", _noop),
+        _spec("vol", _noop, backlog=Backlog(count=lambda r: r.get("volumes"),
+                                            done=lambda r: r["updated"])),
+        _spec("plain", _noop),
+    ])
+    return runner, history
+
+
+def test_catalog_estimates_remaining_as_snapshot_count_minus_work_done_since() -> None:
+    runner, history = _backlog_runner()
+    _stored(history, "vol", "2026-11-01T01:00:00", {"updated": 50})  # before the count
+    _stored(history, "queue_snapshot", "2026-11-01T02:00:00", {"volumes": 400})
+    _stored(history, "vol", "2026-11-01T03:00:00", {"updated": 30})
+    _stored(history, "vol", "2026-11-01T04:00:00", {"updated": 20})
+
+    catalog = {j["id"]: j for j in runner.catalog()}
+
+    assert catalog["vol"]["remaining"] == {
+        "estimate": 350, "counted": 400, "done_since": 50, "counted_at": "2026-11-01T02:00:00",
+    }
+    assert catalog["plain"]["remaining"] is None
+
+
+def test_backlog_estimate_is_missing_without_a_count_and_never_negative() -> None:
+    runner, history = _backlog_runner()
+    assert {j["id"]: j for j in runner.catalog()}["vol"]["remaining"] is None
+    _stored(history, "queue_snapshot", "2026-11-01T02:00:00", {"other": 1})
+    assert {j["id"]: j for j in runner.catalog()}["vol"]["remaining"] is None
+    _stored(history, "queue_snapshot", "2026-11-01T05:00:00", {"volumes": 10})
+    _stored(history, "vol", "2026-11-01T06:00:00", {"updated": 25})
+    assert {j["id"]: j for j in runner.catalog()}["vol"]["remaining"]["estimate"] == 0
+
+
+def test_backfill_jobs_read_their_backlog_from_the_snapshot(settings: Any) -> None:
+    specs = {s.id: s for s in build_job_specs(settings, MagicMock(), MagicMock(), MagicMock())}
+    snapshot = {"issues_missing_details_in_window": 7, "issues_missing_fields_in_window": 8,
+                "volumes_missing_fields": 9, "publishers_missing_fields": 10,
+                "issues_missing_covers_in_window": 11}
+    expected = {"issue_detail_backfill": 7, "issue_backfill": 8, "volume_backfill": 9,
+                "publisher_backfill": 10, "cover_hash_backfill": 11}
+    for job_id, count in expected.items():
+        backlog = specs[job_id].backlog
+        assert backlog is not None, job_id
+        assert backlog.count(snapshot) == count, job_id
+    run = {"updated": 4, "missing": 1, "queued": 9}
+    assert specs["issue_detail_backfill"].backlog.done(run) == 5  # type: ignore[union-attr]
+    assert specs["cover_hash_backfill"].backlog.done(  # type: ignore[union-attr]
+        {"hashed": 6, "failed": 1, "issues": 3}) == 3
 
 
 def test_backup_job_not_scheduled_when_keep_is_zero(settings: Any) -> None:

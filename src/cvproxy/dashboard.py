@@ -701,11 +701,13 @@ DASHBOARD_HTML = """\
         for (const j of jobs) {
           const eps = j.endpoints.length
             ? `<span class="small text-secondary ms-2">${j.endpoints.map(e => '/' + esc(e)).join(' ')}</span>` : '';
+          const rem = j.remaining
+            ? `<span class="small text-info ms-2" title="Counted ${esc(relTime(j.remaining.counted_at))} by Backlog snapshot (${j.remaining.counted.toLocaleString()}), minus ${j.remaining.done_since.toLocaleString()} done since">~${j.remaining.estimate.toLocaleString()} left</span>` : '';
           const off = j.disabled ? `<div class="small text-warning"><i class="bi bi-slash-circle me-1"></i>${esc(j.disabled)}</div>` : '';
           const btn = j.manual && !j.disabled
             ? `<button class="btn btn-sm btn-outline-primary run-btn text-nowrap" data-job="${esc(j.id)}" ${j.running ? 'disabled' : ''}><i class="bi bi-play-fill"></i> Run</button>` : '';
           html += `<tr class="${j.disabled ? 'opacity-50' : ''}">
-              <td><span class="fw-semibold">${esc(j.name)}</span>${eps}
+              <td><span class="fw-semibold">${esc(j.name)}</span>${eps}${rem}
                   <div class="small text-secondary job-desc">${esc(j.description)}</div>${off}</td>
               <td class="small text-nowrap">${esc(j.schedule)}</td>
               <td class="small text-nowrap">${j.next_run ? relTime(j.next_run) : '-'}</td>

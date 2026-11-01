@@ -22,6 +22,7 @@ result dict (see :data:`STOP_REASONS`); the runner turns that into a status:
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextvars
 import json
 import logging
@@ -152,6 +153,20 @@ def _never_disabled(_settings: Settings) -> str | None:
     return None
 
 
+#: The job whose result counts every backfill's remaining work
+BACKLOG_JOB = "queue_snapshot"
+
+
+@dataclass(frozen=True)
+class Backlog:
+    """How a job's remaining work is estimated from the backlog snapshot."""
+
+    #: The count in the snapshot's result (None when that snapshot lacks it)
+    count: Callable[[dict[str, Any]], int | None]
+    #: How much of it one run's result worked off
+    done: Callable[[dict[str, Any]], int]
+
+
 @dataclass
 class JobSpec:
     """One background job: what it does, when it runs and how to run it."""
@@ -179,6 +194,7 @@ class JobSpec:
     #: Returns why the job is disabled under these settings, or None
     disabled: Callable[[Settings], str | None] = _never_disabled
     summarize: Callable[[dict[str, Any]], str] | None = None
+    backlog: Backlog | None = None
 
     def coerce_params(self, raw: dict[str, Any] | None) -> dict[str, Any]:
         raw = dict(raw or {})
@@ -491,6 +507,16 @@ class JobHistory:
             if row["ok_rk"] == 1 and row["status"] in (DONE, IDLE):
                 entry["last_ok"] = run
         return out
+
+    def results_since(self, job_id: str, since_iso: str) -> builtins.list[dict[str, Any]]:
+        """Results of the job's runs that started after *since_iso*."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT result FROM job_runs WHERE job_id = ? AND started_at > ?"
+                " AND result IS NOT NULL",
+                [job_id, since_iso],
+            ).fetchall()
+        return [json.loads(r[0]) for r in rows]
 
     def counts_since(self, since_iso: str) -> dict[str, int]:
         with self._lock:
@@ -841,20 +867,11 @@ class JobRunner:
     def catalog(self) -> list[dict[str, Any]]:
         """Every job with its description, schedule, next run and latest runs."""
         stored = self.history.latest_per_job()
+        snapshot = self._latest_runs(BACKLOG_JOB, stored)[1]
         out = []
         for spec in self.specs.values():
             job = self._scheduler.get_job(spec.id) if self._scheduler is not None else None
-            entry = stored.get(spec.id, {})
-            last = entry.get("last")
-            last_ok = entry.get("last_ok")
-            mem = self._latest.get(spec.id)
-            if mem is not None and mem.status != RUNNING:
-                if last is None or mem.started_at > last["started_at"]:
-                    last = mem.public()
-                if mem.status in (DONE, IDLE) and (
-                    last_ok is None or mem.started_at > last_ok["started_at"]
-                ):
-                    last_ok = mem.public()
+            last, last_ok = self._latest_runs(spec.id, stored)
             active = self.running(spec.id)
             next_run = getattr(job, "next_run_time", None) if job is not None else None
             if job is not None:
@@ -878,5 +895,37 @@ class JobRunner:
                 "running": active.public() if active is not None else None,
                 "last": last,
                 "last_ok": last_ok,
+                "remaining": self._remaining(spec, snapshot),
             })
         return out
+
+    def _latest_runs(
+        self, job_id: str, stored: dict[str, dict[str, Any]]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """(last run, last good run) from history and the runs this process made."""
+        entry = stored.get(job_id, {})
+        last = entry.get("last")
+        last_ok = entry.get("last_ok")
+        mem = self._latest.get(job_id)
+        if mem is not None and mem.status != RUNNING:
+            if last is None or mem.started_at > last["started_at"]:
+                last = mem.public()
+            if mem.status in (DONE, IDLE) and (
+                last_ok is None or mem.started_at > last_ok["started_at"]
+            ):
+                last_ok = mem.public()
+        return last, last_ok
+
+    def _remaining(
+        self, spec: JobSpec, snapshot: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """The snapshot's count of the job's backlog, minus what it did since."""
+        if spec.backlog is None or snapshot is None or not snapshot.get("result"):
+            return None
+        counted = spec.backlog.count(snapshot["result"])
+        if counted is None:
+            return None
+        counted_at = snapshot.get("finished_at") or snapshot["started_at"]
+        done = sum(spec.backlog.done(r) for r in self.history.results_since(spec.id, counted_at))
+        return {"estimate": max(counted - done, 0), "counted": counted,
+                "done_since": done, "counted_at": counted_at}
