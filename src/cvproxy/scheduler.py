@@ -14,6 +14,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -225,6 +226,33 @@ def _no_covers(s: Settings) -> str | None:
     return None if s.cover_hash_per_hour > 0 else "COVER_HASH_PER_HOUR=0"
 
 
+def _min_year(s: Settings) -> str:
+    year = s.backfill_min_year
+    return f"{year} or later (BACKFILL_MIN_YEAR)" if year > 0 else "any year (BACKFILL_MIN_YEAR)"
+
+
+def _expiry(what: str, days: int, setting: str) -> str:
+    if days <= 0:
+        return f"{what} are kept forever ({setting})"
+    return f"{what} expire after {days} days ({setting})"
+
+
+def _path(path: Path | None, setting: str) -> str:
+    return f"{path} ({setting})" if path is not None else f"{setting} (not set)"
+
+
+def _eviction_description(s: Settings) -> str:
+    issues = (
+        f"Deletes issues older than {s.evict_older_than_years} years "
+        f"(EVICT_OLDER_THAN_YEARS) not accessed for {s.evict_unaccessed_days} days "
+        "(EVICT_UNACCESSED_DAYS) and volumes left without issues"
+        if s.evict_older_than_years > 0 else "Issue eviction is off (EVICT_OLDER_THAN_YEARS)"
+    )
+    responses = _expiry("Cached responses", s.response_cache_ttl_days, "RESPONSE_CACHE_TTL_DAYS")
+    searches = _expiry("search results", s.search_cache_ttl_days, "SEARCH_CACHE_TTL_DAYS")
+    return f"{issues}. {responses}; {searches}. Manual runs default to a dry run."
+
+
 def build_job_specs(
     settings: Settings,
     image_cache: ImageCache,
@@ -247,10 +275,9 @@ def build_job_specs(
         JobSpec(
             id="incremental_issue_sync", name="Incremental issue sync", category="sync",
             description=(
-                "Pulls every issue ComicVine changed since the stored watermark (the newest "
-                "date_last_updated already saved) and upserts it. Walks the gap in 24 h "
-                "slices, at most 45 per run, and only moves the watermark over data that "
-                "was fully stored, so a failed run is resumed by the next one."
+                "Upserts issues ComicVine changed since the stored watermark, in 24 h slices (at "
+                "most 45 per run). The watermark only advances over fully stored data, so a "
+                "failed run is resumed by the next."
             ),
             run=job(lambda p: _sync_issues_incremental(client, db)),
             trigger=_cron(minute=10), endpoints=("issues/",), summarize=_sum_sync,
@@ -258,8 +285,8 @@ def build_job_specs(
         JobSpec(
             id="releases_prefetch", name="Releases prefetch", category="sync",
             description=(
-                "Fetches every issue with a store date from two weeks ago to one week ahead, "
-                "so new-release lists and calendars are answered from the local database."
+                "Caches issues with a store date from two weeks ago to one week ahead, so "
+                "release lists are served locally."
             ),
             run=job(lambda p: _prefetch_releases(client, db)),
             trigger=_cron(hour=h, minute=0), endpoints=("issues/",),
@@ -267,10 +294,8 @@ def build_job_specs(
         JobSpec(
             id="issue_resync", name="Issue re-sync (time window)", category="sync",
             description=(
-                "Re-reads every issue ComicVine changed in the last N days, regardless of "
-                "the watermark. Use it after a ComicVine outage or to pick up older "
-                "corrections. Does not move the scheduled sync's watermark. Costs about one "
-                "/issues/ call per 100 changed issues."
+                "Re-reads issues changed in the last N days without moving the sync watermark, "
+                "e.g. after a ComicVine outage. About one /issues/ call per 100 issues."
             ),
             run=job(lambda p: _sync_recent_issues(client, db, int(p["days"] * 24))),
             endpoints=("issues/",), summarize=_sum_sync,
@@ -280,10 +305,8 @@ def build_job_specs(
         JobSpec(
             id="issue_refetch", name="Re-fetch issues", category="sync",
             description=(
-                "Re-fetches specific issues from ComicVine: a list of issue IDs (100 per "
-                "/issues/ call) and/or every issue of one volume. 'Full details' also fetches "
-                "each issue from /issue/ for credits (one call each, first 100 only). Uses the "
-                "backfill budget and waits for queued client requests."
+                "Re-fetches given issue IDs and/or every issue of one volume (100 per call). "
+                "'Full details' adds /issue/ credits for the first 100. Uses the backfill budget."
             ),
             run=job(run_refetch), endpoints=("issues/", "issue/"), summarize=_sum_refetch,
             params=(
@@ -298,10 +321,9 @@ def build_job_specs(
         JobSpec(
             id="pending_fetch", name="Pending fetch", category="sync",
             description=(
-                "Fetches cache misses that came in while ComicVine couldn't be asked "
-                "(cooldown or a full hourly window), oldest first, keeping 30 calls per hour "
-                "per endpoint for live requests. Runs that had nothing to fetch, or only "
-                "waited for a window, are not kept in the history."
+                "Fetches requests that missed while ComicVine was rate-limited, oldest first, "
+                "keeping 30 calls/h per endpoint for live traffic. Idle runs are not kept in the "
+                "history."
             ),
             run=job(lambda p: process_pending(client, db)),
             trigger={"trigger": "interval", "minutes": 2}, persist_idle=False,
@@ -312,10 +334,9 @@ def build_job_specs(
         JobSpec(
             id="issue_detail_backfill", name="Issue detail backfill", category="backfill",
             description=(
-                "Fetches /issue/ details (credits, variant covers) for up to 100 issues that "
-                "were stored from list responses only, newest first, limited to issues dated "
-                "BACKFILL_MIN_YEAR or later (or undated). Shares the /issue/ backfill budget "
-                "(120 calls/h) and yields to queued client requests."
+                "Fetches /issue/ details (credits, variant covers) for up to 100 list-only "
+                f"issues dated {_min_year(settings)} or undated, newest first. Yields to "
+                "client requests."
             ),
             run=job(lambda p: _backfill_issue_details(client, db)),
             trigger=_cron(minute=5), endpoints=("issue/",), summarize=_sum_backfill,
@@ -323,11 +344,9 @@ def build_job_specs(
         JobSpec(
             id="issue_backfill", name="Issue backfill", category="backfill",
             description=(
-                "Re-fetches up to 150 issues cached by an older cvproxy that lack the newer "
-                "fields (no date_last_updated): issues dated BACKFILL_MIN_YEAR or later by "
-                "store date, newest first, then undated ones and the rest of the window by "
-                "newest ID. Older issues are refreshed only when a client asks for them. IDs "
-                "ComicVine no longer has are marked and skipped from then on."
+                "Re-fetches up to 150 issues cached without date_last_updated (by older "
+                f"versions), dated {_min_year(settings)} first. IDs ComicVine no longer has "
+                "are skipped from then on."
             ),
             run=job(lambda p: _backfill_issues(client, db)),
             trigger=_cron(minute=45), endpoints=("issue/",), summarize=_sum_backfill,
@@ -335,8 +354,8 @@ def build_job_specs(
         JobSpec(
             id="volume_backfill", name="Volume backfill", category="backfill",
             description=(
-                "Re-fetches volumes missing detail fields: up to 100 that have dated issues "
-                "(calendar-relevant) plus 50 older ones."
+                "Re-fetches volumes missing detail fields: up to 100 with dated issues plus 50 "
+                "older ones."
             ),
             run=job(lambda p: _backfill_volumes(client, db)),
             trigger=_cron(minute=30), endpoints=("volume/",), summarize=_sum_backfill,
@@ -352,8 +371,8 @@ def build_job_specs(
             id="search_cache_volume_backfill", name="Search cache volume backfill",
             category="backfill",
             description=(
-                "Fetches volumes that appear in cached search results but aren't stored yet "
-                "(up to 50 per run), so later searches can be answered locally."
+                "Fetches up to 50 volumes that appear in cached search results but aren't stored "
+                "yet."
             ),
             run=job(lambda p: _backfill_search_cache_volumes(client, db)),
             trigger=_cron(hour="*/2", minute=50), endpoints=("volume/",),
@@ -362,9 +381,8 @@ def build_job_specs(
         JobSpec(
             id="mcl_gap_backfill", name="MCL gap backfill", category="backfill",
             description=(
-                "Compares the community latest.mcl with the database and fetches volumes and "
-                "issues it lists that cvproxy doesn't have, 100 IDs per list call, newest "
-                "first. Issues arrive list-shaped; the issue detail backfill adds credits."
+                "Fetches volumes and issues listed in latest.mcl that aren't in the database, "
+                "newest first, 100 IDs per call. The detail backfill adds issue credits later."
             ),
             run=job(lambda p: _backfill_from_mcl(client, db, get_settings())),
             trigger=_cron(hour=(h + 6) % 24, minute=0), endpoints=("volumes/", "issues/"),
@@ -373,20 +391,20 @@ def build_job_specs(
         JobSpec(
             id="cover_hash_backfill", name="Cover hash backfill", category="backfill",
             description=(
-                "Hashes the cover images (pHash and average hash) of issues missing from "
-                "comic_covers, for ComicManager's cover matching: up to COVER_HASH_PER_HOUR "
-                "images per run from ComicVine's image CDN (no API quota), for issues dated "
-                "BACKFILL_MIN_YEAR or later (or undated)."
+                "Hashes cover images (pHash, average hash) into comic_covers for issues dated "
+                f"{_min_year(settings)}: up to {settings.cover_hash_per_hour} covers per run "
+                "(COVER_HASH_PER_HOUR). Uses the image CDN, not API quota."
             ),
             run=job(lambda p: _backfill_cover_hashes(db, get_settings())),
             trigger=_cron(minute=20), disabled=_no_covers, summarize=_sum_covers,
-        ),        # -- export ----------------------------------------------------------
+        ),
+        # -- export ----------------------------------------------------------
         JobSpec(
             id="comicvine_db_export", name="comicvine.db export", category="export",
             description=(
-                "Builds a ComicManager-compatible comicvine.db on local disk from a read-only "
-                "snapshot and moves it into CV_DB_EXPORT_PATH with an atomic rename "
-                "(ComicManager opens it immutable)."
+                "Builds comicvine.db from a read-only snapshot and swaps it into "
+                f"{_path(settings.cv_db_export_path, 'CV_DB_EXPORT_PATH')} with an atomic "
+                "rename."
             ),
             run=job(lambda p: _export_comicvine_db(db, get_settings())),
             trigger=_cron(hour=(h + 5) % 24, minute=0), disabled=_no_export,
@@ -395,8 +413,9 @@ def build_job_specs(
         JobSpec(
             id="mcl_refresh", name="latest.mcl refresh", category="export",
             description=(
-                "Downloads the newest community latest.mcl to MCL_EXPORT_PATH; the file is "
-                "only replaced when it changed and parses."
+                "Downloads the newest latest.mcl to "
+                f"{_path(settings.mcl_export_path, 'MCL_EXPORT_PATH')}, replacing the file only "
+                "when it changed and parses."
             ),
             run=job(lambda p: _refresh_mcl(get_settings())),
             trigger=_cron(hour=(h + 5) % 24, minute=30), disabled=_no_mcl,
@@ -405,21 +424,15 @@ def build_job_specs(
         JobSpec(
             id="wal_checkpoint", name="WAL checkpoint", category="maintenance",
             description=(
-                "PASSIVE WAL checkpoint on its own connection: copies committed pages into "
-                "the database without taking the write lock. Ends 'partial' when a "
-                "long-running reader keeps a large WAL from being checkpointed."
+                "Passive WAL checkpoint on its own connection, without taking the write lock. "
+                "Ends 'partial' when a long-running reader holds the WAL."
             ),
             run=job(lambda p: _checkpoint_wal(db)),
             trigger=_cron(minute=40), cancellable=False, summarize=_sum_wal,
         ),
         JobSpec(
             id="evict_stale_data", name="Cache eviction", category="maintenance",
-            description=(
-                "Deletes old, unaccessed issues (EVICT_OLDER_THAN_YEARS / "
-                "EVICT_UNACCESSED_DAYS), volumes left without issues, and response and search "
-                "cache entries past RESPONSE_CACHE_TTL_DAYS / SEARCH_CACHE_TTL_DAYS. Manual "
-                "runs default to a dry run that only counts."
-            ),
+            description=_eviction_description(settings),
             run=job(lambda p: _evict_stale_data(db, get_settings(), dry_run=p["dry_run"])),
             trigger=_cron(hour=(h + 3) % 24, minute=0), destructive=True,
             params=(Param("dry_run", "bool", True, "Dry run (count only)",
@@ -429,7 +442,8 @@ def build_job_specs(
         JobSpec(
             id="image_cache_cleanup", name="Image cache cleanup", category="maintenance",
             description=(
-                "Removes cached images not accessed within IMAGE_CACHE_TTL_DAYS."
+                f"Removes cached images not accessed for {settings.image_cache_ttl_days} days "
+                "(IMAGE_CACHE_TTL_DAYS)."
             ),
             run=job(lambda p: _cleanup_images(image_cache)),
             trigger=_cron(hour=(h + 2) % 24, minute=0),
@@ -437,8 +451,8 @@ def build_job_specs(
         JobSpec(
             id="database_backup", name="Database backup", category="maintenance",
             description=(
-                "In-app VACUUM INTO snapshot of localcv.db into BACKUP_DIR, keeping "
-                "BACKUP_KEEP copies."
+                f"VACUUM INTO snapshot of the database into {settings.backup_dir} (BACKUP_DIR),"
+                f" keeping {settings.backup_keep} copies (BACKUP_KEEP)."
             ),
             run=job(lambda p: _backup_database(db, get_settings())),
             trigger=_cron(hour=(h + 4) % 24, minute=0), disabled=_no_backups,
@@ -447,10 +461,9 @@ def build_job_specs(
         JobSpec(
             id="queue_snapshot", name="Backlog snapshot", category="maintenance",
             description=(
-                "Counts what every backfill still has to do (issues without details or "
-                "fields, volumes, publishers), the pending-fetch queue, response cache size "
-                "and the sync watermark. Read-only; the issue count scans cv_issue, so it "
-                "takes a few minutes on this disk. Shown in the Backlog card."
+                "Counts remaining backfill work, the pending queue, response cache size and the "
+                "sync watermark for the Backlog card. Read-only, but scans cv_issue, so it can "
+                "take minutes."
             ),
             run=job(lambda p: _queue_snapshot(db)),
             trigger=_cron(hour=(h + 2) % 24, minute=30), cancellable=False,
@@ -459,10 +472,8 @@ def build_job_specs(
         JobSpec(
             id="response_cache_audit", name="Response cache audit", category="maintenance",
             description=(
-                "Scans cv_response_cache for cached failures: ComicVine error envelopes, "
-                "unparseable rows and empty results (negative-cache entries are ignored). "
-                "The weekly run only reports; a manual run with 'Purge' deletes error "
-                "envelopes and unparseable rows so they are fetched again."
+                "Finds cached failures (error envelopes, unparseable rows, empty results) in the "
+                "response cache. Scheduled runs only report; 'Purge' deletes the bad rows."
             ),
             run=job(lambda p: _audit_response_cache(db, purge=p["purge"])),
             trigger=_cron(day_of_week="sat", hour=(h + 1) % 24, minute=30),
@@ -473,8 +484,8 @@ def build_job_specs(
         JobSpec(
             id="integrity_check", name="Integrity check", category="maintenance",
             description=(
-                "PRAGMA quick_check on a read-only connection. Reads the whole 4 GB file, so "
-                "it takes several minutes; run it after a crash or a disk problem."
+                "PRAGMA quick_check on a read-only connection. Reads the whole database, so it "
+                "is slow on large ones; run it after a crash or a disk problem."
             ),
             run=job(lambda p: _integrity_check(db)), cancellable=False,
             summarize=_sum_integrity,
@@ -483,10 +494,9 @@ def build_job_specs(
         JobSpec(
             id="publisher_repair", name="Publisher repair", category="repair",
             description=(
-                "Re-reads id and publisher for cached volumes from /volumes/ and writes "
-                "ComicVine's publisher IDs back, for databases seeded by tools that "
-                "numbered publishers themselves. 'Calendar volumes only' limits it to "
-                "volumes with dated issues."
+                "Rewrites cached volumes' publisher IDs from /volumes/ to match ComicVine's, for "
+                "databases imported with their own publisher numbering. Optionally calendar "
+                "volumes only."
             ),
             run=job(lambda p: _repair_publishers(
                 client, db, batch_size=p["batch_size"], calendar_only=p["calendar_only"]
@@ -502,9 +512,8 @@ def build_job_specs(
         JobSpec(
             id="fts_rebuild", name="FTS rebuild", category="repair",
             description=(
-                "Rebuilds the full-text search indexes (volume_fts, issue_fts, "
-                "publisher_fts) on a connection of its own. Triggers keep them current; "
-                "only needed after editing the database outside cvproxy."
+                "Rebuilds the full-text search indexes. Triggers keep them current; only needed "
+                "after editing the database outside cvproxy."
             ),
             run=job(lambda p: _rebuild_fts(db)), cancellable=False,
         ),

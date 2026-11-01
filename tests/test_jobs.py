@@ -266,6 +266,25 @@ def test_every_job_has_a_description_and_scheduled_jobs_are_registered(settings:
     assert catalog["comicvine_db_export"]["disabled"] == "CV_DB_EXPORT_PATH is not set"
 
 
+def test_job_descriptions_show_configured_values_and_their_setting(settings: Any) -> None:
+    settings = settings.model_copy(update={
+        "backfill_min_year": 2015, "cover_hash_per_hour": 250, "image_cache_ttl_days": 9,
+        "backup_keep": 4, "evict_older_than_years": 0, "search_cache_ttl_days": 0,
+    })
+    desc = {s.id: s.description for s in build_job_specs(settings, MagicMock(), MagicMock(),
+                                                         MagicMock())}
+    assert "2015 or later (BACKFILL_MIN_YEAR)" in desc["issue_detail_backfill"]
+    assert "250 covers per run (COVER_HASH_PER_HOUR)" in desc["cover_hash_backfill"]
+    assert "9 days (IMAGE_CACHE_TTL_DAYS)" in desc["image_cache_cleanup"]
+    assert "4 copies (BACKUP_KEEP)" in desc["database_backup"]
+    assert "off (EVICT_OLDER_THAN_YEARS)" in desc["evict_stale_data"]
+    assert "kept forever (SEARCH_CACHE_TTL_DAYS)" in desc["evict_stale_data"]
+    no_floor = settings.model_copy(update={"backfill_min_year": 0})
+    desc = {s.id: s.description for s in build_job_specs(no_floor, MagicMock(), MagicMock(),
+                                                         MagicMock())}
+    assert "any year (BACKFILL_MIN_YEAR)" in desc["issue_backfill"]
+
+
 def test_backup_job_not_scheduled_when_keep_is_zero(settings: Any) -> None:
     off = settings.model_copy(update={"backup_keep": 0})
     scheduler = create_scheduler(off, MagicMock(), MagicMock(), MagicMock())

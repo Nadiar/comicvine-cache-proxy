@@ -27,7 +27,8 @@ DASHBOARD_HTML = """\
     .source-badge { font-size: .75rem; }
     .footer-note { color: var(--bs-secondary-color); }
     #clientsTable tbody tr:hover { background: rgba(var(--bs-primary-rgb), .08); }
-    .job-desc { max-width: 46rem; }
+    .small { font-size: .8rem; }
+    .job-desc { max-width: 56rem; line-height: 1.3; }
     .job-log { max-height: 320px; overflow: auto; }
   </style>
 </head>
