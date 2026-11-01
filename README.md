@@ -70,6 +70,8 @@ environment, apply from the next job run or request, and stay until reset on tha
 | `CACHE_CUTOFF_YEAR` | `0` | Skip caching issues/volumes older than this publication year (e.g. `1995`). Issues checked against `store_date` then `cover_date`; volumes against `last_issue.cover_date`. `0` = disabled. |
 | `EVICT_OLDER_THAN_YEARS` † | `0` | Evict issues older than N years (disabled when `0`) |
 | `EVICT_UNACCESSED_DAYS` † | `180` | Grace period: skip eviction for recently-accessed entities |
+| `DASHBOARD_USERNAME` | `admin` | Sign-in name for `/dashboard`, `/admin/*` and `/docs` |
+| `DASHBOARD_PASSWORD` | *(unset)* | Sign-in password; unset leaves those pages open (a warning is logged). `/api/*` and `/health` never need it |
 | `HOST` | `0.0.0.0` | Listen address |
 | `PORT` | `8585` | Listen port |
 

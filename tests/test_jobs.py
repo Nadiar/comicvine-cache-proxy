@@ -239,8 +239,8 @@ def test_describe_trigger() -> None:
     assert describe_trigger({"trigger": "cron", "minute": 5}) == "Hourly at :05"
     assert describe_trigger({"trigger": "interval", "minutes": 2}) == "Every 2 min"
     assert describe_trigger({"trigger": "cron", "hour": "*/6", "minute": 15}) == "Every 6 h at :15"
-    daily = describe_trigger({"trigger": "cron", "hour": 3, "minute": 0}, "UTC")
-    assert daily == "Daily at 03:00 (UTC)"
+    daily = describe_trigger({"trigger": "cron", "hour": 3, "minute": 0})
+    assert daily == "Daily at 03:00"
     weekly = describe_trigger({"trigger": "cron", "day_of_week": "sat", "hour": 4, "minute": 30})
     assert weekly == "Weekly, Sat 04:30"
 
@@ -263,6 +263,8 @@ def test_every_job_has_a_description_and_scheduled_jobs_are_registered(settings:
     assert "issue_refetch" not in scheduled
     catalog = {c["id"]: c for c in runner.catalog()}
     assert catalog["integrity_check"]["schedule"] == "Manual only"
+    hour = settings.sync_cron_hour
+    assert catalog["releases_prefetch"]["schedule"] == f"Daily at {hour:02d}:00"
     assert catalog["comicvine_db_export"]["disabled"] == "CV_DB_EXPORT_PATH is not set"
 
 

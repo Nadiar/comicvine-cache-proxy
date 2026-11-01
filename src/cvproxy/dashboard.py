@@ -55,6 +55,7 @@ DASHBOARD_HTML = """\
         <button id="refreshBtn" class="btn btn-sm btn-outline-primary" title="Refresh now">
           <i class="bi bi-arrow-clockwise"></i>
         </button>
+        <!--LOGOUT-->
       </div>
     </div>
   </nav>
@@ -341,6 +342,14 @@ DASHBOARD_HTML = """\
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>
   <script>
+    // A session that ran out sends the browser back to the sign-in form
+    const rawFetch = window.fetch.bind(window);
+    window.fetch = async (...args) => {
+      const resp = await rawFetch(...args);
+      if (resp.status === 401) location.href = '/login?next=/dashboard';
+      return resp;
+    };
+
     // -----------------------------------------------------------------------
     // Chart defaults
     // -----------------------------------------------------------------------
@@ -988,3 +997,32 @@ DASHBOARD_HTML = """\
 </body>
 </html>
 """
+
+# Sign-in form (see auth.py); <!--ALERT--> and <!--TARGET--> are filled in there
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>CVProxy — Sign in</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+</head>
+<body class="d-flex align-items-center min-vh-100">
+  <main class="container" style="max-width:22rem">
+    <h4 class="mb-3">CVProxy</h4>
+    <!--ALERT-->
+    <form method="post" action="/login">
+      <input type="hidden" name="next" value="<!--TARGET-->">
+      <div class="mb-2">
+        <label class="form-label small mb-1" for="username">Username</label>
+        <input class="form-control" id="username" name="username" autocomplete="username" required autofocus>
+      </div>
+      <div class="mb-3">
+        <label class="form-label small mb-1" for="password">Password</label>
+        <input class="form-control" id="password" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <button class="btn btn-primary w-100" type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>"""

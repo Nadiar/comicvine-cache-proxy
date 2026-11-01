@@ -13,9 +13,20 @@ from typing import Annotated, Any
 from urllib.parse import parse_qs
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from cvproxy.auth import (
+    DEFAULT_NEXT,
+    SESSION_COOKIE,
+    SESSION_SECONDS,
+    AuthMiddleware,
+    credentials_match,
+    login_enabled,
+    login_page,
+    safe_next,
+    session_token,
+)
 from cvproxy.config import Settings, get_settings, override_settings
 from cvproxy.cv_client import CVClient
 from cvproxy.dashboard import DASHBOARD_HTML
@@ -200,6 +211,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     base_settings = get_settings()
     jobs_db = base_settings.jobs_db_path or base_settings.stats_db_path.with_name("jobs.db")
     settings = _load_overrides(app, base_settings, jobs_db)
+    if not login_enabled(settings):
+        logger.warning("DASHBOARD_PASSWORD is not set: /dashboard, /admin and /docs are open")
 
     # Database
     db = Database(settings.db_path, cutoff_year=settings.cache_cutoff_year)
@@ -311,6 +324,7 @@ def create_app() -> FastAPI:
     # Normalise paths so clients without trailing slashes don't trigger
     # broken 307 redirects when behind a TLS-terminating reverse proxy.
     app.add_middleware(TrailingSlashMiddleware)
+    app.add_middleware(AuthMiddleware)
 
     # Health check at root level (not under /api)
     @app.get("/health")
@@ -345,7 +359,50 @@ def create_app() -> FastAPI:
     # Dashboard — pretty HTML UI
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard_page() -> str:
-        return DASHBOARD_HTML
+        logout = (
+            '<form method="post" action="/logout" class="m-0"><button class="btn btn-sm '
+            'btn-outline-secondary" title="Sign out"><i class="bi bi-box-arrow-right"></i>'
+            "</button></form>"
+            if login_enabled(get_settings()) else ""
+        )
+        return DASHBOARD_HTML.replace("<!--LOGOUT-->", logout)
+
+    @app.get("/login", response_class=HTMLResponse)
+    def login_form(request: Request) -> Any:
+        if not login_enabled(get_settings()):
+            return RedirectResponse(DEFAULT_NEXT, status_code=303)
+        return login_page(safe_next(request.query_params.get("next", DEFAULT_NEXT)))
+
+    @app.post("/login")
+    async def login_submit(request: Request) -> Any:
+        form = parse_qs((await request.body()).decode())
+        username = form.get("username", [""])[0]
+        password = form.get("password", [""])[0]
+        target = safe_next(form.get("next", [DEFAULT_NEXT])[0])
+        settings = get_settings()
+        if not login_enabled(settings):
+            return RedirectResponse(target, status_code=303)
+        if not credentials_match(settings, username, password):
+            logger.warning("Failed dashboard login for %r from %s", username,
+                           request.client.host if request.client else "?")
+            await asyncio.sleep(1)  # slows down password guessing
+            return HTMLResponse(login_page(target, "Wrong username or password."),
+                                status_code=401)
+        response = RedirectResponse(target, status_code=303)
+        response.set_cookie(
+            SESSION_COOKIE,
+            session_token(settings.dashboard_username, settings.dashboard_password,
+                          expires=int(time.time()) + SESSION_SECONDS),
+            max_age=SESSION_SECONDS, httponly=True, samesite="lax", path="/",
+            secure=request.headers.get("x-forwarded-proto", request.url.scheme) == "https",
+        )
+        return response
+
+    @app.post("/logout")
+    def logout() -> RedirectResponse:
+        response = RedirectResponse("/login", status_code=303)
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        return response
 
     # Dashboard — JSON data API (consumed by the HTML dashboard)
     @app.get("/dashboard/data")

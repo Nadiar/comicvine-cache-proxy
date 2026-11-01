@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8585
 
+    # Login form in front of /dashboard, /admin and /docs; no password = login off
+    dashboard_username: str = "admin"
+    dashboard_password: str = ""
+
     model_config = {"env_prefix": "", "case_sensitive": False}
 
 

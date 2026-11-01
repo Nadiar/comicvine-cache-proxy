@@ -189,11 +189,10 @@ class JobSpec:
         return {p.name: p.coerce(raw.get(p.name)) for p in self.params}
 
 
-def describe_trigger(trigger: dict[str, Any] | None, tz: str = "") -> str:
-    """Human-readable schedule for a trigger dict."""
+def describe_trigger(trigger: dict[str, Any] | None) -> str:
+    """Human-readable schedule for a trigger dict, in the container's local time."""
     if not trigger:
         return "Manual only"
-    suffix = f" ({tz})" if tz else ""
     if trigger.get("trigger") == "interval":
         minutes = trigger.get("minutes")
         hours = trigger.get("hours")
@@ -204,8 +203,8 @@ def describe_trigger(trigger: dict[str, Any] | None, tz: str = "") -> str:
     if hour is None or hour == "*":
         return f"Hourly at :{minute:02d}"
     if isinstance(hour, str) and hour.startswith("*/"):
-        return f"Every {hour[2:]} h at :{minute:02d}{suffix}"
-    when = f"{int(hour):02d}:{minute:02d}{suffix}"
+        return f"Every {hour[2:]} h at :{minute:02d}"
+    when = f"{int(hour):02d}:{minute:02d}"
     if dow:
         return f"Weekly, {str(dow).capitalize()} {when}"
     return f"Daily at {when}"
@@ -842,7 +841,6 @@ class JobRunner:
     def catalog(self) -> list[dict[str, Any]]:
         """Every job with its description, schedule, next run and latest runs."""
         stored = self.history.latest_per_job()
-        tz = str(getattr(self._scheduler, "timezone", "") or "")
         out = []
         for spec in self.specs.values():
             job = self._scheduler.get_job(spec.id) if self._scheduler is not None else None
@@ -860,7 +858,7 @@ class JobRunner:
             active = self.running(spec.id)
             next_run = getattr(job, "next_run_time", None) if job is not None else None
             if job is not None:
-                schedule = describe_trigger(spec.trigger, tz)
+                schedule = describe_trigger(spec.trigger)
             else:
                 schedule = "Manual only" if spec.trigger is None else "Not scheduled"
             out.append({
