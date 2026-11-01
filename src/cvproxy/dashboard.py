@@ -229,7 +229,7 @@ DASHBOARD_HTML = """\
         <div class="table-responsive">
           <table class="table table-sm table-hover mb-0 align-middle" id="catalogTable">
             <thead class="table-dark">
-              <tr><th>Job</th><th>Schedule</th><th>Next run</th><th>Last run</th><th></th></tr>
+              <tr><th style="width:50%">Job</th><th>Schedule</th><th class="text-nowrap">Next run</th><th>Last run</th><th></th></tr>
             </thead>
             <tbody id="catalogBody">
               <tr><td colspan="5" class="text-center text-secondary py-3">Loading&hellip;</td></tr>
@@ -646,7 +646,7 @@ DASHBOARD_HTML = """\
       if (!j.last) return '<span class="text-secondary small">never</span>';
       const l = j.last;
       let html = `${jobStatusBadge(l.status, l.stop_text)} <span class="small">${relTime(l.finished_at || l.started_at)}</span>`
-               + `<div class="small text-secondary text-truncate" style="max-width:26rem" title="${esc(l.summary)}">${esc(l.summary)}</div>`;
+               + `<div class="small text-secondary text-truncate" style="max-width:18rem" title="${esc(l.summary)}">${esc(l.summary)}</div>`;
       if (!['done', 'idle'].includes(l.status)) {
         html += `<div class="small text-secondary">last ok: ${j.last_ok ? relTime(j.last_ok.finished_at) : 'never'}</div>`;
       }
