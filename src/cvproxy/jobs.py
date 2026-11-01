@@ -159,7 +159,8 @@ class JobSpec:
     id: str
     name: str
     category: str  # sync | backfill | export | maintenance | repair
-    description: str
+    #: Plain text, or built from the current settings when the catalog is read
+    description: str | Callable[[Settings], str]
     run: JobFn
     #: APScheduler trigger kwargs ({"trigger": "cron", "minute": 10}); None = manual only
     trigger: dict[str, Any] | None = None
@@ -560,6 +561,11 @@ class JobRunner:
         except Exception:  # noqa: BLE001 - no settings available (unit tests)
             return None
 
+    def description(self, spec: JobSpec) -> str:
+        if isinstance(spec.description, str):
+            return spec.description
+        return spec.description(self._settings())
+
     def attach(self, scheduler: BaseScheduler) -> None:
         """Record APScheduler's missed and overlapping runs as skipped runs."""
         from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
@@ -568,6 +574,31 @@ class JobRunner:
         scheduler.add_listener(
             self._on_scheduler_event, EVENT_JOB_MISSED | EVENT_JOB_MAX_INSTANCES
         )
+
+    def sync_schedule(self) -> None:
+        """Schedule every enabled job that has a trigger and unschedule disabled ones.
+
+        Called at start-up and whenever settings change, since a setting can turn
+        a job on or off (BACKUP_KEEP=0, COVER_HASH_PER_HOUR=0).
+        """
+        if self._scheduler is None:
+            return
+        for spec in self.specs.values():
+            if spec.trigger is None:
+                continue
+            scheduled = self._scheduler.get_job(spec.id) is not None
+            if self.disabled_reason(spec) is not None:
+                if scheduled:
+                    self._scheduler.remove_job(spec.id)
+                continue
+            if scheduled:
+                continue
+            trigger = dict(spec.trigger)
+            kind = trigger.pop("trigger")
+            self._scheduler.add_job(
+                self.scheduled(spec.id), kind, id=spec.id, name=spec.name,
+                replace_existing=True, max_instances=1, coalesce=True, **trigger,
+            )
 
     def startup(self) -> None:
         interrupted = self.history.mark_interrupted()
@@ -836,7 +867,7 @@ class JobRunner:
                 "id": spec.id,
                 "name": spec.name,
                 "category": spec.category,
-                "description": spec.description,
+                "description": self.description(spec),
                 "endpoints": list(spec.endpoints),
                 "schedule": schedule,
                 "scheduled": job is not None,

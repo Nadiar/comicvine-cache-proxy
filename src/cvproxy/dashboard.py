@@ -42,6 +42,7 @@ DASHBOARD_HTML = """\
         <ul class="nav nav-pills nav-sm me-2" id="mainTabs">
           <li class="nav-item"><a class="nav-link active py-1 px-2" data-tab="stats" href="#">Stats</a></li>
           <li class="nav-item"><a class="nav-link py-1 px-2" data-tab="jobs" href="#">Jobs <span class="badge text-bg-secondary ms-1" id="jobsBadge" style="display:none"></span></a></li>
+          <li class="nav-item"><a class="nav-link py-1 px-2" data-tab="settings" href="#">Settings</a></li>
         </ul>
         <div class="btn-group btn-group-sm" role="group" aria-label="Time filter" id="timeFilterGroup">
           <button type="button" class="btn btn-outline-secondary time-btn" data-hours="1">1h</button>
@@ -273,6 +274,32 @@ DASHBOARD_HTML = """\
         <div class="text-center py-2">
           <button class="btn btn-sm btn-outline-secondary" id="histMore" style="display:none">Load more</button>
         </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- =====================================================================
+       SETTINGS TAB PANE
+       ===================================================================== -->
+  <main class="container my-4" id="settingsPane" style="display:none">
+    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+      <h5 class="mb-0"><i class="bi bi-sliders me-2"></i>Settings</h5>
+      <div class="d-flex align-items-center gap-3">
+        <span class="small" id="settingsFeedback"></span>
+        <button class="btn btn-sm btn-primary" id="saveSettingsBtn"><i class="bi bi-check2"></i> Save</button>
+      </div>
+    </div>
+    <div class="card shadow-sm">
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0">
+          <thead><tr><th style="width:60%">Setting</th><th>Value</th><th>Source</th><th></th></tr></thead>
+          <tbody id="settingsBody"><tr><td colspan="4" class="small text-secondary">Loading&hellip;</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card-footer small footer-note">
+        Values saved here override the environment and apply from the next job run or request.
+        Reset goes back to the environment value, or the default when it isn't set.
+        Paths, the API key and rate limits stay in the environment.
       </div>
     </div>
   </main>
@@ -567,8 +594,9 @@ DASHBOARD_HTML = """\
     // Tab switching
     // -----------------------------------------------------------------------
     let currentTab = 'stats';
-    const statsPane = document.querySelector('main.container:not(#jobsPane)');
+    const statsPane = document.querySelector('main.container:not(#jobsPane):not(#settingsPane)');
     const jobsPane  = document.getElementById('jobsPane');
+    const settingsPane = document.getElementById('settingsPane');
     const timeFilterGroup = document.getElementById('timeFilterGroup');
 
     document.querySelectorAll('[data-tab]').forEach(link => {
@@ -579,8 +607,10 @@ DASHBOARD_HTML = """\
         link.classList.add('active');
         statsPane.style.display = currentTab === 'stats' ? '' : 'none';
         jobsPane.style.display  = currentTab === 'jobs'  ? '' : 'none';
+        settingsPane.style.display = currentTab === 'settings' ? '' : 'none';
         timeFilterGroup.style.display = currentTab === 'stats' ? '' : 'none';
         if (currentTab === 'jobs') loadJobsTab();
+        if (currentTab === 'settings') loadSettings();
       });
     });
 
@@ -891,6 +921,65 @@ DASHBOARD_HTML = """\
         else badge.style.display = 'none';
       }).catch(() => {});
     }
+    // -----------------------------------------------------------------------
+    // Settings tab
+    // -----------------------------------------------------------------------
+    const SOURCE_STYLE = {override: ['text-bg-primary', 'dashboard'], env: ['text-bg-info', 'env'],
+                          default: ['text-bg-secondary', 'default']};
+
+    function settingRow(s) {
+      const [cls, label] = SOURCE_STYLE[s.source];
+      const base = s.source === 'override'
+        ? `<div class="small text-secondary">env/default: ${esc(s.base)}</div>` : '';
+      const reset = s.source === 'override'
+        ? `<button class="btn btn-sm btn-outline-secondary reset-setting" data-name="${esc(s.name)}">Reset</button>` : '';
+      return `<tr>
+          <td><span class="fw-semibold">${esc(s.label)}</span> <code class="small ms-1">${esc(s.env)}</code>
+              <div class="small text-secondary job-desc">${esc(s.help)}</div></td>
+          <td style="width:8rem"><input type="number" class="form-control form-control-sm setting-input"
+              data-name="${esc(s.name)}" data-value="${esc(s.value)}" value="${esc(s.value)}" min="${esc(s.min)}" step="1"></td>
+          <td><span class="badge ${cls}">${label}</span>${base}</td>
+          <td class="text-end">${reset}</td></tr>`;
+    }
+
+    function showSettingsFeedback(ok, text) {
+      document.getElementById('settingsFeedback').innerHTML =
+        `<span class="${ok ? 'text-success' : 'text-danger'}"><i class="bi ${ok ? 'bi-check-circle' : 'bi-x-circle'} me-1"></i>${esc(text)}</span>`;
+    }
+
+    function renderSettings(rows) {
+      const body = document.getElementById('settingsBody');
+      body.innerHTML = rows.map(settingRow).join('');
+      body.querySelectorAll('.reset-setting').forEach(btn => btn.addEventListener('click',
+        () => saveSettings({[btn.dataset.name]: null})));
+    }
+
+    async function loadSettings() {
+      try { renderSettings(await fetch('/admin/settings').then(r => r.json())); }
+      catch (e) { console.error('Settings load failed:', e); }
+    }
+
+    async function saveSettings(changes) {
+      if (!Object.keys(changes).length) { showSettingsFeedback(true, 'Nothing changed.'); return; }
+      const resp = await fetch('/admin/settings', {
+        method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(changes)});
+      const data = await resp.json();
+      if (!resp.ok) { showSettingsFeedback(false, data.detail || resp.statusText); return; }
+      renderSettings(data);
+      showSettingsFeedback(true, 'Saved. Applies from the next job run or request.');
+    }
+
+    document.getElementById('saveSettingsBtn').addEventListener('click', () => {
+      const changes = {};
+      for (const input of document.querySelectorAll('.setting-input')) {
+        if (input.value === '' || input.value === input.dataset.value) continue;
+        const value = Number(input.value);
+        if (!Number.isInteger(value)) { showSettingsFeedback(false, `${input.dataset.name.toUpperCase()} must be a whole number`); return; }
+        changes[input.dataset.name] = value;
+      }
+      saveSettings(changes);
+    });
+
     // Boot
     load();
     startAutoRefresh();

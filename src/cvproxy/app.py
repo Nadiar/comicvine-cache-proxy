@@ -8,6 +8,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import parse_qs
 
@@ -15,12 +16,19 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from cvproxy.config import get_settings
+from cvproxy.config import Settings, get_settings, override_settings
 from cvproxy.cv_client import CVClient
 from cvproxy.dashboard import DASHBOARD_HTML
 from cvproxy.db import Database
 from cvproxy.image_cache import ImageCache
 from cvproxy.jobs import STATUSES, JobError, JobHistory, JobRunner
+from cvproxy.overrides import (
+    InvalidOverride,
+    OverrideStore,
+    apply_overrides,
+    describe_settings,
+    usable_overrides,
+)
 from cvproxy.routes.api import router as api_router
 from cvproxy.scheduler import build_job_specs, create_scheduler
 from cvproxy.stats import StatsTracker
@@ -189,7 +197,9 @@ def _dict_to_cv_xml(obj: Any, tag: str = "", resource_type: str = "") -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Start-up / shut-down lifecycle for the application."""
-    settings = get_settings()
+    base_settings = get_settings()
+    jobs_db = base_settings.jobs_db_path or base_settings.stats_db_path.with_name("jobs.db")
+    settings = _load_overrides(app, base_settings, jobs_db)
 
     # Database
     db = Database(settings.db_path, cutoff_year=settings.cache_cutoff_year)
@@ -244,7 +254,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     watchdog.start()
 
     # Background jobs: one runner records scheduled and manual runs alike
-    jobs_db = settings.jobs_db_path or settings.stats_db_path.with_name("jobs.db")
     runner = JobRunner(JobHistory(jobs_db))
     runner.register(build_job_specs(settings, cache, db, client))
     runner.startup()
@@ -268,7 +277,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     cache.close()
     stats.close()
     db.close()
+    app.state.override_store.close()
+    override_settings(base_settings)
     logger.info("Shutdown complete")
+
+
+def _load_overrides(app: FastAPI, base: Settings, jobs_db: Path) -> Settings:
+    """Apply the dashboard's stored setting overrides before anything reads settings."""
+    store = OverrideStore(jobs_db)
+    overrides = usable_overrides(store.load())
+    settings = apply_overrides(base, overrides)
+    override_settings(settings)
+    app.state.override_store = store
+    app.state.base_settings = base
+    app.state.setting_overrides = overrides
+    if overrides:
+        logger.info("Setting overrides from the dashboard: %s", overrides)
+    return settings
 
 
 def create_app() -> FastAPI:
@@ -415,6 +440,34 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         """Start any job by id now; the body holds its parameters (see the catalog)."""
         return _start(job, params)
+
+    def _settings_view() -> list[dict[str, Any]]:
+        return describe_settings(
+            app.state.base_settings, get_settings(), app.state.setting_overrides
+        )
+
+    @app.get("/admin/settings")
+    def admin_settings() -> list[dict[str, Any]]:
+        """Settings editable here, with their value, default and source."""
+        return _settings_view()
+
+    @app.put("/admin/settings")
+    def admin_settings_update(
+        changes: Annotated[dict[str, Any], Body()],
+    ) -> list[dict[str, Any]]:
+        """Override settings ({name: value}); a null value goes back to env/default."""
+        overrides = {**app.state.setting_overrides, **changes}
+        overrides = {k: v for k, v in overrides.items() if v is not None}
+        try:
+            settings = apply_overrides(app.state.base_settings, overrides)
+        except InvalidOverride as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        app.state.override_store.save(overrides)
+        app.state.setting_overrides = overrides
+        override_settings(settings)
+        _runner().sync_schedule()
+        logger.info("Setting overrides changed: %s", changes)
+        return _settings_view()
 
     # Older per-job endpoints, kept for scripts; they start the same jobs.
 

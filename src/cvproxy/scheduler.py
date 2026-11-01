@@ -333,9 +333,9 @@ def build_job_specs(
         # -- backfill --------------------------------------------------------
         JobSpec(
             id="issue_detail_backfill", name="Issue detail backfill", category="backfill",
-            description=(
+            description=lambda s: (
                 "Fetches /issue/ details (credits, variant covers) for up to 100 list-only "
-                f"issues dated {_min_year(settings)} or undated, newest first. Yields to "
+                f"issues dated {_min_year(s)} or undated, newest first. Yields to "
                 "client requests."
             ),
             run=job(lambda p: _backfill_issue_details(client, db)),
@@ -343,9 +343,9 @@ def build_job_specs(
         ),
         JobSpec(
             id="issue_backfill", name="Issue backfill", category="backfill",
-            description=(
+            description=lambda s: (
                 "Re-fetches up to 150 issues cached without date_last_updated (by older "
-                f"versions), dated {_min_year(settings)} first. IDs ComicVine no longer has "
+                f"versions), dated {_min_year(s)} first. IDs ComicVine no longer has "
                 "are skipped from then on."
             ),
             run=job(lambda p: _backfill_issues(client, db)),
@@ -390,9 +390,9 @@ def build_job_specs(
         ),
         JobSpec(
             id="cover_hash_backfill", name="Cover hash backfill", category="backfill",
-            description=(
+            description=lambda s: (
                 "Hashes cover images (pHash, average hash) into comic_covers for issues dated "
-                f"{_min_year(settings)}: up to {settings.cover_hash_per_hour} covers per run "
+                f"{_min_year(s)}: up to {s.cover_hash_per_hour} covers per run "
                 "(COVER_HASH_PER_HOUR). Uses the image CDN, not API quota."
             ),
             run=job(lambda p: _backfill_cover_hashes(db, get_settings())),
@@ -401,9 +401,9 @@ def build_job_specs(
         # -- export ----------------------------------------------------------
         JobSpec(
             id="comicvine_db_export", name="comicvine.db export", category="export",
-            description=(
+            description=lambda s: (
                 "Builds comicvine.db from a read-only snapshot and swaps it into "
-                f"{_path(settings.cv_db_export_path, 'CV_DB_EXPORT_PATH')} with an atomic "
+                f"{_path(s.cv_db_export_path, 'CV_DB_EXPORT_PATH')} with an atomic "
                 "rename."
             ),
             run=job(lambda p: _export_comicvine_db(db, get_settings())),
@@ -412,9 +412,9 @@ def build_job_specs(
         ),
         JobSpec(
             id="mcl_refresh", name="latest.mcl refresh", category="export",
-            description=(
+            description=lambda s: (
                 "Downloads the newest latest.mcl to "
-                f"{_path(settings.mcl_export_path, 'MCL_EXPORT_PATH')}, replacing the file only "
+                f"{_path(s.mcl_export_path, 'MCL_EXPORT_PATH')}, replacing the file only "
                 "when it changed and parses."
             ),
             run=job(lambda p: _refresh_mcl(get_settings())),
@@ -432,7 +432,7 @@ def build_job_specs(
         ),
         JobSpec(
             id="evict_stale_data", name="Cache eviction", category="maintenance",
-            description=_eviction_description(settings),
+            description=_eviction_description,
             run=job(lambda p: _evict_stale_data(db, get_settings(), dry_run=p["dry_run"])),
             trigger=_cron(hour=(h + 3) % 24, minute=0), destructive=True,
             params=(Param("dry_run", "bool", True, "Dry run (count only)",
@@ -441,8 +441,8 @@ def build_job_specs(
         ),
         JobSpec(
             id="image_cache_cleanup", name="Image cache cleanup", category="maintenance",
-            description=(
-                f"Removes cached images not accessed for {settings.image_cache_ttl_days} days "
+            description=lambda s: (
+                f"Removes cached images not accessed for {s.image_cache_ttl_days} days "
                 "(IMAGE_CACHE_TTL_DAYS)."
             ),
             run=job(lambda p: _cleanup_images(image_cache)),
@@ -450,9 +450,9 @@ def build_job_specs(
         ),
         JobSpec(
             id="database_backup", name="Database backup", category="maintenance",
-            description=(
-                f"VACUUM INTO snapshot of the database into {settings.backup_dir} (BACKUP_DIR),"
-                f" keeping {settings.backup_keep} copies (BACKUP_KEEP)."
+            description=lambda s: (
+                f"VACUUM INTO snapshot of the database into {s.backup_dir} (BACKUP_DIR),"
+                f" keeping {s.backup_keep} copies (BACKUP_KEEP)."
             ),
             run=job(lambda p: _backup_database(db, get_settings())),
             trigger=_cron(hour=(h + 4) % 24, minute=0), disabled=_no_backups,
@@ -544,25 +544,11 @@ def create_scheduler(
         job_defaults={"coalesce": True, "misfire_grace_time": _MISFIRE_GRACE_SECONDS}
     )
     if runner is None:
-        runner = JobRunner()
+        runner = JobRunner(settings_provider=lambda: settings)
     if not runner.specs:
         runner.register(build_job_specs(settings, image_cache, db, client))
-    for spec in runner.specs.values():
-        if spec.trigger is None or spec.disabled(settings):
-            continue
-        trigger = dict(spec.trigger)
-        kind = trigger.pop("trigger")
-        scheduler.add_job(
-            runner.scheduled(spec.id),
-            kind,
-            id=spec.id,
-            name=spec.name,
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            **trigger,
-        )
     runner.attach(scheduler)
+    runner.sync_schedule()
     return scheduler
 
 
