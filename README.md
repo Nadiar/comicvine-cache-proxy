@@ -4,6 +4,12 @@ ComicVine API proxy with local SQLite cache, full-text search, and on-demand ima
 
 Drop-in replacement for the ComicVine API URL — point your tools (ComicTagger, Mylar, etc.) at this proxy instead of `comicvine.gamespot.com`.
 
+> [!IMPORTANT]
+> **Private use only.** Everything cvproxy stores comes from the ComicVine API under your own API key, and is subject to the [ComicVine API terms of use](https://comicvine.gamespot.com/api/).
+>
+> - **Keep the server off the public internet.** Run it on your own network, or behind an IP allowlist and sign-in, for your own tools. Don't offer it as a public ComicVine mirror.
+> - **Don't distribute the data.** Don't publish or share `localcv.db`, the `comicvine.db` export, backups or cached images.
+
 ## Features
 
 - **CV-compatible REST API** — transparent proxy, tools need no modification
@@ -17,6 +23,8 @@ Drop-in replacement for the ComicVine API URL — point your tools (ComicTagger,
 - **Stats dashboard** — live cache hit rate, per-client and per-endpoint breakdowns
 - **Dashboard sign-in, Jobs, Settings and Publishers tabs** — run history with backlog estimates, run-time settings, publisher allow/block lists with CSV import and export
 - **Publisher allowlist and blocklist** — backfills only fetch the publishers you want; blocked publishers are never served, stored or exported
+- **ComicManager export** — a daily `comicvine.db` in the `localcv.db` layout, with cover hashes for cover matching
+- **Missing comics list (MCL)** — keeps the community `latest.mcl` current and fetches the volumes and issues it lists that the database lacks
 - **Admin API** — on-demand sync, publisher repair, cache eviction, FTS rebuild
 - **Docker-ready** — single container deployment
 
@@ -76,6 +84,35 @@ environment, apply from the next job run or request, and stay until reset on tha
 | `DASHBOARD_PASSWORD` | *(unset)* | Sign-in password; unset leaves those pages open (a warning is logged). `/api/*` and `/health` never need it |
 | `HOST` | `0.0.0.0` | Listen address |
 | `PORT` | `8585` | Listen port |
+
+## Local Database
+
+cvproxy keeps its ComicVine data in one SQLite file, `localcv.db` (`DB_PATH`). It fills the file itself:
+
+- from client requests that miss the cache;
+- from the background syncs, which re-read issues and volumes that ComicVine changed;
+- from the backfills and the MCL gap backfill.
+
+You can also start from an existing `localcv.db`, for example one built by `sqlite_cv_updater.py`, by putting it at `DB_PATH` before the first start:
+
+- **Schema upgrade:** missing columns, indexes and full-text tables are added at startup. On a database with about a million issues this adds a few minutes to that first start.
+- **Publisher IDs:** databases from older tools may number publishers their own way. Run the *Publisher repair* job to map them to ComicVine's IDs.
+
+Files under `/data`:
+
+| File | What it holds |
+| --- | --- |
+| `localcv.db` | ComicVine data: publishers, volumes, issues, cover hashes, the search and response caches, the publisher lists |
+| `jobs.db` | Job run history (30 days) and the Settings tab overrides |
+| `stats.db` | Request statistics for the dashboard |
+| `rate_state.json` | Recent upstream calls and any cooldown, so a restart doesn't overrun ComicVine's limits |
+| `images/` | Cached cover images |
+| `backups/` | Nightly `VACUUM INTO` snapshots of `localcv.db` (`BACKUP_KEEP`) |
+
+Notes:
+
+- **Slow work runs off the main thread.** Scans, exports and backups use connections of their own on worker threads, so client requests keep being answered.
+- **Free space after deletes.** Eviction and the blocked-publisher purge leave free pages, so the file doesn't shrink. The backups are compacted.
 
 ## Usage
 
@@ -256,7 +293,7 @@ With `CV_DB_EXPORT_PATH` set, a daily job writes a `comicvine.db` in the layout 
 
 The file is built as `comicvine.db.partial` on local disk next to cvproxy's own database, copied into the destination folder (which can be a network share), and renamed into place. ComicManager opens it with `immutable=1`, so it must never see the file change. Consumers should **mount the directory, not the file**. A single-file bind mount keeps showing the old file after the rename.
 
-`MCL_EXPORT_PATH` (usually the same folder, as `latest.mcl`) keeps a copy of the community missing-comics list. ComicManager only reads it as a fallback when `comicvine.db` is missing.
+`MCL_EXPORT_PATH` (usually the same folder, as `latest.mcl`) keeps a copy of the community missing-comics list (see below). ComicManager only reads it as a fallback when `comicvine.db` is missing.
 
 ```yaml
 # cvproxy
@@ -273,16 +310,26 @@ Limits:
 - **Cover hashes:** with `COVER_HASH_PER_HOUR` set, cvproxy adds `comic_covers` rows for newer issues. It uses the `imagehash` pHash and average hash that ComicManager computes, applied to the `scale_medium` image, which hashes the same as the original. Issues whose details haven't been fetched only get their main cover, not variants. Without it, only the hashes imported with the original `localcv.db` exist.
 - **Credits:** issues stored only from list responses show empty credits until the issue detail backfill reaches them.
 
+## Missing Comics List (latest.mcl)
+
+The community *missing comics list* maps every ComicVine volume to the IDs and numbers of all its issues, one `volume_id;issue_ids;issue_numbers` row per volume. It's published under a dated name (`20261020_latest.mcl`) in the folder `MCL_SOURCE_URL` lists. With `MCL_EXPORT_PATH` set:
+
+- **latest.mcl refresh** (daily) downloads the newest file and replaces the local copy only when it changed and parses.
+- **MCL gap backfill** (daily) compares the list with the database and fetches what's missing, newest first, 100 IDs per `/volumes/` or `/issues/` call. Issues arrive without credits; the issue detail backfill adds them later.
+  - **Blocked publishers:** their volumes and issues are skipped.
+  - **Allowlist:** when one is set, only issues of allowlisted publishers' volumes are fetched. Missing volumes are fetched whatever their publisher, because it isn't known until they arrive.
+
 ## Development
 
 ```bash
-# Run tests
-pytest -v
+pip install -e ".[dev]"
 
-# Lint and format
-ruff check src/ tests/
-ruff format src/ tests/
+# Tests (PYTHONPATH makes sure the checkout is tested, not an installed copy)
+PYTHONPATH=src python -m pytest -q
 
-# Type check
-mypy src --strict
+# Lint and type check (both must be clean)
+python -m ruff check src tests
+PYTHONPATH=src python -m mypy src
 ```
+
+The version lives in `src/cvproxy/__init__.py` and `pyproject.toml`; changes are listed in [CHANGELOG.md](CHANGELOG.md).

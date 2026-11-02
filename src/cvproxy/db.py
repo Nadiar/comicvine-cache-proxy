@@ -2299,6 +2299,19 @@ class Database:
         finally:
             conn.close()
 
+    def allowed_volume_ids_snapshot(self) -> set[int] | None:
+        """Stored volumes of allowlisted publishers (worker thread); None without an allowlist."""
+        if not self.allowed_publishers:
+            return None
+        conn = self._ro_connect()
+        try:
+            return {row[0] for row in conn.execute(
+                "SELECT id FROM cv_volume"  # noqa: S608
+                f" WHERE publisher_id IN ({_id_list(self.allowed_publishers)})"
+            )}
+        finally:
+            conn.close()
+
     def rebuild_fts(self) -> dict[str, dict[str, int]]:
         """Rebuild volume_fts, issue_fts and publisher_fts on a connection of its own."""
         tables = ("volume_fts", "issue_fts", "publisher_fts")

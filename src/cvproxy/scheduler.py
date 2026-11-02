@@ -1442,16 +1442,23 @@ async def _backfill_from_mcl(
         db.conn.commit()
         return len(rows)
 
+    # Blocked volumes are never stored, so without this they'd be "missing" every run
     local_volumes = await asyncio.to_thread(db.existing_ids_snapshot, "cv_volume")
-    missing_volumes = sorted(set(mcl) - local_volumes, reverse=True)
+    missing_volumes = sorted(set(mcl) - local_volumes - db.blocked_volumes, reverse=True)
     result["volumes_missing"] = len(missing_volumes)
     result["volumes_added"], stop = await _fetch_ids_in_batches(
         client, db, "volumes/", missing_volumes, store_volumes
     )
 
     local_issues = await asyncio.to_thread(db.existing_ids_snapshot, "cv_issue")
+    allowed = await asyncio.to_thread(db.allowed_volume_ids_snapshot)
     missing_issues = sorted(
-        {iid for ids in mcl.values() for iid in ids} - local_issues, reverse=True
+        {
+            iid for vid, ids in mcl.items()
+            if vid not in db.blocked_volumes and (allowed is None or vid in allowed)
+            for iid in ids
+        } - local_issues,
+        reverse=True,
     )
     result["issues_missing"] = len(missing_issues)
     if stop != "rate_limited":  # after a refusal every endpoint waits out the cooldown

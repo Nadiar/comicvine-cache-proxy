@@ -5,6 +5,8 @@
 - **Incremental volume sync:** an hourly job re-reads volumes ComicVine changed since its own watermark, like the issue sync. Before, a volume edited on ComicVine after cvproxy stored it stayed as first stored.
 - **Volume sync rewind:** a manual job moves the volume watermark back N days (default 730) so the hourly sync re-reads that span, 45 days per run.
 - Volume rows from list responses (`/volumes/`, search, the sync) no longer wipe stored character, people, concept and object lists.
+- MCL gap backfill skips blocked publishers' volumes and issues (they were never stored, so they counted as missing every day), and with an allowlist only fetches issues of allowlisted publishers' volumes.
+- README: private-use notice (keep servers off the public internet, don't distribute the data, per the ComicVine API terms), plus sections on the local database and the missing comics list.
 
 ## 2.0.0 (2026-11-01)
 

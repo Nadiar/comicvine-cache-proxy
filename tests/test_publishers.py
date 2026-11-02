@@ -307,3 +307,32 @@ def test_importing_with_replace_drops_entries_missing_from_the_file(client: Test
 
 def test_importing_into_an_unknown_list_is_rejected(client: TestClient) -> None:
     assert client.post("/admin/publishers/maybe.csv", content="1\n").status_code == 404
+
+
+async def test_mcl_gap_backfill_skips_blocked_volumes_and_unallowed_issues(
+    tmp_db: Database, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from cvproxy.config import Settings
+    from cvproxy.scheduler import _backfill_from_mcl
+
+    _add_blocked_publisher_data(tmp_db)
+    tmp_db.set_publisher_list(BLOCKED_PUB, "block")
+    tmp_db.purge_blocked()
+    tmp_db.upsert_volume({"id": 7000, "name": "Other", "publisher": {"id": 2, "name": "Marvel"}})
+    tmp_db.set_publisher_list(1, "allow")
+    mcl = tmp_path / "latest.mcl"
+    mcl.write_text(f"{BLOCKED_VOL};9001,9002;1,2\n160294;999001;7\n7000;999003;1\n")
+    client = MagicMock()
+    client.hourly_calls.return_value = 0
+    client.get = AsyncMock(return_value={"status_code": 1, "results": [
+        {"id": 999001, "volume": {"id": 160294}, "issue_number": "7"}]})
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        result = await _backfill_from_mcl(
+            client, tmp_db, Settings(cv_api_key="k", mcl_export_path=mcl))
+
+    assert result["volumes_missing"] == 0
+    assert result["issues_missing"] == 1
+    assert [c.args[1]["filter"] for c in client.get.call_args_list] == ["id:999001"]
