@@ -15,8 +15,8 @@ from cvproxy.scheduler import (
     _MISFIRE_GRACE_SECONDS,
     _SYNC_OVERLAP,
     ISSUE_SYNC_WATERMARK,
-    _sync_issue_window,
     _sync_issues_incremental,
+    _sync_window,
     create_scheduler,
 )
 
@@ -123,7 +123,7 @@ async def test_rate_limit_stops_the_window(tmp_db: Database) -> None:
 
     cv.get = _get
     now = _utcnow()
-    upserted, latest, complete = await _sync_issue_window(cv, tmp_db, now - timedelta(days=1), now)
+    upserted, latest, complete = await _sync_window(cv, tmp_db, now - timedelta(days=1), now)
     assert (upserted, latest, complete) == (0, None, False)
 
 
@@ -132,7 +132,7 @@ async def test_window_is_walked_in_daily_slices(tmp_db: Database) -> None:
     cv = FakeCV([_issue(9300 + d, (now - timedelta(days=d, hours=1)).strftime(_CV_TS))
                  for d in range(5)])
 
-    upserted, _latest, complete = await _sync_issue_window(
+    upserted, _latest, complete = await _sync_window(
         cv, tmp_db, now - timedelta(days=5), now  # type: ignore[arg-type]
     )
 
@@ -144,7 +144,7 @@ async def test_window_is_walked_in_daily_slices(tmp_db: Database) -> None:
 async def test_max_chunks_bounds_a_run(tmp_db: Database) -> None:
     now = _utcnow()
     cv = FakeCV([])
-    _u, _l, complete = await _sync_issue_window(
+    _u, _l, complete = await _sync_window(
         cv, tmp_db, now - timedelta(days=10), now, max_chunks=3  # type: ignore[arg-type]
     )
     assert complete is False

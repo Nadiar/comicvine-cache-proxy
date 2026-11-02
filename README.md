@@ -214,6 +214,7 @@ after them. Every job can be started from the Jobs tab.
 | Job | Schedule | Description |
 | --- | --- | --- |
 | Incremental issue sync | Hourly at :10 | Issues changed since the stored watermark, in 24h slices; the watermark only moves over stored data |
+| Incremental volume sync | Hourly at :25 | Volumes changed since the volume watermark, in 24h slices; keeps stored character/people lists |
 | Releases prefetch | Daily at H:00 | Issues with a store date from 2 weeks ago to 1 week ahead |
 | Pending fetch | Every 2 min | Cache misses queued while ComicVine couldn't be asked; idle runs aren't kept in history |
 | Issue detail backfill | Hourly at :05 | /issue/ details (credits) for issues stored from list responses, newest first; allowed publishers only |
@@ -232,6 +233,7 @@ after them. Every job can be started from the Jobs tab.
 | Database backup | Daily at H+4 | Only when `BACKUP_KEEP` > 0 |
 | Backlog snapshot | Daily at H+2:30, and after a publisher list change | Read-only counts of every backfill's remaining work (Backlog card) |
 | Response cache audit | Weekly, Sat H+1:30 | Reports cached error envelopes, unparseable rows and empty results |
+| Volume sync rewind | Manual | Moves the volume watermark back N days (default 730); the hourly volume sync re-reads from there |
 | Issue re-sync (time window) | Manual | Issues changed in the last N days; doesn't move the watermark |
 | Re-fetch issues | Manual | Specific issue IDs and/or a volume's issues, optional /issue/ details |
 | Response cache audit (purge) | Manual | Deletes error envelopes and unparseable rows |

@@ -114,6 +114,9 @@ ISSUE_DETAIL_FIELDS: tuple[str, ...] = (
     "first_appearance_storyarcs", "first_appearance_teams",
 )
 
+#: cv_volume columns only the /volume/ detail endpoint returns (never /volumes/ lists)
+VOLUME_DETAIL_FIELDS: tuple[str, ...] = ("characters", "concepts", "people", "objects")
+
 #: Schema of the exported comicvine.db: the localcv.db distribution layout read
 #: by ComicManager and kept current by its sqlite_cv_updater.py script.
 _LOCALCV_EXPORT_DDL = """
@@ -1815,36 +1818,41 @@ class Database:
             except (TypeError, ValueError):
                 return False
 
-        self.conn.execute(
-            """INSERT OR REPLACE INTO cv_volume
-                   (id, name, aliases, start_year, publisher_id, count_of_issues,
-                    description, image_url, site_detail_url, deck,
-                    characters, concepts, people, objects,
-                    first_issue, last_issue,
-                    api_detail_url, date_added, date_last_updated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                data.get("id"),
-                data.get("name"),
-                aliases,
-                data.get("start_year"),
-                pub.get("id"),
-                data.get("count_of_issues"),
-                data.get("description"),
-                image_url,
-                data.get("site_detail_url"),
-                data.get("deck"),
-                _to_json(data.get("characters")),
-                _to_json(data.get("concepts")),
-                _to_json(data.get("people")),
-                _to_json(data.get("objects")),
-                _to_json(None if _sentinel(data.get("first_issue")) else data.get("first_issue")),
-                _to_json(None if _sentinel(data.get("last_issue")) else data.get("last_issue")),
-                data.get("api_detail_url"),
-                data.get("date_added"),
-                data.get("date_last_updated"),
-            ],
-        )
+        row: dict[str, Any] = {
+            "id": data.get("id"),
+            "name": data.get("name"),
+            "aliases": aliases,
+            "start_year": data.get("start_year"),
+            "publisher_id": pub.get("id"),
+            "count_of_issues": data.get("count_of_issues"),
+            "description": data.get("description"),
+            "image_url": image_url,
+            "site_detail_url": data.get("site_detail_url"),
+            "deck": data.get("deck"),
+            "first_issue": _to_json(
+                None if _sentinel(data.get("first_issue")) else data.get("first_issue")),
+            "last_issue": _to_json(
+                None if _sentinel(data.get("last_issue")) else data.get("last_issue")),
+            "api_detail_url": data.get("api_detail_url"),
+            "date_added": data.get("date_added"),
+            "date_last_updated": data.get("date_last_updated"),
+        }
+        if any(col in data for col in VOLUME_DETAIL_FIELDS):
+            row.update({col: _to_json(data.get(col)) for col in VOLUME_DETAIL_FIELDS})
+            self.conn.execute(
+                f"INSERT OR REPLACE INTO cv_volume ({', '.join(row)})"  # noqa: S608
+                f" VALUES ({', '.join('?' * len(row))})",
+                list(row.values()),
+            )
+        else:
+            # List responses (/volumes/, search) lack the detail lists: keep stored ones
+            updates = ", ".join(f"{col} = excluded.{col}" for col in row if col != "id")
+            self.conn.execute(
+                f"INSERT INTO cv_volume ({', '.join(row)})"  # noqa: S608
+                f" VALUES ({', '.join('?' * len(row))})"
+                f" ON CONFLICT(id) DO UPDATE SET {updates}",
+                list(row.values()),
+            )
         if commit:
             self.conn.commit()
 

@@ -110,7 +110,8 @@ def _sum_backfill(r: dict[str, Any]) -> str:
 
 
 def _sum_sync(r: dict[str, Any]) -> str:
-    text = f"{r.get('issues_upserted', 0)} issues upserted"
+    noun = "volumes" if "volumes_upserted" in r else "issues"
+    text = f"{r.get(noun + '_upserted', 0)} {noun} upserted"
     if r.get("watermark"):
         text += f", watermark {r['watermark']}"
     if r.get("window_hours"):
@@ -294,6 +295,9 @@ def build_job_specs(
     def job(fn: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]) -> Any:
         return fn
 
+    async def run_rewind(p: dict[str, Any]) -> dict[str, Any]:
+        return _rewind_volume_sync(db, p["days"])  # main connection: stays on the loop
+
     async def run_refetch(p: dict[str, Any]) -> dict[str, Any]:
         return await _refetch_issues(
             client, db, parse_id_list(p["ids"]), p["volume_id"], details=p["details"]
@@ -310,6 +314,26 @@ def build_job_specs(
             ),
             run=job(lambda p: _sync_issues_incremental(client, db)),
             trigger=_cron(minute=10), endpoints=("issues/",), summarize=_sum_sync,
+        ),
+        JobSpec(
+            id="incremental_volume_sync", name="Incremental volume sync", category="sync",
+            description=(
+                "Upserts volumes ComicVine changed since the volume watermark, like the issue "
+                "sync (24 h slices, at most 45 per run). Keeps stored character, people and "
+                "concept lists."
+            ),
+            run=job(lambda p: _sync_volumes_incremental(client, db)),
+            trigger=_cron(minute=25), endpoints=("volumes/",), summarize=_sum_sync,
+        ),
+        JobSpec(
+            id="volume_sync_rewind", name="Volume sync rewind", category="sync",
+            description=(
+                "Moves the volume sync watermark back N days (never forward). The hourly volume "
+                "sync then re-reads everything changed since, 45 days per run."
+            ),
+            run=job(run_rewind),
+            params=(Param("days", "float", 730.0, "Look-back (days)",
+                          "Re-read volumes changed within this many days.", 1, 3650),),
         ),
         JobSpec(
             id="releases_prefetch", name="Releases prefetch", category="sync",
@@ -973,8 +997,9 @@ async def _checkpoint_wal(db: Database) -> dict[str, Any]:
 # Incremental issue sync  (issues endpoint, date_last_updated watermark)
 # ---------------------------------------------------------------------------
 
-#: cv_sync_metadata key holding the incremental issue sync watermark.
+#: cv_sync_metadata keys holding the incremental sync watermarks.
 ISSUE_SYNC_WATERMARK = "issues_incremental"
+VOLUME_SYNC_WATERMARK = "volumes_incremental"
 #: CV timestamp format (date_last_updated and filter bounds).
 _CV_TS = "%Y-%m-%d %H:%M:%S"
 #: Re-read this far behind the watermark: edits sharing its second, or saved
@@ -1005,16 +1030,31 @@ def _store_issue_page(db: Database, results: list[dict[str, Any]]) -> None:
     db.conn.commit()
 
 
-async def _sync_issue_window(
+def _store_volume_page(db: Database, results: list[dict[str, Any]]) -> None:
+    """Upsert one page of list-endpoint volumes and commit (event loop thread)."""
+    for volume in results:
+        db.upsert_volume(volume, commit=False)
+    db.conn.commit()
+
+
+#: List endpoints the incremental sync reads, and how a page of each is stored.
+_SYNC_STORE: dict[str, Callable[[Database, list[dict[str, Any]]], None]] = {
+    "issues/": _store_issue_page,
+    "volumes/": _store_volume_page,
+}
+
+
+async def _sync_window(
     client: CVClient,
     db: Database,
     start: datetime,
     end: datetime,
     *,
+    endpoint: str = "issues/",
     max_chunks: int | None = None,
     outcome: dict[str, Any] | None = None,
 ) -> tuple[int, str | None, bool]:
-    """Upsert issues CV updated between *start* and *end*, oldest first.
+    """Upsert issues or volumes (*endpoint*) CV updated between *start* and *end*.
 
     Walks the range in _SYNC_CHUNK slices.  Returns (upserted, latest
     date_last_updated stored, complete).  Stops at the first failed request;
@@ -1035,7 +1075,7 @@ async def _sync_issue_window(
         offset = 0
         while True:
             data = await client.get(
-                "issues/",
+                endpoint,
                 {
                     "filter": (
                         f"date_last_updated:{chunk_start.strftime(_CV_TS)}"
@@ -1051,7 +1091,8 @@ async def _sync_issue_window(
                 break
             if not data:
                 logger.warning(
-                    "Issue sync: upstream request failed for slice %s at offset %d%s",
+                    "Sync of %s: upstream request failed for slice %s at offset %d%s",
+                    endpoint,
                     chunk_start.strftime(_CV_TS),
                     offset,
                     " (rate limited)" if data is _CV_RATE_LIMITED else "",
@@ -1061,7 +1102,7 @@ async def _sync_issue_window(
                 return upserted, latest, False
             results = data.get("results") or []
             if results:
-                _store_issue_page(db, results)
+                _SYNC_STORE[endpoint](db, results)
                 upserted += len(results)
                 page_latest = max(str(r.get("date_last_updated") or "") for r in results)
                 if page_latest and (latest is None or page_latest > latest):
@@ -1071,47 +1112,78 @@ async def _sync_issue_window(
                 break
         chunks += 1
         chunk_start = chunk_end
-        report_progress(chunks, total_chunks, f"{upserted} issues")
+        report_progress(chunks, total_chunks, f"{upserted} {endpoint.rstrip('/')}")
     return upserted, latest, True
 
 
-async def _sync_issues_incremental(client: CVClient, db: Database) -> dict[str, Any]:
-    """Pull issues updated since the stored watermark and upsert them.
+async def _sync_incremental(
+    client: CVClient, db: Database, endpoint: str, watermark_key: str
+) -> dict[str, Any]:
+    """Pull issues or volumes (*endpoint*) updated since their watermark and upsert them.
 
     The watermark is the newest date_last_updated actually stored, in CV's own
     clock, and it only moves forward over data that was fully written.  A run
     that fails (CV 5xx, rate limit) or never fires leaves it in place, so the
     next run resumes where the last good one stopped instead of leaving a gap.
     """
+    noun = endpoint.rstrip("/")
     now = datetime.now(UTC).replace(tzinfo=None)
-    mark = db.get_sync_watermark(ISSUE_SYNC_WATERMARK)
+    mark = db.get_sync_watermark(watermark_key)
     if mark:
         start = datetime.strptime(mark, _CV_TS) - _SYNC_OVERLAP
     else:
         start = now - _SYNC_INITIAL_LOOKBACK
     end = now + _SYNC_FUTURE_PAD
     logger.info(
-        "Incremental sync: issues updated since %s (watermark %s)",
+        "Incremental sync: %s updated since %s (watermark %s)",
+        noun,
         start.strftime(_CV_TS),
         mark or "none",
     )
     outcome: dict[str, Any] = {}
-    upserted, latest, complete = await _sync_issue_window(
-        client, db, start, end, max_chunks=_SYNC_MAX_CHUNKS, outcome=outcome
+    upserted, latest, complete = await _sync_window(
+        client, db, start, end, endpoint=endpoint, max_chunks=_SYNC_MAX_CHUNKS, outcome=outcome
     )
     if latest and (mark is None or latest > mark):
-        db.set_sync_watermark(ISSUE_SYNC_WATERMARK, latest)
+        db.set_sync_watermark(watermark_key, latest)
         mark = latest
     logger.info(
-        "Incremental sync: upserted %d issues, watermark %s%s",
+        "Incremental sync: upserted %d %s, watermark %s%s",
         upserted,
+        noun,
         mark or "none",
         "" if complete else " (incomplete; next run resumes from watermark)",
     )
-    result: dict[str, Any] = {"issues_upserted": upserted, "watermark": mark, "complete": complete}
+    result: dict[str, Any] = {
+        f"{noun}_upserted": upserted, "watermark": mark, "complete": complete,
+    }
     if not complete:
         result["stop_reason"] = outcome.get("stop_reason", "upstream_error")
     return result
+
+
+async def _sync_issues_incremental(client: CVClient, db: Database) -> dict[str, Any]:
+    """Issues ComicVine changed since the issue watermark."""
+    return await _sync_incremental(client, db, "issues/", ISSUE_SYNC_WATERMARK)
+
+
+async def _sync_volumes_incremental(client: CVClient, db: Database) -> dict[str, Any]:
+    """Volumes ComicVine changed since the volume watermark."""
+    return await _sync_incremental(client, db, "volumes/", VOLUME_SYNC_WATERMARK)
+
+
+def _rewind_volume_sync(db: Database, days: float) -> dict[str, Any]:
+    """Move the volume sync watermark back *days*, never forward.
+
+    The hourly volume sync then re-reads everything changed since, 45 days
+    per run, resuming after failures like any other backlog.
+    """
+    previous = db.get_sync_watermark(VOLUME_SYNC_WATERMARK)
+    target = (datetime.now(UTC).replace(tzinfo=None) - timedelta(days=days)).strftime(_CV_TS)
+    mark = min(previous, target) if previous else target
+    db.set_sync_watermark(VOLUME_SYNC_WATERMARK, mark)
+    logger.info("Volume sync watermark rewound from %s to %s", previous or "none", mark)
+    return {"watermark": mark, "previous": previous}
 
 
 async def _sync_recent_issues(client: CVClient, db: Database, hours: int = 48) -> dict[str, Any]:
@@ -1132,7 +1204,7 @@ async def _sync_recent_issues(client: CVClient, db: Database, hours: int = 48) -
         hours,
     )
     outcome: dict[str, Any] = {}
-    upserted, _latest, complete = await _sync_issue_window(
+    upserted, _latest, complete = await _sync_window(
         client, db, start, now + _SYNC_FUTURE_PAD, outcome=outcome
     )
     logger.info(
