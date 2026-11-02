@@ -336,3 +336,53 @@ async def test_mcl_gap_backfill_skips_blocked_volumes_and_unallowed_issues(
     assert result["volumes_missing"] == 0
     assert result["issues_missing"] == 1
     assert [c.args[1]["filter"] for c in client.get.call_args_list] == ["id:999001"]
+
+
+def _search_volume(vid: int, publisher: int | None, start_year: str | None) -> dict[str, Any]:
+    pub = {"id": publisher, "name": "P"} if publisher else None
+    return {"resource_type": "volume", "id": vid, "name": f"V{vid}", "publisher": pub,
+            "start_year": start_year}
+
+
+def test_search_cache_volume_backfill_follows_the_lists_and_the_year_floor(
+    tmp_db: Database,
+) -> None:
+    tmp_db.set_publisher_list(BLOCKED_PUB, "block")
+    tmp_db.set_publisher_list(1, "allow")
+    tmp_db.cache_put_search("h", [
+        _search_volume(9501, BLOCKED_PUB, "2020"),  # blocked publisher
+        _search_volume(9502, 2, "2020"),            # not on the allowlist
+        _search_volume(9503, 1, "2005"),            # allowed, before the floor
+        _search_volume(9504, 1, "2015"),            # allowed, in the window
+        _search_volume(9505, 1, None),              # allowed, no start year
+        _search_volume(9506, None, "2020"),         # publisher unknown
+    ], 6)
+    assert sorted(tmp_db.get_search_cache_missing_volume_ids(100, min_year=2010)) == [
+        9504, 9505, 9506]
+    tmp_db.set_publisher_list(1, None)  # no allowlist, no floor: only blocked are skipped
+    assert sorted(tmp_db.get_search_cache_missing_volume_ids(100)) == [
+        9502, 9503, 9504, 9505, 9506]
+
+
+async def test_mcl_gap_backfill_only_fetches_issues_of_volumes_in_the_year_window(
+    tmp_db: Database, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from cvproxy.config import Settings
+    from cvproxy.scheduler import _backfill_from_mcl
+
+    tmp_db.upsert_volume({"id": 7100, "name": "Old run", "publisher": {"id": 1, "name": "DC"}})
+    tmp_db.upsert_issue({"id": 7101, "volume": {"id": 7100}, "store_date": "2004-01-01"})
+    mcl = tmp_path / "latest.mcl"
+    mcl.write_text("7100;7101,7102;1,2\n160294;999001;7\n")
+    client = MagicMock()
+    client.hourly_calls.return_value = 0
+    client.get = AsyncMock(return_value={"status_code": 1, "results": []})
+
+    with patch("cvproxy.scheduler.asyncio.sleep", new_callable=AsyncMock):
+        result = await _backfill_from_mcl(
+            client, tmp_db, Settings(cv_api_key="k", mcl_export_path=mcl, backfill_min_year=2010))
+
+    assert result["issues_missing"] == 1
+    assert [c.args[1]["filter"] for c in client.get.call_args_list] == ["id:999001"]

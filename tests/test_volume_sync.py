@@ -134,3 +134,17 @@ def test_existing_detailed_volumes_are_marked_when_the_column_is_added(tmp_path:
         assert _needs_detail(db) == [2]
     finally:
         db.close()
+
+
+def test_volume_backfill_follows_the_backfill_year_floor(tmp_db: Database) -> None:
+    for vid, dates in ((8401, ["2005-03-01"]), (8402, ["2005-03-01", "2015-06-01"]),
+                       (8403, []), (8404, [None])):
+        tmp_db.upsert_volume(_volume(vid, "2026-01-01 00:00:00"))
+        for n, date in enumerate(dates):
+            tmp_db.upsert_issue({"id": vid * 10 + n, "volume": {"id": vid}, "store_date": date})
+    calendar, old = tmp_db.volume_ids_needing_backfill(100, 100, min_year=2010)
+    picked = calendar + old
+    assert 8401 not in picked  # only issues before 2010
+    assert {8402, 8403, 8404} <= set(picked)  # a 2010+ issue, no issues, undated issue
+    assert 8401 in _needs_detail(tmp_db)  # no floor
+    assert tmp_db.queue_snapshot(2010)["volumes_missing_fields"] == len(picked)

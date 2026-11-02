@@ -14,6 +14,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -408,10 +409,10 @@ def build_job_specs(
         ),
         JobSpec(
             id="volume_backfill", name="Volume backfill", category="backfill",
-            description=(
+            description=lambda s: (
                 "Fetches /volume/ details for volumes of allowed publishers stored only from "
-                "list responses, or changed on ComicVine since: up to 100 with dated issues "
-                "plus 50 older ones."
+                "list responses, or changed on ComicVine since, with an issue dated "
+                f"{_min_year(s)} or none dated: up to 100 with dated issues plus 50 others."
             ),
             run=job(lambda p: _backfill_volumes(client, db)),
             trigger=_cron(minute=30), endpoints=("volume/",), summarize=_sum_backfill,
@@ -428,9 +429,9 @@ def build_job_specs(
         JobSpec(
             id="search_cache_volume_backfill", name="Search cache volume backfill",
             category="backfill",
-            description=(
-                "Fetches up to 50 volumes that appear in cached search results but aren't stored "
-                "yet."
+            description=lambda s: (
+                "Fetches up to 50 volumes of allowed publishers that appear in cached search "
+                f"results but aren't stored yet, started {_min_year(s)}."
             ),
             run=job(lambda p: _backfill_search_cache_volumes(client, db)),
             trigger=_cron(hour="*/2", minute=50), endpoints=("volume/",),
@@ -438,9 +439,10 @@ def build_job_specs(
         ),
         JobSpec(
             id="mcl_gap_backfill", name="MCL gap backfill", category="backfill",
-            description=(
+            description=lambda s: (
                 "Fetches volumes and issues listed in latest.mcl that aren't in the database, "
-                "newest first, 100 IDs per call. The detail backfill adds issue credits later."
+                "newest first, 100 IDs per call. Issues only for allowed publishers' volumes "
+                f"with an issue dated {_min_year(s)}. The detail backfill adds credits later."
             ),
             run=job(lambda p: _backfill_from_mcl(client, db, get_settings())),
             trigger=_cron(hour=(h + 6) % 24, minute=0), endpoints=("volumes/", "issues/"),
@@ -805,7 +807,7 @@ async def _backfill_volumes(client: CVClient, db: Database) -> dict[str, Any]:
       - Up to 50 older stale volumes: backfills the long tail.
     """
     calendar_ids, old_ids = db.volume_ids_needing_backfill(
-        _VOLUME_CALENDAR_BATCH, _VOLUME_OLD_BATCH
+        _VOLUME_CALENDAR_BATCH, _VOLUME_OLD_BATCH, min_year=get_settings().backfill_min_year
     )
     return await _backfill_ids(
         client, db, label="Volume backfill", endpoint="volume/", table="cv_volume",
@@ -959,7 +961,8 @@ async def _backfill_search_cache_volumes(client: CVClient, db: Database) -> dict
     with its own connection.
     """
     missing_ids = await asyncio.to_thread(
-        db.get_search_cache_missing_volume_ids, _SEARCH_BACKFILL_BATCH
+        partial(db.get_search_cache_missing_volume_ids, _SEARCH_BACKFILL_BATCH,
+                min_year=get_settings().backfill_min_year)
     )
     return await _backfill_ids(
         client, db, label="Search cache volume backfill", endpoint="volume/",
@@ -1452,11 +1455,11 @@ async def _backfill_from_mcl(
     )
 
     local_issues = await asyncio.to_thread(db.existing_ids_snapshot, "cv_issue")
-    allowed = await asyncio.to_thread(db.allowed_volume_ids_snapshot)
+    wanted = await asyncio.to_thread(db.backfill_volume_ids_snapshot, settings.backfill_min_year)
     missing_issues = sorted(
         {
             iid for vid, ids in mcl.items()
-            if vid not in db.blocked_volumes and (allowed is None or vid in allowed)
+            if vid not in db.blocked_volumes and (wanted is None or vid in wanted)
             for iid in ids
         } - local_issues,
         reverse=True,

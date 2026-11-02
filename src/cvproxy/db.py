@@ -623,6 +623,21 @@ def _missing_cover_sql(min_year: int, scope: str = "1") -> str:
     )
 
 
+def volume_window_sql(min_year: int, alias: str = "v") -> str:
+    """SQL condition: volume *alias* has an issue dated *min_year* or later, or no dated issue.
+
+    The volume-level counterpart of backfill_window_sql: a series that started
+    before *min_year* but runs past it qualifies.
+    """
+    if min_year <= 0:
+        return "1"
+    when = "COALESCE(NULLIF(i.store_date, ''), NULLIF(i.cover_date, ''))"
+    return (
+        f"COALESCE((SELECT MAX({when}) FROM cv_issue i WHERE i.volume_id = {alias}.id),"
+        f" '9999') >= '{int(min_year):04d}'"
+    )
+
+
 def _check_publisher_list(which: str | None) -> None:
     if which not in ("allow", "block", None):
         raise ValueError(f"Unknown publisher list: {which!r}")
@@ -1576,24 +1591,44 @@ class Database:
         """Remember that upstream returned no results for *key*."""
         self.cache_put_list(f"negative:{resource_type}", key, [])
 
-    def get_search_cache_missing_volume_ids(self, limit: int = 200) -> list[int]:
+    def get_search_cache_missing_volume_ids(
+        self, limit: int = 200, *, min_year: int = 0
+    ) -> list[int]:
         """Return volume IDs referenced in search caches that are absent from cv_volume.
 
         Scans all search cache entries, collects every ``id`` field from the
         stored results list, then returns IDs not yet present in cv_volume.
         Used by the backfill scheduler to ensure volumes found via search are
-        eventually fully indexed.
+        eventually fully indexed.  Skips blocked publishers (never stored, so
+        they'd be "missing" forever), publishers off the allowlist, and volumes
+        that started before *min_year* (search results carry no issue dates).
+        A result without a publisher or start year is fetched to find out.
         """
         # Own read-only connection: this reads every cached search, which took
         # minutes on the event loop once the cache grew (see the loop watchdog).
         conn = self._ro_connect()
         try:
-            return self._search_cache_missing_volume_ids(conn, limit)
+            return self._search_cache_missing_volume_ids(
+                conn, limit, lambda item: self._search_volume_wanted(item, min_year)
+            )
         finally:
             conn.close()
 
+    def _search_volume_wanted(self, item: dict[str, Any], min_year: int) -> bool:
+        publisher = (item.get("publisher") or {}).get("id")
+        if item.get("id") in self.blocked_volumes or publisher in self.blocked_publishers:
+            return False
+        allowed = self.allowed_publishers
+        if allowed and publisher is not None and publisher not in allowed:
+            return False
+        start = str(item.get("start_year") or "")
+        return not (min_year > 0 and start.isdigit() and int(start) < min_year)
+
     @staticmethod
-    def _search_cache_missing_volume_ids(conn: sqlite3.Connection, limit: int) -> list[int]:
+    def _search_cache_missing_volume_ids(
+        conn: sqlite3.Connection, limit: int,
+        wanted: Callable[[dict[str, Any]], bool] = lambda item: True,
+    ) -> list[int]:
         cur = conn.execute(
             "SELECT data_json FROM cv_response_cache WHERE resource_type='search'"
         )
@@ -1602,7 +1637,7 @@ class Database:
             try:
                 payload = json.loads(data_json)
                 for item in payload.get("results") or []:
-                    if item.get("resource_type") == "volume":
+                    if item.get("resource_type") == "volume" and wanted(item):
                         vid = item.get("id")
                         if vid:
                             seen.add(int(vid))
@@ -1957,7 +1992,7 @@ class Database:
             conn.close()
 
     def volume_ids_needing_backfill(
-        self, calendar_limit: int, old_limit: int, *, scan_limit: int = 5000
+        self, calendar_limit: int, old_limit: int, *, min_year: int = 0, scan_limit: int = 5000
     ) -> tuple[list[int], list[int]]:
         """Volumes never fetched from /volume/ (or changed since): (calendar-relevant, older).
 
@@ -1973,6 +2008,7 @@ class Database:
             " WHERE v.detail_fetched_at IS NULL"
             " AND (v.backfill_missing IS NULL OR v.backfill_missing = 0)"
             f" AND {self.publisher_filter_sql('v.publisher_id')}"
+            f" AND {volume_window_sql(min_year)}"
             " ORDER BY v.id DESC LIMIT ?",
             [scan_limit],
         ).fetchall()
@@ -2307,15 +2343,23 @@ class Database:
         finally:
             conn.close()
 
-    def allowed_volume_ids_snapshot(self) -> set[int] | None:
-        """Stored volumes of allowlisted publishers (worker thread); None without an allowlist."""
-        if not self.allowed_publishers:
+    def backfill_volume_ids_snapshot(self, min_year: int = 0) -> set[int] | None:
+        """Stored volumes the backfills may work on (worker thread).
+
+        Allowlisted publishers' volumes in the year window (volume_window_sql);
+        None when neither an allowlist nor a floor limits them.
+        """
+        if not self.allowed_publishers and min_year <= 0:
             return None
-        conn = self._ro_connect()
+        allowed = (
+            f"v.publisher_id IN ({_id_list(self.allowed_publishers)})"
+            if self.allowed_publishers else "1"
+        )
+        conn = self._ro_connect(timeout=30)
         try:
             return {row[0] for row in conn.execute(
-                "SELECT id FROM cv_volume"  # noqa: S608
-                f" WHERE publisher_id IN ({_id_list(self.allowed_publishers)})"
+                f"SELECT v.id FROM cv_volume v WHERE {allowed}"  # noqa: S608
+                f" AND {volume_window_sql(min_year)}"
             )}
         finally:
             conn.close()
@@ -2375,9 +2419,10 @@ class Database:
         not_missing = "(backfill_missing IS NULL OR backfill_missing = 0)"
         try:
             one("volumes_missing_fields",
-                "SELECT COUNT(*) FROM cv_volume INDEXED BY idx_volume_needs_detail"
+                "SELECT COUNT(*) FROM cv_volume v INDEXED BY idx_volume_needs_detail"
                 f" WHERE detail_fetched_at IS NULL AND {not_missing}"
-                f" AND {self.publisher_filter_sql('publisher_id')}")
+                f" AND {self.publisher_filter_sql('publisher_id')}"
+                f" AND {volume_window_sql(min_year)}")
             one("publishers_missing_fields",
                 "SELECT COUNT(*) FROM cv_publisher"
                 f" WHERE date_last_updated IS NULL AND {not_missing}"

@@ -30,8 +30,8 @@ class Editable:
 EDITABLE: dict[str, Editable] = {
     "backfill_min_year": Editable(
         "Backfill floor year",
-        "Backfills and cover hashing only go after issues dated this year or later, plus "
-        "undated ones. 0 = no floor."),
+        "Every backfill (issues, details, covers, volumes, search and MCL gaps) only goes "
+        "after material dated this year or later, plus undated items. 0 = no floor."),
     "cover_hash_per_hour": Editable(
         "Cover hashes per run",
         "Cover images hashed per hourly run, from the image CDN (no API quota). "

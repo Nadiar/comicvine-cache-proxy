@@ -3,6 +3,8 @@
 ## Unreleased
 
 - **Volume backfill finds list-only volumes:** it picked only volumes without `date_last_updated`, which every list row has, so volumes never fetched from `/volume/` (no character/people lists, stale issue counts and start years) were never backfilled. Volumes now carry a `detail_fetched_at` marker like issues: set by a `/volume/` fetch, cleared when a list row shows ComicVine changed the volume. Existing volumes with detail lists are marked once at startup.
+- **`BACKFILL_MIN_YEAR` applies to every backfill:** the volume backfill (volumes with an issue dated in the window), the search cache volume backfill (start year) and the MCL gap backfill's issues (their volume's dates) now follow it, as the issue, detail and cover backfills already did.
+- **Search cache volume backfill skips blocked and non-allowlisted publishers.** Blocked volumes are never stored, so they were fetched again every 2 hours.
 
 ## 2.0.0 (2026-11-01)
 
