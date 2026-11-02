@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.1.0 (2026-11-01)
+## 2.0.1 (2026-11-01)
 
 - **Incremental volume sync:** an hourly job re-reads volumes ComicVine changed since its own watermark, like the issue sync. Before, a volume edited on ComicVine after cvproxy stored it stayed as first stored.
 - **Volume sync rewind:** a manual job moves the volume watermark back N days (default 730) so the hourly sync re-reads that span, 45 days per run.
