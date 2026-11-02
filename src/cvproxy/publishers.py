@@ -13,6 +13,8 @@ dashboard's Publishers tab; SEED_ALLOW and SEED_BLOCK fill them once.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -74,6 +76,38 @@ def drop_blocked(kind: str | None, body: Any, db: Database) -> Any:
     if isinstance(body.get("number_of_total_results"), int):
         out["number_of_total_results"] = max(0, body["number_of_total_results"] - dropped)
     return out
+
+
+def list_csv(entries: list[dict[str, Any]]) -> str:
+    """A publisher list as CSV: header "id,name", one publisher per row."""
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(["id", "name"])
+    writer.writerows([p["id"], p["name"] or ""] for p in entries)
+    return out.getvalue()
+
+
+def parse_list_csv(text: str) -> tuple[dict[int, str | None], int]:
+    """({id: name}, rows skipped) from CSV whose first column is a publisher ID.
+
+    IDs may be ComicVine's "4010-123" form; an optional second column is the
+    name; a header row and blank rows are ignored.
+    """
+    entries: dict[int, str | None] = {}
+    skipped = 0
+    for n, row in enumerate(csv.reader(io.StringIO(text))):
+        if not row or not row[0].strip():
+            continue
+        raw = row[0].strip()
+        if n == 0 and raw.lower() == "id":
+            continue
+        try:
+            pid = int(raw.removeprefix("4010-"))
+        except ValueError:
+            skipped += 1
+            continue
+        entries[pid] = row[1].strip() or None if len(row) > 1 else None
+    return entries, skipped
 
 
 def _path_kind(path: str) -> tuple[bool, str | None]:

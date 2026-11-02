@@ -288,6 +288,7 @@ DASHBOARD_HTML = """\
       <h5 class="mb-0"><i class="bi bi-building me-2"></i>Publishers</h5>
       <span class="small" id="publishersFeedback"></span>
     </div>
+    <input type="file" id="publisherCsvFile" accept=".csv,text/csv" style="display:none">
     <div class="card shadow-sm mb-3">
       <div class="card-body py-2">
         <input type="search" class="form-control form-control-sm" id="publisherSearch"
@@ -299,7 +300,9 @@ DASHBOARD_HTML = """\
       <div class="col-lg-6">
         <div class="card shadow-sm h-100">
           <div class="card-header py-2"><span class="fw-semibold">Allowed</span>
-            <span class="badge text-bg-success ms-1" id="allowCount"></span></div>
+            <span class="badge text-bg-success ms-1" id="allowCount"></span>
+            <span class="float-end"><a class="btn btn-sm btn-outline-secondary py-0" href="/admin/publishers/allow.csv"><i class="bi bi-download"></i> CSV</a>
+              <button class="btn btn-sm btn-outline-secondary py-0 import-list" data-list="allow"><i class="bi bi-upload"></i> Import</button></span></div>
           <ul class="list-group list-group-flush" id="allowList"></ul>
           <div class="card-footer small footer-note">
             The issue, issue detail, cover hash, volume and publisher backfills only work on these.
@@ -310,7 +313,9 @@ DASHBOARD_HTML = """\
       <div class="col-lg-6">
         <div class="card shadow-sm h-100">
           <div class="card-header py-2"><span class="fw-semibold">Blocked</span>
-            <span class="badge text-bg-danger ms-1" id="blockCount"></span></div>
+            <span class="badge text-bg-danger ms-1" id="blockCount"></span>
+            <span class="float-end"><a class="btn btn-sm btn-outline-secondary py-0" href="/admin/publishers/block.csv"><i class="bi bi-download"></i> CSV</a>
+              <button class="btn btn-sm btn-outline-secondary py-0 import-list" data-list="block"><i class="bi bi-upload"></i> Import</button></span></div>
           <ul class="list-group list-group-flush" id="blockList"></ul>
           <div class="card-footer small footer-note">
             Never served to clients, stored or exported. Blocking hides a publisher at once;
@@ -1089,6 +1094,34 @@ DASHBOARD_HTML = """\
       feedback.innerHTML = `<span class="text-success"><i class="bi bi-check-circle me-1"></i>Saved.</span>`;
       searchPublishers();
     }
+
+    // CSV import: first column is the publisher ID (4010-123 works), the rest is ignored
+    let importTarget = null;
+    const csvFile = document.getElementById('publisherCsvFile');
+    document.querySelectorAll('.import-list').forEach(btn => btn.addEventListener('click', () => {
+      importTarget = btn.dataset.list;
+      csvFile.value = '';
+      csvFile.click();
+    }));
+    csvFile.addEventListener('change', async () => {
+      const file = csvFile.files[0];
+      if (!file || !importTarget) return;
+      const name = importTarget === 'allow' ? 'allowlist' : 'blocklist';
+      const replace = confirm(`Import ${file.name} into the ${name}.
+
+`
+        + `OK: the ${name} becomes exactly the file's publishers.
+Cancel: only add the file's publishers.`);
+      const resp = await fetch(`/admin/publishers/${importTarget}.csv?replace=${replace}`, {
+        method: 'POST', headers: {'Content-Type': 'text/csv'}, body: await file.text()});
+      const data = await resp.json();
+      const feedback = document.getElementById('publishersFeedback');
+      if (!resp.ok) { feedback.innerHTML = `<span class="text-danger">${esc(data.detail || resp.statusText)}</span>`; return; }
+      renderPublishers(data.lists);
+      const r = data.result;
+      feedback.innerHTML = `<span class="text-success"><i class="bi bi-check-circle me-1"></i>`
+        + `Imported: ${r.listed} listed, ${r.removed} taken off, ${r.skipped} rows skipped.</span>`;
+    });
 
     let publisherSearchTimer = null;
     async function searchPublishers() {

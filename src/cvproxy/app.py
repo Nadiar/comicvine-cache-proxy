@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import parse_qs
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -32,7 +32,7 @@ from cvproxy.cv_client import CVClient
 from cvproxy.dashboard import DASHBOARD_HTML
 from cvproxy.db import Database
 from cvproxy.image_cache import ImageCache
-from cvproxy.jobs import STATUSES, JobError, JobHistory, JobRunner
+from cvproxy.jobs import BACKLOG_JOB, STATUSES, JobError, JobHistory, JobRunner
 from cvproxy.overrides import (
     InvalidOverride,
     OverrideStore,
@@ -40,7 +40,13 @@ from cvproxy.overrides import (
     describe_settings,
     usable_overrides,
 )
-from cvproxy.publishers import SEED_ALLOW, SEED_BLOCK, PublisherFilterMiddleware
+from cvproxy.publishers import (
+    SEED_ALLOW,
+    SEED_BLOCK,
+    PublisherFilterMiddleware,
+    list_csv,
+    parse_list_csv,
+)
 from cvproxy.routes.api import router as api_router
 from cvproxy.scheduler import build_job_specs, create_scheduler
 from cvproxy.stats import StatsTracker
@@ -555,7 +561,7 @@ def create_app() -> FastAPI:
         return [{"id": p["id"], "name": p["name"], "list": on_list.get(p["id"])} for p in found]
 
     @app.put("/admin/publishers/{publisher_id}")
-    def admin_publishers_update(
+    async def admin_publishers_update(
         publisher_id: int, change: Annotated[dict[str, Any], Body()]
     ) -> dict[str, list[dict[str, Any]]]:
         """Move a publisher to {"list": "allow" | "block"}, or off both lists with null."""
@@ -565,7 +571,43 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         logger.info("Publisher %d moved to list %s", publisher_id, change.get("list"))
+        _recount_backlog()
         return db.publisher_lists()
+
+    def _list_name(which: str) -> str:
+        if which not in ("allow", "block"):
+            raise HTTPException(status_code=404, detail=f"No publisher list {which!r}")
+        return which
+
+    @app.get("/admin/publishers/{which}.csv")
+    def admin_publishers_export(which: str) -> Response:
+        """One list as CSV (id,name)."""
+        db: Database = app.state.db
+        return Response(
+            list_csv(db.publisher_lists()[_list_name(which)]), media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="publishers-{which}.csv"'},
+        )
+
+    @app.post("/admin/publishers/{which}.csv")
+    async def admin_publishers_import(
+        which: str, request: Request,
+        replace: bool = Query(default=False, description="Take off publishers not in the file"),
+    ) -> dict[str, Any]:
+        """Put the publishers of a CSV (first column: ID) on a list."""
+        db: Database = app.state.db
+        entries, skipped = parse_list_csv((await request.body()).decode("utf-8-sig"))
+        removed = db.import_publisher_list(_list_name(which), entries, replace=replace)
+        result = {"listed": len(entries), "removed": removed, "skipped": skipped}
+        logger.info("Publisher list %s imported: %s", which, result)
+        _recount_backlog()
+        return {"result": result, "lists": db.publisher_lists()}
+
+    def _recount_backlog() -> None:
+        """The backfill estimates count against the publisher lists: recount them."""
+        try:
+            _runner().start(BACKLOG_JOB)
+        except JobError as exc:
+            logger.info("Backlog snapshot not started: %s", exc)
 
     # Older per-job endpoints, kept for scripts; they start the same jobs.
 

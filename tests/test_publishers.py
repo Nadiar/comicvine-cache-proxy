@@ -266,3 +266,44 @@ def test_publisher_lists_are_edited_from_the_dashboard_api(client: TestClient) -
     assert client.put("/admin/publishers/2", json={"list": "maybe"}).status_code == 422
     found = client.get("/admin/publishers/search", params={"q": "verl"}).json()
     assert found[0] == {"id": BLOCKED_PUB, "name": "Verlag", "list": "block"}
+
+
+def test_changing_a_list_takes_a_fresh_backlog_snapshot(client: TestClient) -> None:
+    client.put("/admin/publishers/2", json={"list": "allow"})
+    runs = client.get("/admin/jobs", params={"job": "queue_snapshot"}).json()
+    assert runs and runs[0]["trigger"] == "manual"
+
+
+# -- CSV export / import --------------------------------------------------------
+
+
+def test_a_list_exports_as_csv(client: TestClient) -> None:
+    resp = client.get("/admin/publishers/block.csv")
+    assert resp.headers["content-type"].startswith("text/csv")
+    lines = resp.text.splitlines()
+    assert lines[0] == "id,name"
+    assert f"{BLOCKED_PUB},Verlag" in lines
+    assert len(lines) == len(SEED_BLOCK) + 2  # header, seeds and publisher 900
+
+
+def test_importing_a_csv_adds_and_moves_publishers(client: TestClient) -> None:
+    csv = f"id,name\n2,Marvel\n4010-{BLOCKED_PUB},Verlag\nnot a number,x\n\n"
+    resp = client.post("/admin/publishers/allow.csv", content=csv,
+                       headers={"content-type": "text/csv"})
+    assert resp.status_code == 200
+    assert resp.json()["result"] == {"listed": 2, "removed": 0, "skipped": 1}
+    lists = resp.json()["lists"]
+    assert {2, BLOCKED_PUB} <= {p["id"] for p in lists["allow"]}
+    assert BLOCKED_PUB not in {p["id"] for p in lists["block"]}
+    assert client.app.state.db.blocked_volumes.isdisjoint({BLOCKED_VOL})
+
+
+def test_importing_with_replace_drops_entries_missing_from_the_file(client: TestClient) -> None:
+    resp = client.post("/admin/publishers/allow.csv", params={"replace": "true"},
+                       content="31,Marvel\n", headers={"content-type": "text/csv"})
+    assert resp.json()["result"] == {"listed": 1, "removed": len(SEED_ALLOW) - 1, "skipped": 0}
+    assert [p["id"] for p in resp.json()["lists"]["allow"]] == [31]
+
+
+def test_importing_into_an_unknown_list_is_rejected(client: TestClient) -> None:
+    assert client.post("/admin/publishers/maybe.csv", content="1\n").status_code == 404

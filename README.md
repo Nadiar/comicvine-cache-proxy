@@ -139,6 +139,8 @@ error...; the next run continues), `idle` (nothing to do), `skipped`
 | `GET /admin/publishers` | The publisher allowlist and blocklist |
 | `GET /admin/publishers/search?q=` | Stored publishers matching a name, with the list each one is on |
 | `PUT /admin/publishers/{id}` | Move a publisher: `{"list": "allow"}`, `{"list": "block"}`, or `{"list": null}` for neither |
+| `GET /admin/publishers/{allow\|block}.csv` | One list as CSV (`id,name`) |
+| `POST /admin/publishers/{allow\|block}.csv` | Put a CSV's publishers (first column: ID) on a list; `?replace=true` also takes off the ones not in the file |
 
 Older per-job endpoints still work and start the same jobs:
 `POST /admin/sync/issues?days=`, `/admin/repair/publishers`, `/admin/evict?dry_run=`,

@@ -617,6 +617,11 @@ def _missing_cover_sql(min_year: int, scope: str = "1") -> str:
     )
 
 
+def _check_publisher_list(which: str | None) -> None:
+    if which not in ("allow", "block", None):
+        raise ValueError(f"Unknown publisher list: {which!r}")
+
+
 def _id_list(ids: frozenset[int]) -> str:
     return ",".join(str(int(i)) for i in sorted(ids))
 
@@ -1990,28 +1995,51 @@ class Database:
         purge job deletes their rows.  Unblocking forgets them, so their data
         is fetched again when clients ask for it.
         """
-        if which not in ("allow", "block", None):
-            raise ValueError(f"Unknown publisher list: {which!r}")
+        _check_publisher_list(which)
         with self.conn:
-            self.conn.execute("DELETE FROM blocked_volume WHERE publisher_id = ?", [publisher_id])
-            if which is None:
-                self.conn.execute(
-                    "DELETE FROM publisher_list WHERE publisher_id = ?", [publisher_id]
-                )
-            else:
-                self.conn.execute(
-                    "INSERT INTO publisher_list (publisher_id, list, name) VALUES (?, ?, ?)"
-                    " ON CONFLICT(publisher_id) DO UPDATE SET list = excluded.list,"
-                    " name = COALESCE(excluded.name, name)",
-                    [publisher_id, which, name],
-                )
-            if which == "block":
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO blocked_volume (volume_id, publisher_id)"
-                    " SELECT id, publisher_id FROM cv_volume WHERE publisher_id = ?",
-                    [publisher_id],
-                )
+            self._put_on_list(publisher_id, which, name)
         self._load_publisher_lists()
+
+    def import_publisher_list(
+        self, which: str, entries: dict[int, str | None], *, replace: bool = False
+    ) -> int:
+        """Put every publisher in *entries* ({id: name}) on list *which*, in one transaction.
+
+        With *replace*, publishers on that list but not in *entries* come off
+        it.  Returns how many were taken off.
+        """
+        _check_publisher_list(which)
+        removed = [
+            pid for (pid,) in self.conn.execute(
+                "SELECT publisher_id FROM publisher_list WHERE list = ?", [which])
+            if pid not in entries
+        ] if replace else []
+        with self.conn:
+            for pid in removed:
+                self._put_on_list(pid, None, None)
+            for pid, name in entries.items():
+                self._put_on_list(pid, which, name)
+        self._load_publisher_lists()
+        return len(removed)
+
+    def _put_on_list(self, publisher_id: int, which: str | None, name: str | None) -> None:
+        """set_publisher_list's writes, inside the caller's transaction."""
+        self.conn.execute("DELETE FROM blocked_volume WHERE publisher_id = ?", [publisher_id])
+        if which is None:
+            self.conn.execute("DELETE FROM publisher_list WHERE publisher_id = ?", [publisher_id])
+            return
+        self.conn.execute(
+            "INSERT INTO publisher_list (publisher_id, list, name) VALUES (?, ?, ?)"
+            " ON CONFLICT(publisher_id) DO UPDATE SET list = excluded.list,"
+            " name = COALESCE(excluded.name, name)",
+            [publisher_id, which, name],
+        )
+        if which == "block":
+            self.conn.execute(
+                "INSERT OR IGNORE INTO blocked_volume (volume_id, publisher_id)"
+                " SELECT id, publisher_id FROM cv_volume WHERE publisher_id = ?",
+                [publisher_id],
+            )
 
     def seed_publisher_lists(self, allow: dict[int, str], block: dict[int, str]) -> bool:
         """Fill the lists the first time only, so dashboard edits are never undone."""
