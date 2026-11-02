@@ -85,3 +85,52 @@ def test_volume_sync_runs_hourly(settings: Any) -> None:
     job = scheduler.get_job("incremental_volume_sync")
     assert job is not None
     assert str(job.trigger.fields[job.trigger.FIELD_NAMES.index("hour")]) == "*"
+
+
+# -- volume detail backfill: what counts as "needs /volume/ details" -----------
+
+
+def _needs_detail(db: Database) -> list[int]:
+    calendar, old = db.volume_ids_needing_backfill(100, 100)
+    return calendar + old
+
+
+def test_list_only_volumes_need_details_even_with_date_last_updated(tmp_db: Database) -> None:
+    tmp_db.upsert_volume(_volume(8301, "2026-06-24 02:47:11"))  # list row, dated
+    tmp_db.upsert_volume(_volume(8302, "2026-06-24 02:47:11", characters=[{"id": 1}]))
+    assert 8301 in _needs_detail(tmp_db)
+    assert 8302 not in _needs_detail(tmp_db)
+    assert tmp_db.queue_snapshot()["volumes_missing_fields"] == len(_needs_detail(tmp_db))
+
+
+def test_a_detail_fetch_with_empty_lists_still_counts_as_detailed(tmp_db: Database) -> None:
+    tmp_db.upsert_volume(_volume(8303, "2026-06-24 02:47:11", characters=[], people=[]))
+    assert 8303 not in _needs_detail(tmp_db)
+
+
+def test_a_newer_list_row_flags_a_detailed_volume_for_a_refetch(tmp_db: Database) -> None:
+    tmp_db.upsert_volume(_volume(8304, "2026-06-24 02:47:11", characters=[{"id": 1}]))
+    tmp_db.upsert_volume(_volume(8304, "2026-06-24 02:47:11"))  # same version: still detailed
+    assert 8304 not in _needs_detail(tmp_db)
+    tmp_db.upsert_volume(_volume(8304, "2026-10-01 00:00:00"))  # CV changed it
+    assert 8304 in _needs_detail(tmp_db)
+
+
+def test_existing_detailed_volumes_are_marked_when_the_column_is_added(tmp_path: Any) -> None:
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE cv_volume (id INTEGER PRIMARY KEY, name TEXT, publisher_id INTEGER,
+                                characters TEXT, date_last_updated TEXT);
+        INSERT INTO cv_volume VALUES (1, 'Detailed', 1, '[{"id": 5}]', '2026-01-01 00:00:00');
+        INSERT INTO cv_volume VALUES (2, 'List only', 1, NULL, '2026-01-01 00:00:00');
+    """)
+    conn.close()
+    db = Database(path)
+    db.connect()
+    try:
+        assert _needs_detail(db) == [2]
+    finally:
+        db.close()

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Volume backfill finds list-only volumes:** it picked only volumes without `date_last_updated`, which every list row has, so volumes never fetched from `/volume/` (no character/people lists, stale issue counts and start years) were never backfilled. Volumes now carry a `detail_fetched_at` marker like issues: set by a `/volume/` fetch, cleared when a list row shows ComicVine changed the volume. Existing volumes with detail lists are marked once at startup.
+
 ## 2.0.0 (2026-11-01)
 
 Breaking changes:

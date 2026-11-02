@@ -190,7 +190,8 @@ CREATE TABLE IF NOT EXISTS cv_volume (
     date_added TEXT,
     date_last_updated TEXT,
     backfill_missing INTEGER,
-    last_accessed TEXT
+    last_accessed TEXT,
+    detail_fetched_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS cv_issue (
@@ -311,8 +312,9 @@ CREATE INDEX IF NOT EXISTS idx_issue_volume_id ON cv_issue(volume_id);
 CREATE INDEX IF NOT EXISTS idx_comic_covers_cvid ON comic_covers(cvid);
 CREATE INDEX IF NOT EXISTS idx_issue_needs_detail ON cv_issue(id)
     WHERE detail_fetched_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_volume_needs_backfill ON cv_volume(id)
-    WHERE date_last_updated IS NULL;
+DROP INDEX IF EXISTS idx_volume_needs_backfill;
+CREATE INDEX IF NOT EXISTS idx_volume_needs_detail ON cv_volume(id)
+    WHERE detail_fetched_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_volume_publisher ON cv_volume(publisher_id);
 CREATE INDEX IF NOT EXISTS idx_blocked_volume_publisher ON blocked_volume(publisher_id);
 """
@@ -417,6 +419,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("date_last_updated", "TEXT"),
         ("last_accessed", "TEXT"),
         ("backfill_missing", "INTEGER"),
+        ("detail_fetched_at", "TEXT"),
     ],
     "cv_issue": [
         ("aliases", "TEXT"),
@@ -806,37 +809,39 @@ class Database:
         *after* the migration step adds those columns to existing databases.
         """
         self.conn.executescript(_SCHEMA_TABLES_DDL)
-        had_detail_marker = "detail_fetched_at" in {
-            row[1] for row in self.conn.execute("PRAGMA table_info(cv_issue)")
-        }
+        detail_tables = {"cv_issue": ISSUE_DETAIL_FIELDS, "cv_volume": VOLUME_DETAIL_FIELDS}
+        unmarked = [
+            table for table in detail_tables
+            if "detail_fetched_at" not in {
+                row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")
+            }
+        ]
         _migrate_columns(self.conn)
-        if not had_detail_marker:
-            self._mark_existing_detailed_issues()
+        for table in unmarked:
+            self._mark_existing_detailed(table, detail_tables[table])
         self.conn.executescript(_SCHEMA_INDEXES_DDL)
         try:
             self._setup_fts()
         except sqlite3.OperationalError as exc:
             logger.warning("FTS5 setup failed — full-text search unavailable: %s", exc)
 
-    def _mark_existing_detailed_issues(self) -> None:
-        """Stamp detail_fetched_at on rows that already hold detail-only data.
+    def _mark_existing_detailed(self, table: str, fields: tuple[str, ...]) -> None:
+        """Stamp detail_fetched_at on rows of *table* that already hold detail-only data.
 
-        Runs once, when the column is added.  Rows without any credit data
+        Runs once, when the column is added.  Rows without any detail data
         can't be told apart from list-only rows, so they stay unmarked and get
-        refetched on demand or by the detail backfill.
+        refetched on demand or by the detail backfills.
         """
-        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(cv_issue)")}
-        has_detail = " OR ".join(
-            f"{col} IS NOT NULL" for col in ISSUE_DETAIL_FIELDS if col in existing
-        )
+        existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        has_detail = " OR ".join(f"{col} IS NOT NULL" for col in fields if col in existing)
         if not has_detail:
             return
         cur = self.conn.execute(
-            "UPDATE cv_issue SET detail_fetched_at = COALESCE(date_last_updated, datetime('now'))"
+            f"UPDATE {table} SET detail_fetched_at = COALESCE(date_last_updated, datetime('now'))"
             f" WHERE detail_fetched_at IS NULL AND ({has_detail})"  # noqa: S608
         )
         self.conn.commit()
-        logger.info("Migrated: marked %d existing issues as detailed", cur.rowcount)
+        logger.info("Migrated: marked %d existing %s rows as detailed", cur.rowcount, table)
 
     def _setup_fts(self) -> None:
         """Create the FTS virtual table and sync triggers.
@@ -1840,17 +1845,20 @@ class Database:
         if any(col in data for col in VOLUME_DETAIL_FIELDS):
             row.update({col: _to_json(data.get(col)) for col in VOLUME_DETAIL_FIELDS})
             self.conn.execute(
-                f"INSERT OR REPLACE INTO cv_volume ({', '.join(row)})"  # noqa: S608
-                f" VALUES ({', '.join('?' * len(row))})",
+                f"INSERT OR REPLACE INTO cv_volume ({', '.join(row)}, detail_fetched_at)"  # noqa: S608
+                f" VALUES ({', '.join('?' * len(row))}, datetime('now'))",
                 list(row.values()),
             )
         else:
-            # List responses (/volumes/, search) lack the detail lists: keep stored ones
+            # List responses (/volumes/, search, the sync) lack the detail lists: keep
+            # stored ones, but a newer date_last_updated flags them for a refetch
             updates = ", ".join(f"{col} = excluded.{col}" for col in row if col != "id")
             self.conn.execute(
                 f"INSERT INTO cv_volume ({', '.join(row)})"  # noqa: S608
                 f" VALUES ({', '.join('?' * len(row))})"
-                f" ON CONFLICT(id) DO UPDATE SET {updates}",
+                f" ON CONFLICT(id) DO UPDATE SET {updates},"
+                " detail_fetched_at = CASE WHEN date_last_updated IS excluded.date_last_updated"
+                " THEN detail_fetched_at END",
                 list(row.values()),
             )
         if commit:
@@ -1951,9 +1959,9 @@ class Database:
     def volume_ids_needing_backfill(
         self, calendar_limit: int, old_limit: int, *, scan_limit: int = 5000
     ) -> tuple[list[int], list[int]]:
-        """Volumes missing detail fields: (calendar-relevant, older), newest first.
+        """Volumes never fetched from /volume/ (or changed since): (calendar-relevant, older).
 
-        Driven by idx_volume_needs_backfill, so the cost scales with the number
+        Driven by idx_volume_needs_detail, so the cost scales with the number
         of volumes that need work rather than with cv_issue.  Calendar volumes
         (those with a dated issue) are ordered by their latest store_date.
         """
@@ -1961,8 +1969,8 @@ class Database:
             "SELECT v.id,"
             " (SELECT MAX(i.store_date) FROM cv_issue i"
             "   WHERE i.volume_id = v.id AND i.store_date IS NOT NULL) AS latest"
-            " FROM cv_volume v INDEXED BY idx_volume_needs_backfill"
-            " WHERE v.date_last_updated IS NULL"
+            " FROM cv_volume v INDEXED BY idx_volume_needs_detail"
+            " WHERE v.detail_fetched_at IS NULL"
             " AND (v.backfill_missing IS NULL OR v.backfill_missing = 0)"
             f" AND {self.publisher_filter_sql('v.publisher_id')}"
             " ORDER BY v.id DESC LIMIT ?",
@@ -2367,8 +2375,8 @@ class Database:
         not_missing = "(backfill_missing IS NULL OR backfill_missing = 0)"
         try:
             one("volumes_missing_fields",
-                "SELECT COUNT(*) FROM cv_volume INDEXED BY idx_volume_needs_backfill"
-                f" WHERE date_last_updated IS NULL AND {not_missing}"
+                "SELECT COUNT(*) FROM cv_volume INDEXED BY idx_volume_needs_detail"
+                f" WHERE detail_fetched_at IS NULL AND {not_missing}"
                 f" AND {self.publisher_filter_sql('publisher_id')}")
             one("publishers_missing_fields",
                 "SELECT COUNT(*) FROM cv_publisher"

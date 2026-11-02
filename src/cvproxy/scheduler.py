@@ -409,8 +409,9 @@ def build_job_specs(
         JobSpec(
             id="volume_backfill", name="Volume backfill", category="backfill",
             description=(
-                "Re-fetches volumes of allowed publishers missing detail fields: up to 100 with "
-                "dated issues plus 50 older ones."
+                "Fetches /volume/ details for volumes of allowed publishers stored only from "
+                "list responses, or changed on ComicVine since: up to 100 with dated issues "
+                "plus 50 older ones."
             ),
             run=job(lambda p: _backfill_volumes(client, db)),
             trigger=_cron(minute=30), endpoints=("volume/",), summarize=_sum_backfill,

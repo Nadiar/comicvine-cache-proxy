@@ -264,7 +264,7 @@ after them. Every job can be started from the Jobs tab.
 | Pending fetch | Every 2 min | Cache misses queued while ComicVine couldn't be asked; idle runs aren't kept in history |
 | Issue detail backfill | Hourly at :05 | /issue/ details (credits) for issues stored from list responses, newest first; allowed publishers only |
 | Issue backfill | Hourly at :45 | Issues cached by older versions without the newer fields; allowed publishers only |
-| Volume backfill | Hourly at :30 | Volumes missing detail fields (calendar-relevant first); allowed publishers only |
+| Volume backfill | Hourly at :30 | /volume/ details for volumes stored only from list responses or changed since (calendar-relevant first); allowed publishers only |
 | Publisher backfill | Every 6h at :15 | Allowed publishers missing detail fields |
 | Search cache volume backfill | Every 2h at :50 | Volumes seen in cached searches but not stored |
 | MCL gap backfill | Daily at H+6 | Volumes and issues in `latest.mcl` but missing locally, 100 IDs per request |

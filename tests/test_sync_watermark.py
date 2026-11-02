@@ -163,7 +163,8 @@ def test_scheduler_runs_sync_hourly_with_misfire_grace(settings: Any) -> None:
 
 @pytest.mark.parametrize("missing", [None, 1])
 def test_volume_ids_needing_backfill(tmp_db: Database, missing: int | None) -> None:
-    filled = {"id": 7001, "name": "Filled", "date_last_updated": "2026-01-01 00:00:00"}
+    filled = {"id": 7001, "name": "Filled", "date_last_updated": "2026-01-01 00:00:00",
+              "characters": [{"id": 1, "name": "Hero"}]}  # fetched from /volume/
     for vol in (
         {"id": 7002, "name": "Old stale"},
         {"id": 7003, "name": "Dated stale"},
