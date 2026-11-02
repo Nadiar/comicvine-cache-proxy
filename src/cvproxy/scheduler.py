@@ -220,7 +220,7 @@ def _cron(**kw: Any) -> dict[str, Any]:
 
 def _no_backups(s: Settings) -> str | None:
     if s.backup_keep <= 0:
-        return "BACKUP_KEEP=0 (snapshots come from the sqlite-backup container)"
+        return "BACKUP_KEEP is 0"
     return None
 
 

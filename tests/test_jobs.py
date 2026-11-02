@@ -493,3 +493,10 @@ def test_backfill_window_limits_issue_detail_and_cover_selection(tmp_db: Databas
     snap = tmp_db.queue_snapshot(2010)
     assert snap["issues_missing_fields_in_window"] == 3
     assert snap["issues_missing_fields"] >= 4
+
+
+def test_disabled_backup_reason_names_only_the_setting(settings: Any) -> None:
+    from cvproxy.scheduler import _no_backups
+
+    reason = _no_backups(settings.model_copy(update={"backup_keep": 0}))
+    assert reason == "BACKUP_KEEP is 0"
