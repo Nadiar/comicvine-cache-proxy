@@ -19,7 +19,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
     mkdir -p src/cvproxy && touch src/cvproxy/__init__.py && \
     pip install . && \
-    rm src/cvproxy/__init__.py
+    rm -rf src build
+# (setuptools builds in-tree: a leftover build/ would keep the stub __init__.py,
+# which is newer than the real one, in the installed package)
 
 # ── source layer ─────────────────────────────────────────────────────────────
 # This COPY invalidates only when application code changes.
