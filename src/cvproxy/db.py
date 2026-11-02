@@ -13,6 +13,7 @@ import json
 import logging
 import shutil
 import time
+from collections.abc import Callable, Iterator
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -268,6 +269,24 @@ CREATE TABLE IF NOT EXISTS cv_sync_metadata (
     last_sync_timestamp TEXT NOT NULL,
     resume_state TEXT
 );
+
+-- Publisher allowlist and blocklist (see publishers.py)
+CREATE TABLE IF NOT EXISTS publisher_list (
+    publisher_id INTEGER PRIMARY KEY,
+    list TEXT NOT NULL CHECK (list IN ('allow', 'block')),
+    name TEXT
+);
+
+-- Volumes of blocked publishers, remembered after their rows are purged
+CREATE TABLE IF NOT EXISTS blocked_volume (
+    volume_id INTEGER PRIMARY KEY,
+    publisher_id INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cvproxy_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 # Indexes are created AFTER column migrations run so that new columns (e.g.
@@ -291,6 +310,8 @@ CREATE INDEX IF NOT EXISTS idx_issue_needs_detail ON cv_issue(id)
     WHERE detail_fetched_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_volume_needs_backfill ON cv_volume(id)
     WHERE date_last_updated IS NULL;
+CREATE INDEX IF NOT EXISTS idx_volume_publisher ON cv_volume(publisher_id);
+CREATE INDEX IF NOT EXISTS idx_blocked_volume_publisher ON blocked_volume(publisher_id);
 """
 
 _FTS_DDL = """
@@ -381,6 +402,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("backfill_missing", "INTEGER"),
     ],
     "cv_volume": [
+        ("publisher_id", "INTEGER"),
         ("characters", "TEXT"),
         ("concepts", "TEXT"),
         ("people", "TEXT"),
@@ -583,13 +605,20 @@ def _parse_json_col(row: sqlite3.Row, col: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _missing_cover_sql(min_year: int) -> str:
-    """Issues (alias i) the cover hash backfill still has to hash."""
+def _missing_cover_sql(min_year: int, scope: str = "1") -> str:
+    """Issues (alias i) the cover hash backfill still has to hash.
+
+    *scope* is Database.issue_scope_sql("i.volume_id").
+    """
     return (
         "i.image_url IS NOT NULL"
         " AND NOT EXISTS (SELECT 1 FROM comic_covers c WHERE c.cvid = i.id)"
-        f" AND {backfill_window_sql(min_year, 'i')}"
+        f" AND {backfill_window_sql(min_year, 'i')} AND {scope}"
     )
+
+
+def _id_list(ids: frozenset[int]) -> str:
+    return ",".join(str(int(i)) for i in sorted(ids))
 
 
 def backfill_window_sql(min_year: int, alias: str = "") -> str:
@@ -636,6 +665,9 @@ class Database:
         self._path = db_path
         self._cutoff_year = cutoff_year
         self._conn: sqlite3.Connection | None = None
+        self.allowed_publishers: frozenset[int] = frozenset()
+        self.blocked_publishers: frozenset[int] = frozenset()
+        self.blocked_volumes: frozenset[int] = frozenset()
 
     def _is_before_cutoff(self, date_str: str | None) -> bool:
         """Return True when date_str's year is strictly before the configured cutoff."""
@@ -660,6 +692,7 @@ class Database:
         self._conn.execute("PRAGMA mmap_size=1073741824")
         self._conn.execute("PRAGMA temp_store=MEMORY")
         self._ensure_schema()
+        self._load_publisher_lists()
 
     def backup_to(self, dest: Path) -> None:
         """Write a compacted, consistent snapshot of the database to *dest*.
@@ -708,6 +741,8 @@ class Database:
             out.execute(
                 "INSERT INTO cv_publisher"
                 " SELECT id, name, image_url, site_detail_url FROM src.cv_publisher"
+                " WHERE id NOT IN (SELECT publisher_id FROM src.publisher_list"
+                "                  WHERE list = 'block')"
             )
             out.execute(
                 """INSERT INTO cv_volume
@@ -717,7 +752,8 @@ class Database:
                           v.description, v.image_url, v.site_detail_url
                    FROM src.cv_volume v
                    LEFT JOIN (SELECT volume_id, COUNT(*) AS issues FROM src.cv_issue
-                              GROUP BY volume_id) n ON n.volume_id = v.id"""
+                              GROUP BY volume_id) n ON n.volume_id = v.id
+                   WHERE v.id NOT IN (SELECT volume_id FROM src.blocked_volume)"""
             )
             out.execute(
                 """INSERT INTO cv_issue
@@ -726,12 +762,16 @@ class Database:
                           COALESCE(character_credits, '[]'), COALESCE(person_credits, '[]'),
                           COALESCE(team_credits, '[]'), COALESCE(location_credits, '[]'),
                           COALESCE(story_arc_credits, '[]'), COALESCE(associated_images, '[]')
-                   FROM src.cv_issue"""
+                   FROM src.cv_issue
+                   WHERE volume_id IS NULL
+                      OR volume_id NOT IN (SELECT volume_id FROM src.blocked_volume)"""
             )
             if has_covers:
                 out.execute(
                     "INSERT INTO comic_covers"
                     " SELECT id, cvid, ct_phash, ct_ahash, cv_url FROM src.comic_covers"
+                    " WHERE cvid NOT IN (SELECT i.id FROM src.cv_issue i"
+                    "                    JOIN src.blocked_volume b ON b.volume_id = i.volume_id)"
                 )
             out.execute("COMMIT")
             out.execute("DETACH DATABASE src")
@@ -1292,7 +1332,8 @@ class Database:
         try:
             rows = conn.execute(
                 "SELECT i.id, i.image_url, i.associated_images FROM cv_issue i"
-                f" WHERE {_missing_cover_sql(min_year)} ORDER BY i.id DESC LIMIT ?",
+                f" WHERE {_missing_cover_sql(min_year, self.issue_scope_sql('i.volume_id'))}"
+                " ORDER BY i.id DESC LIMIT ?",
                 [limit],
             ).fetchall()
         finally:
@@ -1746,6 +1787,11 @@ class Database:
             ):
                 return
         pub = data.get("publisher") or {}
+        if data["id"] in self.blocked_volumes:
+            return
+        if pub.get("id") in self.blocked_publishers:
+            self._remember_blocked_volume(data["id"], pub["id"], commit=commit)
+            return
         if pub.get("id"):
             self.upsert_publisher(pub, commit=False)
 
@@ -1812,6 +1858,8 @@ class Database:
             if self._is_before_cutoff(date_str):
                 return
         volume = data.get("volume") or {}
+        if volume.get("id") in self.blocked_volumes:
+            return
         image = data.get("image") or {}
         image_url = (image.get("original_url") or image.get("medium_url")) if image else None
 
@@ -1879,6 +1927,7 @@ class Database:
                 " WHERE detail_fetched_at IS NULL"
                 " AND (backfill_missing IS NULL OR backfill_missing = 0)"
                 f" AND {backfill_window_sql(min_year)}"
+                f" AND {self.issue_scope_sql('volume_id')}"
                 " ORDER BY id DESC LIMIT ?",
                 [limit],
             )
@@ -1902,6 +1951,7 @@ class Database:
             " FROM cv_volume v INDEXED BY idx_volume_needs_backfill"
             " WHERE v.date_last_updated IS NULL"
             " AND (v.backfill_missing IS NULL OR v.backfill_missing = 0)"
+            f" AND {self.publisher_filter_sql('v.publisher_id')}"
             " ORDER BY v.id DESC LIMIT ?",
             [scan_limit],
         ).fetchall()
@@ -1910,6 +1960,187 @@ class Database:
         seen = set(calendar)
         old = [r[0] for r in rows if r[0] not in seen][:old_limit]
         return calendar, old
+
+    # -- publisher allowlist / blocklist ---------------------------------------
+
+    def _load_publisher_lists(self) -> None:
+        rows = self.conn.execute("SELECT publisher_id, list FROM publisher_list").fetchall()
+        self.allowed_publishers = frozenset(r[0] for r in rows if r[1] == "allow")
+        self.blocked_publishers = frozenset(r[0] for r in rows if r[1] == "block")
+        self.blocked_volumes = frozenset(
+            r[0] for r in self.conn.execute("SELECT volume_id FROM blocked_volume")
+        )
+
+    def publisher_lists(self) -> dict[str, list[dict[str, Any]]]:
+        """Allowed and blocked publishers as {id, name}, by name."""
+        out: dict[str, list[dict[str, Any]]] = {"allow": [], "block": []}
+        for pid, which, name in self.conn.execute(
+            "SELECT l.publisher_id, l.list, COALESCE(p.name, l.name) FROM publisher_list l"
+            " LEFT JOIN cv_publisher p ON p.id = l.publisher_id ORDER BY 3 COLLATE NOCASE"
+        ):
+            out[which].append({"id": pid, "name": name})
+        return out
+
+    def set_publisher_list(
+        self, publisher_id: int, which: str | None, *, name: str | None = None
+    ) -> None:
+        """Put a publisher on the allow or block list, or (None) take it off both.
+
+        Blocking records the publisher's stored volumes in blocked_volume; the
+        purge job deletes their rows.  Unblocking forgets them, so their data
+        is fetched again when clients ask for it.
+        """
+        if which not in ("allow", "block", None):
+            raise ValueError(f"Unknown publisher list: {which!r}")
+        with self.conn:
+            self.conn.execute("DELETE FROM blocked_volume WHERE publisher_id = ?", [publisher_id])
+            if which is None:
+                self.conn.execute(
+                    "DELETE FROM publisher_list WHERE publisher_id = ?", [publisher_id]
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO publisher_list (publisher_id, list, name) VALUES (?, ?, ?)"
+                    " ON CONFLICT(publisher_id) DO UPDATE SET list = excluded.list,"
+                    " name = COALESCE(excluded.name, name)",
+                    [publisher_id, which, name],
+                )
+            if which == "block":
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO blocked_volume (volume_id, publisher_id)"
+                    " SELECT id, publisher_id FROM cv_volume WHERE publisher_id = ?",
+                    [publisher_id],
+                )
+        self._load_publisher_lists()
+
+    def seed_publisher_lists(self, allow: dict[int, str], block: dict[int, str]) -> bool:
+        """Fill the lists the first time only, so dashboard edits are never undone."""
+        seeded = self.conn.execute(
+            "SELECT 1 FROM cvproxy_meta WHERE key = 'publisher_lists_seeded'"
+        ).fetchone()
+        if seeded:
+            return False
+        rows = [(pid, "allow", name) for pid, name in allow.items()]
+        rows += [(pid, "block", name) for pid, name in block.items()]
+        with self.conn:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO publisher_list (publisher_id, list, name) VALUES (?, ?, ?)",
+                rows,
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO blocked_volume (volume_id, publisher_id)"
+                " SELECT v.id, v.publisher_id FROM cv_volume v JOIN publisher_list l"
+                " ON l.publisher_id = v.publisher_id AND l.list = 'block'"
+            )
+            self.conn.execute(
+                "INSERT INTO cvproxy_meta (key, value)"
+                " VALUES ('publisher_lists_seeded', datetime('now'))"
+            )
+        self._load_publisher_lists()
+        return True
+
+    def _remember_blocked_volume(self, volume_id: int, publisher_id: int, *, commit: bool) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO blocked_volume (volume_id, publisher_id) VALUES (?, ?)",
+            [volume_id, publisher_id],
+        )
+        if commit:
+            self.conn.commit()
+        self.blocked_volumes = self.blocked_volumes | {volume_id}
+
+    def publisher_filter_sql(self, column: str) -> str:
+        """SQL condition on a publisher ID column: the backfills may fetch it.
+
+        With an allowlist only listed publishers qualify; without one, every
+        publisher that isn't blocked.
+        """
+        if self.allowed_publishers:
+            return f"{column} IN ({_id_list(self.allowed_publishers)})"
+        if self.blocked_publishers:
+            return f"({column} IS NULL OR {column} NOT IN ({_id_list(self.blocked_publishers)}))"
+        return "1"
+
+    def issue_scope_sql(self, volume_column: str) -> str:
+        """SQL condition on an issue's volume ID column: the backfills may fetch it."""
+        if self.allowed_publishers:
+            return (
+                f"{volume_column} IN (SELECT id FROM cv_volume"
+                f" WHERE publisher_id IN ({_id_list(self.allowed_publishers)}))"
+            )
+        if self.blocked_volumes:
+            return (
+                f"({volume_column} IS NULL"
+                f" OR {volume_column} NOT IN (SELECT volume_id FROM blocked_volume))"
+            )
+        return "1"
+
+    def blocked_row_counts(self) -> dict[str, int]:
+        """Stored issues and volumes the purge would delete (read-only connection)."""
+        conn = self._ro_connect(timeout=30)
+        try:
+            issues, volumes = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM cv_issue"
+                "        WHERE volume_id IN (SELECT volume_id FROM blocked_volume)),"
+                "       (SELECT COUNT(*) FROM cv_volume"
+                "        WHERE id IN (SELECT volume_id FROM blocked_volume))"
+            ).fetchone()
+        finally:
+            conn.close()
+        return {"issues": issues, "volumes": volumes}
+
+    def purge_blocked(
+        self,
+        *,
+        batch: int = 2000,
+        pause: float = 0.0,
+        progress: Callable[[int], None] | None = None,
+    ) -> dict[str, int]:
+        """Delete blocked publishers' issues, covers and volumes (worker thread).
+
+        Works on a connection of its own in batches of *batch* rows, one short
+        transaction each and *pause* seconds apart, so writers on the main
+        connection are never locked out for long (the FTS delete triggers make
+        every row costly).  Publisher rows stay: the dashboard shows their names.
+        *progress* gets the number of issues deleted so far.
+        """
+        out = {"issues": 0, "covers": 0, "volumes": 0, "cached_responses": 0}
+        conn = sqlite3.connect(str(self._path), timeout=30)
+
+        def batches(select: str) -> Iterator[list[int]]:
+            while ids := [r[0] for r in conn.execute(select, [batch])]:
+                yield ids
+                if pause:
+                    time.sleep(pause)
+
+        def delete(sql: str, ids: list[int]) -> int:
+            return int(conn.execute(sql.format(",".join("?" * len(ids))), ids).rowcount)
+
+        try:
+            for ids in batches(
+                "SELECT id FROM cv_issue"
+                " WHERE volume_id IN (SELECT volume_id FROM blocked_volume) LIMIT ?"
+            ):
+                with conn:
+                    out["covers"] += delete("DELETE FROM comic_covers WHERE cvid IN ({})", ids)
+                    out["cached_responses"] += delete(
+                        "DELETE FROM cv_response_cache"
+                        " WHERE resource_type = 'issue' AND resource_id IN ({})", ids)
+                    out["issues"] += delete("DELETE FROM cv_issue WHERE id IN ({})", ids)
+                if progress:
+                    progress(out["issues"])
+            for ids in batches(
+                "SELECT id FROM cv_volume"
+                " WHERE id IN (SELECT volume_id FROM blocked_volume) LIMIT ?"
+            ):
+                with conn:
+                    out["cached_responses"] += delete(
+                        "DELETE FROM cv_response_cache"
+                        " WHERE resource_type = 'volume' AND resource_id IN ({})", ids)
+                    delete("DELETE FROM cv_volume_issue_sync WHERE volume_id IN ({})", ids)
+                    out["volumes"] += delete("DELETE FROM cv_volume WHERE id IN ({})", ids)
+        finally:
+            conn.close()
+        return out
 
     # -- WAL maintenance -----------------------------------------------------
 
@@ -2088,11 +2319,14 @@ class Database:
         try:
             one("volumes_missing_fields",
                 "SELECT COUNT(*) FROM cv_volume INDEXED BY idx_volume_needs_backfill"
-                f" WHERE date_last_updated IS NULL AND {not_missing}")
+                f" WHERE date_last_updated IS NULL AND {not_missing}"
+                f" AND {self.publisher_filter_sql('publisher_id')}")
             one("publishers_missing_fields",
                 "SELECT COUNT(*) FROM cv_publisher"
-                f" WHERE date_last_updated IS NULL AND {not_missing}")
-            window = backfill_window_sql(min_year)
+                f" WHERE date_last_updated IS NULL AND {not_missing}"
+                f" AND {self.publisher_filter_sql('id')}")
+            # "in window": what the backfills work on (year floor and allowlist)
+            window = f"({backfill_window_sql(min_year)} AND {self.issue_scope_sql('volume_id')})"
             t0 = time.monotonic()
             out["issues_missing_details"], out["issues_missing_details_in_window"] = conn.execute(
                 f"SELECT COUNT(*), COALESCE(SUM({window}), 0) FROM cv_issue"
@@ -2107,7 +2341,8 @@ class Database:
             ).fetchone()
             timings["issues_missing_fields"] = round(time.monotonic() - t0, 1)
             one("issues_missing_covers_in_window",
-                f"SELECT COUNT(*) FROM cv_issue i WHERE {_missing_cover_sql(min_year)}")
+                "SELECT COUNT(*) FROM cv_issue i"
+                f" WHERE {_missing_cover_sql(min_year, self.issue_scope_sql('i.volume_id'))}")
             out["backfill_min_year"] = min_year
             one("newest_issue_id", "SELECT COALESCE(MAX(id), 0) FROM cv_issue")
             one("newest_hashed_issue_id", "SELECT COALESCE(MAX(cvid), 0) FROM comic_covers")

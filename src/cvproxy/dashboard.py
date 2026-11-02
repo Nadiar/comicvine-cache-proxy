@@ -43,6 +43,7 @@ DASHBOARD_HTML = """\
           <li class="nav-item"><a class="nav-link active py-1 px-2" data-tab="stats" href="#">Stats</a></li>
           <li class="nav-item"><a class="nav-link py-1 px-2" data-tab="jobs" href="#">Jobs <span class="badge text-bg-secondary ms-1" id="jobsBadge" style="display:none"></span></a></li>
           <li class="nav-item"><a class="nav-link py-1 px-2" data-tab="settings" href="#">Settings</a></li>
+          <li class="nav-item"><a class="nav-link py-1 px-2" data-tab="publishers" href="#">Publishers</a></li>
         </ul>
         <div class="btn-group btn-group-sm" role="group" aria-label="Time filter" id="timeFilterGroup">
           <button type="button" class="btn btn-outline-secondary time-btn" data-hours="1">1h</button>
@@ -274,6 +275,48 @@ DASHBOARD_HTML = """\
         </div>
         <div class="text-center py-2">
           <button class="btn btn-sm btn-outline-secondary" id="histMore" style="display:none">Load more</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- =====================================================================
+       PUBLISHERS TAB PANE
+       ===================================================================== -->
+  <main class="container my-4" id="publishersPane" style="display:none">
+    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+      <h5 class="mb-0"><i class="bi bi-building me-2"></i>Publishers</h5>
+      <span class="small" id="publishersFeedback"></span>
+    </div>
+    <div class="card shadow-sm mb-3">
+      <div class="card-body py-2">
+        <input type="search" class="form-control form-control-sm" id="publisherSearch"
+               placeholder="Find a stored publisher by name (2+ letters)" autocomplete="off">
+        <div id="publisherSearchResults" class="mt-2"></div>
+      </div>
+    </div>
+    <div class="row g-3">
+      <div class="col-lg-6">
+        <div class="card shadow-sm h-100">
+          <div class="card-header py-2"><span class="fw-semibold">Allowed</span>
+            <span class="badge text-bg-success ms-1" id="allowCount"></span></div>
+          <ul class="list-group list-group-flush" id="allowList"></ul>
+          <div class="card-footer small footer-note">
+            The issue, issue detail, cover hash, volume and publisher backfills only work on these.
+            With none listed, they work on every publisher that isn't blocked.
+          </div>
+        </div>
+      </div>
+      <div class="col-lg-6">
+        <div class="card shadow-sm h-100">
+          <div class="card-header py-2"><span class="fw-semibold">Blocked</span>
+            <span class="badge text-bg-danger ms-1" id="blockCount"></span></div>
+          <ul class="list-group list-group-flush" id="blockList"></ul>
+          <div class="card-footer small footer-note">
+            Never served to clients, stored or exported. Blocking hides a publisher at once;
+            the Blocked publisher purge job deletes its stored rows. Unblocking can't bring those back:
+            they're fetched again when a client asks for them.
+          </div>
         </div>
       </div>
     </div>
@@ -603,9 +646,11 @@ DASHBOARD_HTML = """\
     // Tab switching
     // -----------------------------------------------------------------------
     let currentTab = 'stats';
-    const statsPane = document.querySelector('main.container:not(#jobsPane):not(#settingsPane)');
+    const statsPane = document.querySelector(
+      'main.container:not(#jobsPane):not(#settingsPane):not(#publishersPane)');
     const jobsPane  = document.getElementById('jobsPane');
     const settingsPane = document.getElementById('settingsPane');
+    const publishersPane = document.getElementById('publishersPane');
     const timeFilterGroup = document.getElementById('timeFilterGroup');
 
     document.querySelectorAll('[data-tab]').forEach(link => {
@@ -617,9 +662,11 @@ DASHBOARD_HTML = """\
         statsPane.style.display = currentTab === 'stats' ? '' : 'none';
         jobsPane.style.display  = currentTab === 'jobs'  ? '' : 'none';
         settingsPane.style.display = currentTab === 'settings' ? '' : 'none';
+        publishersPane.style.display = currentTab === 'publishers' ? '' : 'none';
         timeFilterGroup.style.display = currentTab === 'stats' ? '' : 'none';
         if (currentTab === 'jobs') loadJobsTab();
         if (currentTab === 'settings') loadSettings();
+        if (currentTab === 'publishers') loadPublishers();
       });
     });
 
@@ -989,6 +1036,74 @@ DASHBOARD_HTML = """\
         changes[input.dataset.name] = value;
       }
       saveSettings(changes);
+    });
+
+    // -----------------------------------------------------------------------
+    // Publishers tab
+    // -----------------------------------------------------------------------
+    const LIST_BUTTONS = {
+      allow: [['block', 'btn-outline-danger', 'Block'], [null, 'btn-outline-secondary', 'Remove']],
+      block: [['allow', 'btn-outline-success', 'Allow'], [null, 'btn-outline-secondary', 'Remove']],
+      none:  [['allow', 'btn-outline-success', 'Allow'], ['block', 'btn-outline-danger', 'Block']],
+    };
+
+    function publisherButtons(p, current) {
+      return LIST_BUTTONS[current || 'none'].map(([target, cls, label]) =>
+        `<button class="btn btn-sm ${cls} py-0 move-publisher" data-id="${esc(p.id)}"
+                 data-list="${target || ''}">${label}</button>`).join(' ');
+    }
+
+    function publisherItem(p, current) {
+      return `<li class="list-group-item d-flex justify-content-between align-items-center py-1">
+          <span>${esc(p.name || '(not stored)')} <code class="small text-secondary ms-1">${esc(p.id)}</code></span>
+          <span class="text-nowrap">${publisherButtons(p, current)}</span></li>`;
+    }
+
+    function bindPublisherButtons(root) {
+      root.querySelectorAll('.move-publisher').forEach(btn => btn.addEventListener('click',
+        () => movePublisher(Number(btn.dataset.id), btn.dataset.list || null)));
+    }
+
+    function renderPublishers(lists) {
+      for (const which of ['allow', 'block']) {
+        const ul = document.getElementById(`${which}List`);
+        ul.innerHTML = lists[which].map(p => publisherItem(p, which)).join('')
+          || '<li class="list-group-item small text-secondary">None</li>';
+        document.getElementById(`${which}Count`).textContent = lists[which].length;
+        bindPublisherButtons(ul);
+      }
+    }
+
+    async function loadPublishers() {
+      try { renderPublishers(await fetch('/admin/publishers').then(r => r.json())); }
+      catch (e) { console.error('Publishers load failed:', e); }
+    }
+
+    async function movePublisher(id, list) {
+      const resp = await fetch(`/admin/publishers/${id}`, {
+        method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({list})});
+      const data = await resp.json();
+      const feedback = document.getElementById('publishersFeedback');
+      if (!resp.ok) { feedback.innerHTML = `<span class="text-danger">${esc(data.detail || resp.statusText)}</span>`; return; }
+      renderPublishers(data);
+      feedback.innerHTML = `<span class="text-success"><i class="bi bi-check-circle me-1"></i>Saved.</span>`;
+      searchPublishers();
+    }
+
+    let publisherSearchTimer = null;
+    async function searchPublishers() {
+      const q = document.getElementById('publisherSearch').value.trim();
+      const out = document.getElementById('publisherSearchResults');
+      if (q.length < 2) { out.innerHTML = ''; return; }
+      const found = await fetch(`/admin/publishers/search?q=${encodeURIComponent(q)}`).then(r => r.json());
+      out.innerHTML = found.length
+        ? `<ul class="list-group">${found.map(p => publisherItem(p, p.list)).join('')}</ul>`
+        : '<div class="small text-secondary">No stored publisher matches.</div>';
+      bindPublisherButtons(out);
+    }
+    document.getElementById('publisherSearch').addEventListener('input', () => {
+      clearTimeout(publisherSearchTimer);
+      publisherSearchTimer = setTimeout(searchPublishers, 250);
     });
 
     // Boot

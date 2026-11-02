@@ -167,6 +167,15 @@ def _sum_evict(r: dict[str, Any]) -> str:
     )
 
 
+def _sum_purge(r: dict[str, Any]) -> str:
+    if r.get("dry_run"):
+        return f"dry run: would remove {r.get('issues', 0)} issues, {r.get('volumes', 0)} volumes"
+    return (
+        f"removed {r.get('issues', 0)} issues, {r.get('volumes', 0)} volumes, "
+        f"{r.get('covers', 0)} cover hashes"
+    )
+
+
 def _sum_refetch(r: dict[str, Any]) -> str:
     parts = [f"{r.get('fetched', 0)}/{r.get('requested', 0)} by ID"]
     if r.get("not_on_cv"):
@@ -355,8 +364,8 @@ def build_job_specs(
             id="issue_detail_backfill", name="Issue detail backfill", category="backfill",
             description=lambda s: (
                 "Fetches /issue/ details (credits, variant covers) for up to 100 list-only "
-                f"issues dated {_min_year(s)} or undated, newest first. Yields to "
-                "client requests."
+                f"issues of allowed publishers dated {_min_year(s)} or undated, newest "
+                "first. Yields to client requests."
             ),
             run=job(lambda p: _backfill_issue_details(client, db)),
             trigger=_cron(minute=5), endpoints=("issue/",), summarize=_sum_backfill,
@@ -365,9 +374,9 @@ def build_job_specs(
         JobSpec(
             id="issue_backfill", name="Issue backfill", category="backfill",
             description=lambda s: (
-                "Re-fetches up to 150 issues cached without date_last_updated (by older "
-                f"versions), dated {_min_year(s)} first. IDs ComicVine no longer has "
-                "are skipped from then on."
+                "Re-fetches up to 150 issues of allowed publishers cached without "
+                f"date_last_updated (by older versions), dated {_min_year(s)} first. "
+                "IDs ComicVine no longer has are skipped from then on."
             ),
             run=job(lambda p: _backfill_issues(client, db)),
             trigger=_cron(minute=45), endpoints=("issue/",), summarize=_sum_backfill,
@@ -376,8 +385,8 @@ def build_job_specs(
         JobSpec(
             id="volume_backfill", name="Volume backfill", category="backfill",
             description=(
-                "Re-fetches volumes missing detail fields: up to 100 with dated issues plus 50 "
-                "older ones."
+                "Re-fetches volumes of allowed publishers missing detail fields: up to 100 with "
+                "dated issues plus 50 older ones."
             ),
             run=job(lambda p: _backfill_volumes(client, db)),
             trigger=_cron(minute=30), endpoints=("volume/",), summarize=_sum_backfill,
@@ -385,7 +394,7 @@ def build_job_specs(
         ),
         JobSpec(
             id="publisher_backfill", name="Publisher backfill", category="backfill",
-            description="Re-fetches up to 50 publishers missing detail fields.",
+            description="Re-fetches up to 50 allowed publishers missing detail fields.",
             run=job(lambda p: _backfill_publishers(client, db)),
             trigger=_cron(hour="*/6", minute=15), endpoints=("publisher/",),
             summarize=_sum_backfill,
@@ -415,7 +424,8 @@ def build_job_specs(
         JobSpec(
             id="cover_hash_backfill", name="Cover hash backfill", category="backfill",
             description=lambda s: (
-                "Hashes cover images (pHash, average hash) into comic_covers for issues dated "
+                "Hashes cover images (pHash, average hash) into comic_covers for issues of "
+                "allowed publishers dated "
                 f"{_min_year(s)}: up to {s.cover_hash_per_hour} covers per run "
                 "(COVER_HASH_PER_HOUR). Uses the image CDN, not API quota."
             ),
@@ -463,6 +473,18 @@ def build_job_specs(
             params=(Param("dry_run", "bool", True, "Dry run (count only)",
                           "Uncheck to actually delete."),),
             schedule_params={"dry_run": False}, summarize=_sum_evict,
+        ),
+        JobSpec(
+            id="blocked_publisher_purge", name="Blocked publisher purge", category="maintenance",
+            description=(
+                "Deletes stored issues, cover hashes and volumes of publishers on the blocklist "
+                "(Publishers tab), in small batches. Publisher names are kept."
+            ),
+            run=job(lambda p: _purge_blocked(db, dry_run=p["dry_run"])),
+            trigger=_cron(hour=(h + 3) % 24, minute=20), destructive=True,
+            params=(Param("dry_run", "bool", True, "Dry run (count only)",
+                          "Uncheck to actually delete."),),
+            schedule_params={"dry_run": False}, summarize=_sum_purge,
         ),
         JobSpec(
             id="image_cache_cleanup", name="Image cache cleanup", category="maintenance",
@@ -685,6 +707,8 @@ _VOLUME_CALENDAR_BATCH = 100  # new/updated volumes (calendar-relevant)
 _VOLUME_OLD_BATCH = 50  # older stale rows
 _ISSUE_BATCH = 150
 _PUBLISHER_BATCH = 50  # publishers table is much smaller
+_PURGE_BATCH = 2000  # rows per transaction when purging blocked publishers
+_PURGE_PAUSE = 0.5  # seconds between those transactions, so other writers get in
 _ISSUE_DETAIL_BATCH = 100
 _SEARCH_BACKFILL_BATCH = 50
 
@@ -772,23 +796,36 @@ def _issue_backfill_ids(db: Database, min_year: int = 0) -> list[int]:
     Uses a read-only connection of its own so it can run on a worker thread:
     with ~900k rows still missing fields, the dated-issues walk took from 15 s
     to 7 minutes on this disk and stalled every request while it ran on the
-    event loop (see the loop watchdog).
+    event loop (see the loop watchdog).  With an allowlist the dated walk goes
+    through the allowed volumes' issues instead (0.4 s instead of 3 minutes).
     """
     conn = db._ro_connect(timeout=30)
     try:
-        return _issue_backfill_ids_on(conn, min_year)
+        return _issue_backfill_ids_on(
+            conn, min_year, db.issue_scope_sql("volume_id"),
+            by_volume=bool(db.allowed_publishers),
+        )
     finally:
         conn.close()
 
 
-def _issue_backfill_ids_on(conn: Any, min_year: int = 0) -> list[int]:
+def _issue_backfill_ids_on(
+    conn: Any, min_year: int = 0, scope: str = "1", *, by_volume: bool = False
+) -> list[int]:
+    """*scope* is Database.issue_scope_sql("volume_id"): the publisher lists.
+
+    *by_volume* reads the dated issues through idx_issue_volume_id, for a
+    scope that names a limited set of volumes.
+    """
     floor = f"{min_year:04d}" if min_year > 0 else ""
+    index = "INDEXED BY idx_issue_volume_id" if by_volume else ""
     cur = conn.execute(
         """
-        SELECT id FROM cv_issue
+        SELECT id FROM cv_issue """ + index + """
         WHERE date_last_updated IS NULL
           AND (backfill_missing IS NULL OR backfill_missing = 0)
           AND store_date IS NOT NULL AND store_date >= ?
+          AND """ + scope + """
         ORDER BY store_date DESC
         LIMIT ?
         """,
@@ -803,7 +840,7 @@ def _issue_backfill_ids_on(conn: Any, min_year: int = 0) -> list[int]:
             SELECT id FROM cv_issue
             WHERE date_last_updated IS NULL
               AND (backfill_missing IS NULL OR backfill_missing = 0)
-              AND """ + backfill_window_sql(min_year) + """
+              AND """ + backfill_window_sql(min_year) + " AND " + scope + """
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -849,23 +886,45 @@ async def _backfill_issue_details(client: CVClient, db: Database) -> dict[str, A
     )
 
 
-async def _backfill_publishers(client: CVClient, db: Database) -> dict[str, Any]:
-    """Re-fetch publishers that are missing the new detail fields."""
+def _publisher_backfill_ids(db: Database) -> list[int]:
+    """Publishers missing detail fields that the publisher lists let us fetch."""
     cur = db.conn.execute(
         """
         SELECT id FROM cv_publisher
         WHERE date_last_updated IS NULL
           AND (backfill_missing IS NULL OR backfill_missing = 0)
+          AND """ + db.publisher_filter_sql("id") + """
         ORDER BY id DESC
         LIMIT ?
         """,
         [_PUBLISHER_BATCH],
     )
+    return [row[0] for row in cur.fetchall()]
+
+
+async def _backfill_publishers(client: CVClient, db: Database) -> dict[str, Any]:
+    """Re-fetch publishers that are missing the new detail fields."""
     return await _backfill_ids(
         client, db, label="Publisher backfill", endpoint="publisher/", table="cv_publisher",
-        ids=[row[0] for row in cur.fetchall()], fetch=client.get_publisher,
+        ids=_publisher_backfill_ids(db), fetch=client.get_publisher,
         store=lambda r: db.upsert_publisher(r, commit=False),
     )
+
+
+async def _purge_blocked(db: Database, *, dry_run: bool) -> dict[str, Any]:
+    """Delete stored rows of blocked publishers (see Database.purge_blocked)."""
+    if dry_run:
+        counts = await asyncio.to_thread(db.blocked_row_counts)
+        logger.info("Blocked publisher purge (dry run): %s", counts)
+        return {"dry_run": True, **counts}
+    result: dict[str, Any] = await asyncio.to_thread(
+        db.purge_blocked, batch=_PURGE_BATCH, pause=_PURGE_PAUSE,
+        progress=lambda n: report_progress(n, None, f"{n} issues"),
+    )
+    logger.info("Blocked publisher purge: %s", result)
+    if not any(result.values()):
+        result["stop_reason"] = "nothing_to_do"
+    return result
 
 
 async def _backfill_search_cache_volumes(client: CVClient, db: Database) -> dict[str, Any]:

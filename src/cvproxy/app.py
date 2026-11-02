@@ -40,6 +40,7 @@ from cvproxy.overrides import (
     describe_settings,
     usable_overrides,
 )
+from cvproxy.publishers import SEED_ALLOW, SEED_BLOCK, PublisherFilterMiddleware
 from cvproxy.routes.api import router as api_router
 from cvproxy.scheduler import build_job_specs, create_scheduler
 from cvproxy.stats import StatsTracker
@@ -217,6 +218,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # Database
     db = Database(settings.db_path, cutoff_year=settings.cache_cutoff_year)
     db.connect()
+    if db.seed_publisher_lists(SEED_ALLOW, SEED_BLOCK):
+        logger.info("Publisher lists seeded: %d allowed, %d blocked",
+                    len(SEED_ALLOW), len(SEED_BLOCK))
     app.state.db = db
     counts = db.get_counts()
     logger.info(
@@ -317,6 +321,9 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    # Drop blocked publishers from /api/ responses (inside the XML conversion).
+    app.add_middleware(PublisherFilterMiddleware)
 
     # Convert JSON responses to CV-compatible XML when format=xml is requested.
     app.add_middleware(XmlFormatMiddleware)
@@ -525,6 +532,40 @@ def create_app() -> FastAPI:
         _runner().sync_schedule()
         logger.info("Setting overrides changed: %s", changes)
         return _settings_view()
+
+    # -- publisher allowlist / blocklist ---------------------------------------
+
+    @app.get("/admin/publishers")
+    def admin_publishers() -> dict[str, list[dict[str, Any]]]:
+        """Allowed and blocked publishers."""
+        db: Database = app.state.db
+        return db.publisher_lists()
+
+    @app.get("/admin/publishers/search")
+    def admin_publishers_search(
+        q: str = Query(min_length=2, description="Part of the publisher's name"),
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> list[dict[str, Any]]:
+        """Stored publishers matching *q*, with the list each one is on."""
+        db: Database = app.state.db
+        on_list = {
+            p["id"]: which for which, pubs in db.publisher_lists().items() for p in pubs
+        }
+        found, _ = db.list_publishers(name=q, limit=limit)
+        return [{"id": p["id"], "name": p["name"], "list": on_list.get(p["id"])} for p in found]
+
+    @app.put("/admin/publishers/{publisher_id}")
+    def admin_publishers_update(
+        publisher_id: int, change: Annotated[dict[str, Any], Body()]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Move a publisher to {"list": "allow" | "block"}, or off both lists with null."""
+        db: Database = app.state.db
+        try:
+            db.set_publisher_list(publisher_id, change.get("list"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        logger.info("Publisher %d moved to list %s", publisher_id, change.get("list"))
+        return db.publisher_lists()
 
     # Older per-job endpoints, kept for scripts; they start the same jobs.
 

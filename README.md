@@ -136,6 +136,9 @@ error...; the next run continues), `idle` (nothing to do), `skipped`
 | `GET /admin/scheduler/history` | The last 100 scheduled runs |
 | `GET /admin/settings` | Settings editable on the dashboard: value, env/default value, source |
 | `PUT /admin/settings` | Override settings (`{"backfill_min_year": 2015}`); `null` goes back to the env/default value |
+| `GET /admin/publishers` | The publisher allowlist and blocklist |
+| `GET /admin/publishers/search?q=` | Stored publishers matching a name, with the list each one is on |
+| `PUT /admin/publishers/{id}` | Move a publisher: `{"list": "allow"}`, `{"list": "block"}`, or `{"list": null}` for neither |
 
 Older per-job endpoints still work and start the same jobs:
 `POST /admin/sync/issues?days=`, `/admin/repair/publishers`, `/admin/evict?dry_run=`,
@@ -163,6 +166,23 @@ X-CV-Cache: no-cache
 ```
 
 ## Limiting What Gets Cached
+
+### Publisher allowlist and blocklist
+
+Both lists are edited on the dashboard's Publishers tab and stored in the database. The first
+start fills them with a default set: 18 major US publishers allowed, and 175 foreign-language
+publishers and UK/Australian reprint houses blocked.
+
+- **Allowed:** the issue, issue detail, cover hash, volume and publisher backfills only work on
+  these publishers. With the allowlist empty they work on every publisher that isn't blocked.
+  Client requests aren't limited by it.
+- **Blocked:** dropped from every `/api/` response, including results fetched live from
+  ComicVine (a direct lookup answers `status_code: 101`). They are never stored and are left
+  out of the `comicvine.db` export.
+- **Purge:** blocking hides a publisher straight away. The daily *Blocked publisher purge* job
+  deletes its stored issues, cover hashes and volumes; run it from the Jobs tab with *Dry run*
+  checked to see the counts first. The volume IDs are kept, so issues that only name their
+  volume are still recognised. Unblocking forgets them, and data comes back as clients ask for it.
 
 ### Ingest cutoff (`CACHE_CUTOFF_YEAR`)
 
