@@ -680,10 +680,11 @@ async def _prefetch_releases(client: CVClient, db: Database) -> dict[str, Any]:
 
     logger.info("Releases prefetch: fetching store_date %s to %s", start, end)
 
-    total_upserted = 0
+    total_upserted = skipped = 0
     offset = 0
     limit = 100
     stop: str | None = None
+    keep = await _sync_row_filter(db, "issues/")
 
     while True:
         data = await client.get(
@@ -704,9 +705,11 @@ async def _prefetch_releases(client: CVClient, db: Database) -> dict[str, Any]:
             break
 
         results = data.get("results") or []
-        if results:
-            _store_issue_page(db, results)
-        total_upserted += len(results)
+        wanted = [r for r in results if keep(r)] if keep else results
+        if wanted:
+            _store_issue_page(db, wanted)
+        total_upserted += len(wanted)
+        skipped += len(results) - len(wanted)
 
         total_available = data.get("number_of_total_results", 0)
         offset += limit
@@ -717,6 +720,8 @@ async def _prefetch_releases(client: CVClient, db: Database) -> dict[str, Any]:
 
     logger.info("Releases prefetch: upserted %d issues", total_upserted)
     result: dict[str, Any] = {"window": f"{start}..{end}", "issues_upserted": total_upserted}
+    if skipped:
+        result["skipped"] = skipped
     if stop:
         result["stop_reason"] = stop
     return result
@@ -1048,6 +1053,55 @@ _SYNC_STORE: dict[str, Callable[[Database, list[dict[str, Any]]], None]] = {
 }
 
 
+async def _sync_row_filter(
+    db: Database, endpoint: str
+) -> Callable[[dict[str, Any]], bool] | None:
+    """Which list rows the syncs and the releases prefetch store; None = all of them.
+
+    The same scope as the backfills (allowlist and BACKFILL_MIN_YEAR):
+
+    - issues: dated in the window (or undated), and their volume allowlisted,
+      or not stored yet (a new series' first issues arrive before its volume);
+    - volumes: publisher allowlisted, and in the window: stored ones by their
+      issues' dates, new ones by start year (or none given).
+
+    Rows outside it are skipped, updates to stored ones included.
+    """
+    min_year = get_settings().backfill_min_year
+    allowed = db.allowed_publishers
+    if not allowed and min_year <= 0:
+        return None
+    floor = f"{min_year:04d}" if min_year > 0 else ""
+    stored = await asyncio.to_thread(db.existing_ids_snapshot, "cv_volume")
+
+    if endpoint == "volumes/":
+        in_window = await asyncio.to_thread(partial(db.volume_ids_snapshot, min_year=min_year))
+
+        def keep_volume(row: dict[str, Any]) -> bool:
+            if allowed and (row.get("publisher") or {}).get("id") not in allowed:
+                return False
+            if row.get("id") in stored:
+                return row["id"] in in_window
+            start = str(row.get("start_year") or "")
+            return not (floor and start.isdigit() and start < floor)
+
+        return keep_volume
+
+    allowed_volumes = (
+        await asyncio.to_thread(partial(db.volume_ids_snapshot, allowed_only=True))
+        if allowed else None
+    )
+
+    def keep_issue(row: dict[str, Any]) -> bool:
+        volume = (row.get("volume") or {}).get("id")
+        if allowed_volumes is not None and volume in stored and volume not in allowed_volumes:
+            return False
+        date = str(row.get("store_date") or row.get("cover_date") or "")
+        return not (floor and date and date < floor)
+
+    return keep_issue
+
+
 async def _sync_window(
     client: CVClient,
     db: Database,
@@ -1065,15 +1119,16 @@ async def _sync_window(
     because pages are sorted ascending, every issue up to *latest* is stored.
     When incomplete, ``outcome["stop_reason"]`` says why.
     """
-    upserted = 0
+    upserted = skipped = 0
     latest: str | None = None
     chunk_start = start
     chunks = 0
+    outcome = outcome if outcome is not None else {}
+    keep = await _sync_row_filter(db, endpoint)
     total_chunks = max(1, int((end - start) / _SYNC_CHUNK + 0.999))
     while chunk_start < end:
         if max_chunks is not None and chunks >= max_chunks:
-            if outcome is not None:
-                outcome["stop_reason"] = "run_limit"
+            outcome["stop_reason"] = "run_limit"
             return upserted, latest, False
         chunk_end = min(chunk_start + _SYNC_CHUNK, end)
         offset = 0
@@ -1101,13 +1156,15 @@ async def _sync_window(
                     offset,
                     " (rate limited)" if data is _CV_RATE_LIMITED else "",
                 )
-                if outcome is not None:
-                    outcome["stop_reason"] = _upstream_failure(data)
+                outcome["stop_reason"] = _upstream_failure(data)
                 return upserted, latest, False
             results = data.get("results") or []
             if results:
-                _SYNC_STORE[endpoint](db, results)
-                upserted += len(results)
+                wanted = [r for r in results if keep(r)] if keep else results
+                _SYNC_STORE[endpoint](db, wanted)
+                upserted += len(wanted)
+                skipped += len(results) - len(wanted)
+                outcome["skipped"] = skipped
                 page_latest = max(str(r.get("date_last_updated") or "") for r in results)
                 if page_latest and (latest is None or page_latest > latest):
                     latest = page_latest
@@ -1161,6 +1218,8 @@ async def _sync_incremental(
     result: dict[str, Any] = {
         f"{noun}_upserted": upserted, "watermark": mark, "complete": complete,
     }
+    if outcome.get("skipped"):
+        result["skipped"] = outcome["skipped"]
     if not complete:
         result["stop_reason"] = outcome.get("stop_reason", "upstream_error")
     return result
@@ -1217,6 +1276,8 @@ async def _sync_recent_issues(client: CVClient, db: Database, hours: int = 48) -
     result: dict[str, Any] = {
         "window_hours": hours, "issues_upserted": upserted, "complete": complete,
     }
+    if outcome.get("skipped"):
+        result["skipped"] = outcome["skipped"]
     if not complete:
         result["stop_reason"] = outcome.get("stop_reason", "upstream_error")
     return result

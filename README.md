@@ -258,9 +258,9 @@ after them. Every job can be started from the Jobs tab.
 
 | Job | Schedule | Description |
 | --- | --- | --- |
-| Incremental issue sync | Hourly at :10 | Issues changed since the stored watermark, in 24h slices; the watermark only moves over stored data |
-| Incremental volume sync | Hourly at :25 | Volumes changed since the volume watermark, in 24h slices; keeps stored character/people lists |
-| Releases prefetch | Daily at H:00 | Issues with a store date from 2 weeks ago to 1 week ahead |
+| Incremental issue sync | Hourly at :10 | Issues changed since the stored watermark, in 24h slices; the watermark only moves over stored data. Only issues in scope are stored (see below) |
+| Incremental volume sync | Hourly at :25 | Volumes changed since the volume watermark, in 24h slices; keeps stored character/people lists. Only volumes in scope are stored |
+| Releases prefetch | Daily at H:00 | Issues with a store date from 2 weeks ago to 1 week ahead, allowed publishers only |
 | Pending fetch | Every 2 min | Cache misses queued while ComicVine couldn't be asked; idle runs aren't kept in history |
 | Issue detail backfill | Hourly at :05 | /issue/ details (credits) for issues stored from list responses, newest first; allowed publishers only |
 | Issue backfill | Hourly at :45 | Issues cached by older versions without the newer fields; allowed publishers only |
@@ -289,6 +289,19 @@ after them. Every job can be started from the Jobs tab.
 Backfill jobs share a per-endpoint budget (120 calls/h), pace their calls across
 the hour, yield to queued client requests and stop at the first ComicVine
 refusal, leaving headroom for live proxy traffic.
+
+**Scope.** Every backfill, both incremental syncs, the issue re-sync and the
+releases prefetch store only what the publisher allowlist and `BACKFILL_MIN_YEAR`
+cover. Rows outside it are skipped, including updates to rows already stored, so
+those stay as they are until a client asks for them again:
+
+- **Issues** are in scope when dated `BACKFILL_MIN_YEAR` or later (or undated) and
+  their volume is allowlisted, or not stored yet: a new series' first issues
+  usually arrive before its volume.
+- **Volumes** are in scope when their publisher is allowlisted and they have an
+  issue dated in the window. A volume not stored yet is judged by its start year.
+
+Client requests are never limited; only blocked publishers are refused.
 
 ## comicvine.db Export (ComicManager)
 

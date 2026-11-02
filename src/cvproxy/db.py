@@ -2351,9 +2351,14 @@ class Database:
         """
         if not self.allowed_publishers and min_year <= 0:
             return None
+        return self.volume_ids_snapshot(allowed_only=True, min_year=min_year)
+
+    def volume_ids_snapshot(self, *, allowed_only: bool = False, min_year: int = 0) -> set[int]:
+        """Stored volume IDs (worker thread), optionally only allowlisted publishers'
+        (when there is an allowlist) and only those in the year window."""
         allowed = (
             f"v.publisher_id IN ({_id_list(self.allowed_publishers)})"
-            if self.allowed_publishers else "1"
+            if allowed_only and self.allowed_publishers else "1"
         )
         conn = self._ro_connect(timeout=30)
         try:

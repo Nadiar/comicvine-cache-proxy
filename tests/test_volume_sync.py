@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from cvproxy.db import Database
 from cvproxy.scheduler import (
     _CV_TS,
@@ -16,6 +18,12 @@ from cvproxy.scheduler import (
     create_scheduler,
 )
 from tests.test_sync_watermark import FakeCV, _recent, _utcnow
+
+
+@pytest.fixture(autouse=True)
+def _test_settings(settings: Any) -> Any:
+    """The syncs read BACKFILL_MIN_YEAR and the publisher lists through get_settings()."""
+    return settings
 
 
 def _volume(vid: int, updated: str, publisher: int = 1, **extra: Any) -> dict[str, Any]:
@@ -148,3 +156,79 @@ def test_volume_backfill_follows_the_backfill_year_floor(tmp_db: Database) -> No
     assert {8402, 8403, 8404} <= set(picked)  # a 2010+ issue, no issues, undated issue
     assert 8401 in _needs_detail(tmp_db)  # no floor
     assert tmp_db.queue_snapshot(2010)["volumes_missing_fields"] == len(picked)
+
+
+# -- syncs and the releases prefetch follow the allowlist and BACKFILL_MIN_YEAR --
+
+
+def _floor_2010(settings: Any) -> None:
+    from cvproxy.config import override_settings
+
+    override_settings(settings.model_copy(update={"backfill_min_year": 2010}))
+
+
+def _dated_issue(iid: int, volume: int, date: str | None, updated: str) -> dict[str, Any]:
+    return {"id": iid, "volume": {"id": volume}, "issue_number": "1", "store_date": date,
+            "date_last_updated": updated}
+
+
+async def test_issue_sync_only_stores_issues_in_scope(tmp_db: Database, settings: Any) -> None:
+    from cvproxy.scheduler import _sync_issues_incremental
+
+    _floor_2010(settings)
+    tmp_db.upsert_volume({"id": 7000, "name": "Other", "publisher": {"id": 2, "name": "Marvel"}})
+    tmp_db.set_publisher_list(1, "allow")
+    t = _recent(5)
+    cv = FakeCV([
+        _dated_issue(9701, 160294, "2024-05-01", t),  # allowed volume, in window
+        _dated_issue(9702, 160294, "2005-05-01", t),  # allowed volume, before the floor
+        _dated_issue(9703, 7000, "2024-05-01", t),    # stored volume off the allowlist
+        _dated_issue(9704, 8888, "2024-05-01", t),    # volume not stored yet
+        _dated_issue(9705, 160294, None, t),          # undated
+    ])
+    result = await _sync_issues_incremental(cv, tmp_db)  # type: ignore[arg-type]
+    stored = {i for i in range(9701, 9706) if tmp_db.get_issue(i) is not None}
+    assert stored == {9701, 9704, 9705}
+    assert result["issues_upserted"] == 3 and result["skipped"] == 2
+    assert result["watermark"] == t  # skipped rows still move the sync forward
+
+
+async def test_volume_sync_only_stores_volumes_in_scope(tmp_db: Database, settings: Any) -> None:
+    _floor_2010(settings)
+    tmp_db.upsert_volume({"id": 7000, "name": "Other", "publisher": {"id": 2, "name": "Marvel"}})
+    tmp_db.upsert_volume({"id": 7200, "name": "Old run", "publisher": {"id": 1, "name": "DC"}})
+    tmp_db.upsert_issue({"id": 7201, "volume": {"id": 7200}, "store_date": "2004-01-01"})
+    tmp_db.set_publisher_list(1, "allow")
+    t = _recent(5)
+    cv = FakeCV([
+        _volume(160294, t, name="Renamed"),               # stored, allowed, 2024 issues
+        _volume(7000, t, publisher=2, name="Renamed"),    # stored, off the allowlist
+        _volume(7200, t, name="Renamed"),                 # stored, allowed, only old issues
+        _volume(8501, t, start_year="2015"),              # new, allowed, in window
+        _volume(8502, t, start_year="2001"),              # new, allowed, too old
+        _volume(8503, t, publisher=2, start_year="2015"),  # new, off the allowlist
+    ])
+    result = await _sync_volumes_incremental(cv, tmp_db)  # type: ignore[arg-type]
+    assert tmp_db.get_volume(160294)["name"] == "Renamed"  # type: ignore[index]
+    assert tmp_db.get_volume(7000)["name"] == "Other"  # type: ignore[index]
+    assert tmp_db.get_volume(7200)["name"] == "Old run"  # type: ignore[index]
+    assert tmp_db.get_volume(8501) is not None
+    assert tmp_db.get_volume(8502) is None and tmp_db.get_volume(8503) is None
+    assert result["volumes_upserted"] == 2 and result["skipped"] == 4
+
+
+async def test_releases_prefetch_follows_the_allowlist(tmp_db: Database, settings: Any) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from cvproxy.scheduler import _prefetch_releases
+
+    _floor_2010(settings)
+    tmp_db.upsert_volume({"id": 7000, "name": "Other", "publisher": {"id": 2, "name": "Marvel"}})
+    tmp_db.set_publisher_list(1, "allow")
+    client = MagicMock()
+    client.get = AsyncMock(return_value={"status_code": 1, "number_of_total_results": 2,
+                                         "results": [_dated_issue(9801, 160294, "2026-11-01", "x"),
+                                                     _dated_issue(9802, 7000, "2026-11-01", "x")]})
+    result = await _prefetch_releases(client, tmp_db)
+    assert tmp_db.get_issue(9801) is not None and tmp_db.get_issue(9802) is None
+    assert result["issues_upserted"] == 1 and result["skipped"] == 1

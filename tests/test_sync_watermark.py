@@ -21,6 +21,12 @@ from cvproxy.scheduler import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _test_settings(settings: Any) -> Any:
+    """The syncs read BACKFILL_MIN_YEAR and the publisher lists through get_settings()."""
+    return settings
+
+
 def _issue(iid: int, updated: str) -> dict[str, Any]:
     return {
         "id": iid, "volume": {"id": 1}, "issue_number": str(iid), "name": f"#{iid}",
