@@ -17,6 +17,8 @@ from typing import Any, Final, Literal
 
 import httpx
 
+from cvproxy import __version__
+
 logger = logging.getLogger(__name__)
 
 
@@ -97,7 +99,7 @@ class CVClient:
         self._client = httpx.AsyncClient(
             timeout=30.0,
             headers={
-                "User-Agent": "CVProxy/0.1",
+                "User-Agent": f"CVProxy/{__version__}",
             },
             follow_redirects=True,
         )

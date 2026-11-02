@@ -1,6 +1,6 @@
 [project]
 name = "cvproxy"
-version = "0.1.0"
+version = "2.0.0"
 description = "ComicVine API proxy with local SQLite cache and on-demand image caching"
 readme = "README.md"
 requires-python = ">=3.11"

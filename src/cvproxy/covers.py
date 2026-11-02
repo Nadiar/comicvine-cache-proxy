@@ -21,6 +21,7 @@ import httpx
 import imagehash
 from PIL import Image
 
+from cvproxy import __version__
 from cvproxy.db import Database
 from cvproxy.jobs import report_progress
 
@@ -121,7 +122,7 @@ async def hash_covers(
         transport=transport,
         timeout=30.0,
         follow_redirects=True,
-        headers={"User-Agent": "CVProxy/0.1"},
+        headers={"User-Agent": f"CVProxy/{__version__}"},
         event_hooks={"request": [_check_request]},
     ) as http:
         for cvid, urls in candidates:

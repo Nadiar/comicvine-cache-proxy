@@ -15,6 +15,8 @@ Drop-in replacement for the ComicVine API URL — point your tools (ComicTagger,
 - **Background jobs** — hourly incremental sync and backfills, daily prefetch/exports/maintenance, with a persistent run history
 - **XML format support** — responds with CV-compatible XML when `format=xml` is requested
 - **Stats dashboard** — live cache hit rate, per-client and per-endpoint breakdowns
+- **Dashboard sign-in, Jobs, Settings and Publishers tabs** — run history with backlog estimates, run-time settings, publisher allow/block lists with CSV import and export
+- **Publisher allowlist and blocklist** — backfills only fetch the publishers you want; blocked publishers are never served, stored or exported
 - **Admin API** — on-demand sync, publisher repair, cache eviction, FTS rebuild
 - **Docker-ready** — single container deployment
 
@@ -214,20 +216,21 @@ after them. Every job can be started from the Jobs tab.
 | Incremental issue sync | Hourly at :10 | Issues changed since the stored watermark, in 24h slices; the watermark only moves over stored data |
 | Releases prefetch | Daily at H:00 | Issues with a store date from 2 weeks ago to 1 week ahead |
 | Pending fetch | Every 2 min | Cache misses queued while ComicVine couldn't be asked; idle runs aren't kept in history |
-| Issue detail backfill | Hourly at :05 | /issue/ details (credits) for issues stored from list responses, newest first |
-| Issue backfill | Hourly at :45 | Issues cached by older versions without the newer fields |
-| Volume backfill | Hourly at :30 | Volumes missing detail fields (calendar-relevant first) |
-| Publisher backfill | Every 6h at :15 | Publishers missing detail fields |
+| Issue detail backfill | Hourly at :05 | /issue/ details (credits) for issues stored from list responses, newest first; allowed publishers only |
+| Issue backfill | Hourly at :45 | Issues cached by older versions without the newer fields; allowed publishers only |
+| Volume backfill | Hourly at :30 | Volumes missing detail fields (calendar-relevant first); allowed publishers only |
+| Publisher backfill | Every 6h at :15 | Allowed publishers missing detail fields |
 | Search cache volume backfill | Every 2h at :50 | Volumes seen in cached searches but not stored |
 | MCL gap backfill | Daily at H+6 | Volumes and issues in `latest.mcl` but missing locally, 100 IDs per request |
-| Cover hash backfill | Hourly at :20 | Only when `COVER_HASH_PER_HOUR` > 0 |
+| Cover hash backfill | Hourly at :20 | Only when `COVER_HASH_PER_HOUR` > 0; allowed publishers only |
 | comicvine.db export | Daily at H+5 | Only when `CV_DB_EXPORT_PATH` is set; see below |
 | latest.mcl refresh | Daily at H+5:30 | Only when `MCL_EXPORT_PATH` is set |
 | WAL checkpoint | Hourly at :40 | PASSIVE checkpoint on its own connection |
 | Cache eviction | Daily at H+3 | When eviction is configured; manual runs default to a dry run |
+| Blocked publisher purge | Daily at H+3:20 | Deletes stored rows of blocked publishers; manual runs default to a dry run |
 | Image cache cleanup | Daily at H+2 | Images not accessed within `IMAGE_CACHE_TTL_DAYS` |
 | Database backup | Daily at H+4 | Only when `BACKUP_KEEP` > 0 |
-| Backlog snapshot | Daily at H+2:30 | Read-only counts of every backfill's remaining work (Backlog card) |
+| Backlog snapshot | Daily at H+2:30, and after a publisher list change | Read-only counts of every backfill's remaining work (Backlog card) |
 | Response cache audit | Weekly, Sat H+1:30 | Reports cached error envelopes, unparseable rows and empty results |
 | Issue re-sync (time window) | Manual | Issues changed in the last N days; doesn't move the watermark |
 | Re-fetch issues | Manual | Specific issue IDs and/or a volume's issues, optional /issue/ details |
@@ -247,6 +250,7 @@ With `CV_DB_EXPORT_PATH` set, a daily job writes a `comicvine.db` in the layout 
 - `cv_publisher`, `cv_volume`, `cv_issue`, `comic_covers`, plus the `volume_fts` search index
 - empty credit lists written as `[]`
 - `count_of_issues` is never lower than the number of stored issues
+- blocked publishers, their volumes, issues and cover hashes are left out
 
 The file is built as `comicvine.db.partial` on local disk next to cvproxy's own database, copied into the destination folder (which can be a network share), and renamed into place. ComicManager opens it with `immutable=1`, so it must never see the file change. Consumers should **mount the directory, not the file**. A single-file bind mount keeps showing the old file after the rename.
 

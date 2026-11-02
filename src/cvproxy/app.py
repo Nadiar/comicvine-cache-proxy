@@ -16,6 +16,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from cvproxy import __version__
 from cvproxy.auth import (
     DEFAULT_NEXT,
     SESSION_COOKIE,
@@ -324,7 +325,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="CVProxy",
         description="ComicVine API proxy with local SQLite cache",
-        version="0.1.0",
+        version=__version__,
         lifespan=lifespan,
     )
 
