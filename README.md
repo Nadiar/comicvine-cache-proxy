@@ -39,7 +39,7 @@ CV_API_KEY=your_key docker compose up -d
 
 The included `docker-compose.yml` has every setting pre-populated with its default and a comment explaining what it does — uncomment and adjust what you need.
 
-A prebuilt image is published to GitHub Container Registry on every push to `main` (`:latest`) and every release tag (`:2.0.1`, `:2.0`). To use it instead of building, set this on the service:
+A prebuilt image is published to GitHub Container Registry on every push to `main` (`:latest`) and every release tag (`:2.0.0`, `:2.0`). To use it instead of building, set this on the service:
 
 ```yaml
 image: ghcr.io/nadiar/comicvine-cache-proxy:latest
