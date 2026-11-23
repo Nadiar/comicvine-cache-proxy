@@ -1454,7 +1454,7 @@ async def proxy_image(
 # ---------------------------------------------------------------------------
 
 
-def _parse_cv_filter(filter_str: str) -> dict[str, str]:
+def _parse_cv_filter(filter_str: str, sep: str=" ") -> dict[str, str]:
     """Parse CV filter format ``key:value,key2:value2`` into a dict."""
     if not filter_str:
         return {}
@@ -1462,7 +1462,12 @@ def _parse_cv_filter(filter_str: str) -> dict[str, str]:
     for part in re.split(r",(?=[a-z_]+:)", filter_str):
         if ":" in part:
             key, _, value = part.partition(":")
-            result[key.strip()] = value.strip()
+            k = key.strip()
+            v = value.strip()
+            if k in result and v:
+                result[k] = f"{result[k]}{sep}{v}"
+            else:
+                result[k] = v
     return result
 
 
